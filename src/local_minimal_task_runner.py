@@ -21,8 +21,22 @@ selected.
 
 from collections.abc import Sequence
 import os
+from pathlib import Path
 import random
+import sys
 from typing import Type
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_ANDROID_WORLD_ROOT_ENV = os.environ.get("ANDROID_WORLD_ROOT")
+_ANDROID_WORLD_ROOT = (
+    Path(_ANDROID_WORLD_ROOT_ENV).expanduser().resolve()
+    if _ANDROID_WORLD_ROOT_ENV
+    else _REPO_ROOT / "libs" / "android_world"
+)
+for _path in (_ANDROID_WORLD_ROOT, _REPO_ROOT / "src"):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 
 from absl import app
 from absl import flags
@@ -43,18 +57,20 @@ os.environ["GRPC_TRACE"] = "none"  # Disable tracing
 
 def _find_adb_directory() -> str:
     """Returns the directory where adb is located."""
+    env_adb_path = os.environ.get("ADB_PATH")
+    if env_adb_path and os.path.isfile(env_adb_path):
+        return env_adb_path
+
     potential_paths = [
         os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
         os.path.expanduser("/home/zmz/Workspace/gui/Android/Sdk/platform-tools/adb"),
+        os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
     ]
     for path in potential_paths:
         if os.path.isfile(path):
             return path
-    raise EnvironmentError(
-        "adb not found in the common Android SDK paths. Please install Android"
-        " SDK and ensure adb is in one of the expected directories. If it's"
-        " already installed, point to the installed location."
-    )
+    return "adb"
 
 
 _ADB_PATH = flags.DEFINE_string(

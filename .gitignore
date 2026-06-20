@@ -3,3 +3,7 @@
 # submodule
 Android/
 Android/Sdk/
+
+# runtime folders
+__pycache__/
+build/

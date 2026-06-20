@@ -1,0 +1,5 @@
+*.zip
+
+# submodule
+Android/
+Android/Sdk/

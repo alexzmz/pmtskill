@@ -43,7 +43,6 @@ from absl import flags
 from absl import logging
 
 from android_world import registry
-from android_world.agents import infer
 from android_world.agents import t3a
 from android_world.env import env_launcher
 from android_world.task_evals import task_eval
@@ -99,18 +98,25 @@ _TASK = flags.DEFINE_string(
     None,
     "A specific task to run.",
 )
-
-model_path = "/home/zmz/Workspace/models/qwen3.5-4b"
+_MODEL_PATH = flags.DEFINE_string(
+    "model_path",
+    os.environ.get("LOCAL_MODEL_PATH", "/home/zmz/Workspace/models/qwen3.5-4b"),
+    "Path to the local model used by vLLM.",
+)
 
 
 def _main() -> None:
     """Runs a single task."""
+    print("Loading Android environment...", flush=True)
     env = env_launcher.load_and_setup_env(
         console_port=_DEVICE_CONSOLE_PORT.value,
         emulator_setup=_EMULATOR_SETUP.value,
         adb_path=_ADB_PATH.value,
     )
+    print("Resetting Android environment...", flush=True)
     env.reset(go_home=True)
+
+    print("Selecting task...", flush=True)
     task_registry = registry.TaskRegistry()
     aw_registry = task_registry.get_registry(task_registry.ANDROID_WORLD_FAMILY)
     if _TASK.value:
@@ -121,15 +127,19 @@ def _main() -> None:
         task_type: Type[task_eval.TaskEval] = random.choice(list(aw_registry.values()))
     params = task_type.generate_random_params()
     task = task_type(params)
+    print(f"Initializing task: {task_type.__name__}", flush=True)
     task.initialize_task(env)
+
+    print(f"Loading local model with vLLM: {_MODEL_PATH.value}", flush=True)
     agent = t3a.T3A(
         env,
         VLLMWrapper(
-            model_path=model_path,
+            model_path=_MODEL_PATH.value,
             temperature=0.7,
             tensor_parallel_size=1,
         ),
     )
+    print("Agent initialized.", flush=True)
 
     print("Goal: " + str(task.goal))
     is_done = False

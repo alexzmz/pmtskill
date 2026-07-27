@@ -9,6 +9,7 @@ Android/Sdk/
 # runtime folders
 __pycache__/
 build/
+/results/
 
 # log
 *log*

@@ -734,6 +734,20 @@ def render_markdown(report: Mapping[str, Any], step_char_limit: int) -> str:
                 f"- SHA-256: `{skill.get('sha256')}`",
             ]
         )
+        if skill.get("delivery") == "skvm-kernel-adaptive":
+            lines.extend(
+                [
+                    f"- SkVM target: `{skill.get('target_model')}`",
+                    f"- Compiler model: `{skill.get('compiler_model')}`",
+                    f"- Prepare mode: `{skill.get('prepare_mode')}`",
+                    (
+                        "- Catalog: "
+                        f"{len(skill.get('skills') or [])} skill(s), "
+                        f"{len(skill.get('variants') or [])} variant(s)"
+                    ),
+                    f"- Adaptation trace: `{skill.get('adaptation_trace')}`",
+                ]
+            )
 
     inference = report.get("inference") or {}
     if inference:
@@ -761,6 +775,27 @@ def render_markdown(report: Mapping[str, Any], step_char_limit: int) -> str:
             lines.append(
                 "| SkVM skill load requests | "
                 f"{inference.get('skill_load_requests')} |"
+            )
+        if inference.get("skvm_adapted_requests") is not None:
+            lines.extend(
+                [
+                    (
+                        "| SkVM-adapted requests | "
+                        f"{inference.get('skvm_adapted_requests')} |"
+                    ),
+                    (
+                        "| SkVM variant sources | "
+                        f"{_table_text(json.dumps(inference.get('skvm_variant_source_counts') or {}, ensure_ascii=False, sort_keys=True))} |"
+                    ),
+                    (
+                        "| SkVM variant tags | "
+                        f"{_table_text(json.dumps(inference.get('skvm_variant_tag_counts') or {}, ensure_ascii=False, sort_keys=True))} |"
+                    ),
+                    (
+                        "| SkVM UI-state labels | "
+                        f"{_table_text(json.dumps(inference.get('skvm_ui_state_counts') or {}, ensure_ascii=False, sort_keys=True))} |"
+                    ),
+                ]
             )
 
     lines.extend(
@@ -1079,7 +1114,7 @@ def run_evaluation(
             flush=True,
         )
 
-        print(f"Loading local vLLM model: {args.model_path}", flush=True)
+        print(f"Initializing vLLM model backend: {args.model_path}", flush=True)
         llm = model_factory(args)
         if agent_factory is None:
             agent = t3a.T3A(env, llm, name=f"t3a_vllm_{condition}")

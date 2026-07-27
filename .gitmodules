@@ -4,3 +4,6 @@
 [submodule "libs/skvm"]
 	path = libs/skvm
 	url = git@github.com:alexzmz/SkVM.git
+[submodule "libs/ms-swift"]
+	path = libs/ms-swift
+	url = git@github.com:alexzmz/ms-swift.git

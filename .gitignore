@@ -1,4 +1,6 @@
 *.zip
+*.tar
+*.gz
 
 # submodule
 Android/

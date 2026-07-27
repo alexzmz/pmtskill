@@ -1,6 +1,6 @@
 [submodule "libs/android_world"]
 	path = libs/android_world
-	url = https://github.com/google-research/android_world.git
+	url = git@github.com:alexzmz/android_world.git
 [submodule "libs/skvm"]
 	path = libs/skvm
-	url = https://github.com/SJTU-IPADS/SkVM.git
+	url = git@github.com:alexzmz/SkVM.git

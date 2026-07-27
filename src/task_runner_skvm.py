@@ -13,9 +13,11 @@ Its model path is deliberately different:
    relevant sections for the current goal/phase;
 6. prefer an existing SkVM JIT-optimize best round when one is available.
 
-The online decisions are written to ``<run_dir>/skvm/adaptations.jsonl``.  The
-result therefore measures ``model + model-adapted skill`` rather than merely
-prepending an unchanged SKILL.md.
+The online decisions are written to ``<run_dir>/skvm/adaptations.jsonl``.
+The runner also emits ``skvm_report.json``, ``skvm_report.md``, numeric TCP
+capability tables, compilation-gap tables, and immutable skill-variant
+snapshots.  The result therefore measures ``model + model-adapted skill``
+rather than merely prepending an unchanged SKILL.md.
 
 Example:
 
@@ -49,6 +51,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import task_runner_detail
+import skvm_reporting
 
 
 REPO_ROOT = task_runner_detail.REPO_ROOT
@@ -1078,6 +1081,8 @@ class SkVMAdaptiveWrapper:
         self._intent_counts: Counter[str] = Counter()
         self._state_counts: Counter[str] = Counter()
         self._phase_counts: Counter[str] = Counter()
+        self._environment_event_counts: Counter[str] = Counter()
+        self._environment_last_errors: list[str] = []
         self._restore_trace_stats()
         if self.variant_policy == "jit-only":
             # Fail before Android World starts rather than halfway through the
@@ -1120,6 +1125,13 @@ class SkVMAdaptiveWrapper:
 
     def reset_skill_session(self) -> None:
         self._session_skill_loaded = self.mode == "inject"
+
+    def record_environment_event(self, kind: str, error: BaseException) -> None:
+        self._environment_event_counts[kind] += 1
+        self._environment_last_errors.append(
+            f"{type(error).__name__}: {error}"
+        )
+        self._environment_last_errors = self._environment_last_errors[-10:]
 
     def _candidate_variants(self) -> list[SkillVariant]:
         by_skill: dict[str, list[SkillVariant]] = {}
@@ -1466,6 +1478,12 @@ class SkVMAdaptiveWrapper:
             "skvm_ui_state_counts": dict(self._state_counts),
             "skvm_phase_counts": dict(self._phase_counts),
             "skvm_adaptation_trace": str(self.trace_path),
+            "android_environment_events": dict(
+                self._environment_event_counts
+            ),
+            "android_environment_last_errors": list(
+                self._environment_last_errors
+            ),
         }
 
 
@@ -1636,6 +1654,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include plaintext task goals in adaptations.jsonl.",
     )
+    recovery = parser.add_argument_group("Android environment recovery")
+    recovery.add_argument(
+        "--android_reset_retries",
+        type=int,
+        default=2,
+        help="Retries after an accessibility-tree failure during episode reset.",
+    )
+    recovery.add_argument(
+        "--android_reset_retry_wait_s",
+        type=float,
+        default=2.0,
+        help="Wait between accessibility reset retries.",
+    )
+    recovery.add_argument(
+        "--a11y_fallback",
+        choices=("none", "uiautomator"),
+        default="uiautomator",
+        help=(
+            "Fall back to adb uiautomator when Android World's a11y gRPC "
+            "forwarder remains unavailable after retries."
+        ),
+    )
     return parser
 
 
@@ -1661,17 +1701,71 @@ def validate_skvm_args(args: argparse.Namespace) -> None:
         raise ValueError("--skvm_max_skills_per_request must be at least 1.")
     if args.skvm_max_skill_chars < 500:
         raise ValueError("--skvm_max_skill_chars must be at least 500.")
+    if args.android_reset_retries < 0:
+        raise ValueError("--android_reset_retries cannot be negative.")
+    if args.android_reset_retry_wait_s < 0:
+        raise ValueError("--android_reset_retry_wait_s cannot be negative.")
     for value in args.skvm_aot_pass_sets:
         _normalize_pass_set(value)
 
 
 def _agent_factory(
-    env: Any, llm: SkVMAdaptiveWrapper, t3a_module: Any
+    env: Any,
+    llm: SkVMAdaptiveWrapper,
+    t3a_module: Any,
+    *,
+    reset_retries: int,
+    retry_wait_s: float,
+    a11y_fallback: str,
 ) -> Any:
     class SkVMAdaptiveT3A(t3a_module.T3A):
         def reset(self, go_home_on_reset: bool = False) -> None:
             llm.reset_skill_session()
-            super().reset(go_home_on_reset)
+            last_error: RuntimeError | None = None
+            for attempt in range(reset_retries + 1):
+                try:
+                    super().reset(go_home_on_reset)
+                    return
+                except RuntimeError as exc:
+                    if "Could not get a11y tree" not in str(exc):
+                        raise
+                    last_error = exc
+                    llm.record_environment_event("a11y_reset_failure", exc)
+                    if attempt >= reset_retries:
+                        break
+                    print(
+                        "Android a11y reset failed; refreshing the controller "
+                        f"and retrying ({attempt + 1}/{reset_retries})...",
+                        flush=True,
+                    )
+                    try:
+                        self.env.controller.refresh_env()
+                    except Exception as refresh_error:  # pylint: disable=broad-exception-caught
+                        llm.record_environment_event(
+                            "a11y_refresh_failure", refresh_error
+                        )
+                    if retry_wait_s:
+                        time.sleep(retry_wait_s)
+
+            if a11y_fallback == "uiautomator":
+                from android_world.env import android_world_controller
+
+                print(
+                    "Android a11y gRPC forwarder is unavailable; falling "
+                    "back to uiautomator for UI extraction.",
+                    flush=True,
+                )
+                self.env.controller._a11y_method = (  # pylint: disable=protected-access
+                    android_world_controller.A11yMethod.UIAUTOMATOR
+                )
+                assert last_error is not None
+                llm.record_environment_event(
+                    "a11y_uiautomator_fallback", last_error
+                )
+                super().reset(go_home_on_reset)
+                return
+            assert last_error is not None
+            raise last_error
 
     return SkVMAdaptiveT3A(env, llm, name="t3a_vllm_skvm_adaptive")
 
@@ -1784,17 +1878,85 @@ def main(argv: Sequence[str] | None = None) -> int:
                 str(server.log_path) if server.log_path is not None else None
             ),
         }
+        skill_info["android_recovery"] = {
+            "reset_retries": args.android_reset_retries,
+            "retry_wait_s": args.android_reset_retry_wait_s,
+            "a11y_fallback": args.a11y_fallback,
+            "max_consecutive_infrastructure_errors": (
+                args.max_consecutive_infrastructure_errors
+            ),
+            "grpc_port": args.grpc_port,
+        }
+        skill_info["skvm_evaluation"] = {
+            "json": str(run_dir / "skvm_report.json"),
+            "markdown": str(run_dir / "skvm_report.md"),
+            "capabilities_csv": str(
+                run_dir / "skvm" / "capabilities.csv"
+            ),
+        }
 
         def model_factory(_: argparse.Namespace) -> SkVMAdaptiveWrapper:
             return adaptive_llm
 
-        return task_runner_detail.run_evaluation(
-            args,
-            condition=condition,
-            model_factory=model_factory,
-            skill_info=skill_info,
-            agent_factory=_agent_factory,
-        )
+        def agent_factory(env: Any, llm: Any, t3a_module: Any) -> Any:
+            return _agent_factory(
+                env,
+                llm,
+                t3a_module,
+                reset_retries=args.android_reset_retries,
+                retry_wait_s=args.android_reset_retry_wait_s,
+                a11y_fallback=args.a11y_fallback,
+            )
+
+        evaluation_error: BaseException | None = None
+        reporting_error: Exception | None = None
+        exit_code = 1
+        try:
+            exit_code = task_runner_detail.run_evaluation(
+                args,
+                condition=condition,
+                model_factory=model_factory,
+                skill_info=skill_info,
+                agent_factory=agent_factory,
+            )
+        except BaseException as exc:
+            # task_runner_detail has already materialized its checkpoint-based
+            # report. Preserve the original failure until the SkVM-specific
+            # report has captured the same partial run.
+            evaluation_error = exc
+
+        try:
+            skvm_reporting.write_skvm_evaluation(
+                run_dir=run_dir,
+                cache_dir=kernel.cache_dir,
+                target_model=kernel.target_model,
+                adapter=SKVM_ADAPTER,
+                variants=variants,
+                manifest=manifest,
+                runtime_stats=adaptive_llm.get_stats(),
+            )
+            print(
+                f"SkVM evaluation: {run_dir / 'skvm_report.md'}",
+                flush=True,
+            )
+            print(
+                f"SkVM structured evaluation: "
+                f"{run_dir / 'skvm_report.json'}",
+                flush=True,
+            )
+        except Exception as exc:  # Do not hide the Android failure.
+            reporting_error = exc
+            print(
+                f"Failed to write SkVM evaluation artifacts: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if evaluation_error is not None:
+            raise evaluation_error
+        if reporting_error is not None:
+            raise reporting_error
+        return exit_code
     finally:
         if server is not None:
             server.close()

@@ -86,8 +86,9 @@ def build_parser(
     description: str | None = None,
     *,
     add_help: bool = True,
+    include_model_args: bool = True,
 ) -> argparse.ArgumentParser:
-    """Build the shared baseline/SKVM command-line interface."""
+    """Build the shared Android World command-line interface."""
     parser = argparse.ArgumentParser(
         description=description or __doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -102,6 +103,12 @@ def build_parser(
         help="Console port of the running Android emulator.",
     )
     runtime.add_argument(
+        "--grpc_port",
+        type=int,
+        default=8554,
+        help="gRPC port exposed by the running Android emulator.",
+    )
+    runtime.add_argument(
         "--perform_emulator_setup",
         action="store_true",
         help="Perform the one-time Android World emulator setup.",
@@ -113,6 +120,16 @@ def build_parser(
         help=(
             "Seconds to wait after actions. The default lets Android World "
             "dynamically wait for a stable screen."
+        ),
+    )
+    runtime.add_argument(
+        "--max_consecutive_infrastructure_errors",
+        type=int,
+        default=3,
+        help=(
+            "Abort after this many consecutive emulator/a11y/model-backend "
+            "errors instead of recording the same invalid result for the "
+            "entire suite. Set zero to disable."
         ),
     )
 
@@ -150,25 +167,29 @@ def build_parser(
         help="List available Android World task names and exit.",
     )
 
-    model = parser.add_argument_group("Local vLLM model")
-    model.add_argument(
-        "--model_path",
-        default=os.environ.get(
-            "LOCAL_MODEL_PATH", "/home/zmz/Workspace/models/qwen3.5-4b"
-        ),
-        help="Local Hugging Face model directory or vLLM model identifier.",
-    )
-    model.add_argument("--tensor_parallel_size", type=int, default=1)
-    model.add_argument("--gpu_memory_utilization", type=float, default=0.9)
-    model.add_argument("--max_model_len", type=int, default=None)
-    model.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Sampling temperature. Zero is recommended for reproducible evals.",
-    )
-    model.add_argument("--top_p", type=float, default=0.95)
-    model.add_argument("--max_tokens", type=int, default=512)
+    if include_model_args:
+        model = parser.add_argument_group("Local vLLM model")
+        model.add_argument(
+            "--model_path",
+            default=os.environ.get(
+                "LOCAL_MODEL_PATH", "/home/zmz/Workspace/models/qwen3.5-4b"
+            ),
+            help="Local Hugging Face model directory or vLLM model identifier.",
+        )
+        model.add_argument("--tensor_parallel_size", type=int, default=1)
+        model.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+        model.add_argument("--max_model_len", type=int, default=None)
+        model.add_argument(
+            "--temperature",
+            type=float,
+            default=0.0,
+            help=(
+                "Sampling temperature. Zero is recommended for reproducible "
+                "evals."
+            ),
+        )
+        model.add_argument("--top_p", type=float, default=0.95)
+        model.add_argument("--max_tokens", type=int, default=512)
 
     output = parser.add_argument_group("Reports and checkpoints")
     output.add_argument(
@@ -213,11 +234,21 @@ def normalize_tasks(raw_tasks: Sequence[str] | None) -> list[str] | None:
 def validate_args(args: argparse.Namespace) -> None:
     if args.n_task_combinations < 1:
         raise ValueError("--n_task_combinations must be at least 1.")
-    if args.tensor_parallel_size < 1:
+    if (
+        hasattr(args, "tensor_parallel_size")
+        and args.tensor_parallel_size < 1
+    ):
         raise ValueError("--tensor_parallel_size must be at least 1.")
-    if not 0 < args.gpu_memory_utilization <= 1:
+    if (
+        hasattr(args, "gpu_memory_utilization")
+        and not 0 < args.gpu_memory_utilization <= 1
+    ):
         raise ValueError("--gpu_memory_utilization must be in (0, 1].")
-    if args.max_model_len is not None and args.max_model_len < 1:
+    if (
+        hasattr(args, "max_model_len")
+        and args.max_model_len is not None
+        and args.max_model_len < 1
+    ):
         raise ValueError("--max_model_len must be positive.")
     if args.max_tokens < 1:
         raise ValueError("--max_tokens must be positive.")
@@ -227,6 +258,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--top_p must be in (0, 1].")
     if args.transition_pause is not None and args.transition_pause < 0:
         raise ValueError("--transition_pause cannot be negative.")
+    if not 1 <= args.grpc_port <= 65535:
+        raise ValueError("--grpc_port must be between 1 and 65535.")
+    if args.max_consecutive_infrastructure_errors < 0:
+        raise ValueError(
+            "--max_consecutive_infrastructure_errors cannot be negative."
+        )
     if args.markdown_step_char_limit < 80:
         raise ValueError("--markdown_step_char_limit must be at least 80.")
 
@@ -256,7 +293,12 @@ def _resolve_run_dir(args: argparse.Namespace, condition: str) -> Path:
     if args.run_dir is not None:
         return args.run_dir.expanduser().resolve()
     timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
-    model_name = Path(str(args.model_path).rstrip("/\\")).name
+    model_reference = (
+        getattr(args, "model_path", None)
+        or getattr(args, "deepseek_model", None)
+        or condition
+    )
+    model_name = Path(str(model_reference).rstrip("/\\")).name
     return (
         args.output_dir.expanduser().resolve()
         / f"{_slug(condition)}_{_slug(model_name)}_{timestamp}"
@@ -776,6 +818,23 @@ def render_markdown(report: Mapping[str, Any], step_char_limit: int) -> str:
                 "| SkVM skill load requests | "
                 f"{inference.get('skill_load_requests')} |"
             )
+        optional_inference_metrics = (
+            ("API attempts", "api_attempt_count", None),
+            ("API retries", "retry_count", None),
+            ("Reasoning tokens", "reasoning_tokens", None),
+            ("Prompt cache-hit tokens", "prompt_cache_hit_tokens", None),
+            ("Prompt cache-miss tokens", "prompt_cache_miss_tokens", None),
+            ("Prompt cache-hit rate", "prompt_cache_hit_rate", "percent"),
+        )
+        for label, key, value_format in optional_inference_metrics:
+            if inference.get(key) is None:
+                continue
+            value = (
+                _percent(inference[key])
+                if value_format == "percent"
+                else inference[key]
+            )
+            lines.append(f"| {label} | {value} |")
         if inference.get("skvm_adapted_requests") is not None:
             lines.extend(
                 [
@@ -978,12 +1037,10 @@ def _base_config(
     condition: str,
     android_world_root: Path,
     skill_info: Mapping[str, Any] | None,
+    model_info: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "condition": condition,
-        "runner": str(Path(sys.argv[0]).resolve()),
-        "android_world_root": str(android_world_root),
-        "model": {
+    if model_info is None:
+        model_config: dict[str, Any] = {
             "model_path": str(args.model_path),
             "backend": "vllm",
             "tensor_parallel_size": args.tensor_parallel_size,
@@ -992,8 +1049,16 @@ def _base_config(
             "temperature": args.temperature,
             "top_p": args.top_p,
             "max_tokens": args.max_tokens,
-            "inference_error_policy": "mark_episode_as_error",
-        },
+        }
+    else:
+        model_config = dict(model_info)
+    model_config["inference_error_policy"] = "mark_episode_as_error"
+
+    return {
+        "condition": condition,
+        "runner": str(Path(sys.argv[0]).resolve()),
+        "android_world_root": str(android_world_root),
+        "model": _json_value(model_config),
         "suite": {
             "family": "android_world",
             "tasks": normalize_tasks(args.tasks),
@@ -1004,8 +1069,12 @@ def _base_config(
         "android_runtime": {
             "adb_path": str(args.adb_path),
             "console_port": args.console_port,
+            "grpc_port": args.grpc_port,
             "perform_emulator_setup": args.perform_emulator_setup,
             "transition_pause": args.transition_pause,
+            "max_consecutive_infrastructure_errors": (
+                args.max_consecutive_infrastructure_errors
+            ),
         },
         "reporting": {
             "include_prompts": args.include_prompts,
@@ -1042,6 +1111,52 @@ def list_available_tasks() -> int:
     return 0
 
 
+_INFRASTRUCTURE_ERROR_MARKERS = (
+    "Could not get a11y tree",
+    "vLLM server inference failed",
+    "vLLM inference failed",
+    "DeepSeek API inference failed",
+    "failed to connect to the emulator",
+    "grpc_status:14",
+    "StatusCode.UNAVAILABLE",
+)
+
+
+class _FailFastCheckpointer:
+    """Persist an episode, then abort on repeated infrastructure failures."""
+
+    def __init__(self, delegate: Any, limit: int) -> None:
+        self.delegate = delegate
+        self.limit = limit
+        self.consecutive_errors = 0
+
+    def save_episodes(
+        self, task_episodes: list[dict[str, Any]], task_name: str
+    ) -> None:
+        # Save first so the final diagnostic report includes the episode that
+        # tripped the threshold.
+        self.delegate.save_episodes(task_episodes, task_name)
+        for episode in task_episodes:
+            exception = str(episode.get("exception_info") or "")
+            is_infrastructure = any(
+                marker.lower() in exception.lower()
+                for marker in _INFRASTRUCTURE_ERROR_MARKERS
+            )
+            self.consecutive_errors = (
+                self.consecutive_errors + 1 if is_infrastructure else 0
+            )
+        if self.limit and self.consecutive_errors >= self.limit:
+            raise RuntimeError(
+                "Aborting Android World after "
+                f"{self.consecutive_errors} consecutive infrastructure "
+                "errors. The last episode was saved. Fix the emulator/a11y/"
+                "model backend and resume the same --run_dir."
+            )
+
+    def load(self, fields: list[str] | None = None) -> list[dict[str, Any]]:
+        return self.delegate.load(fields)
+
+
 def run_evaluation(
     args: argparse.Namespace,
     *,
@@ -1049,6 +1164,9 @@ def run_evaluation(
     model_factory: Callable[[argparse.Namespace], Any] = create_vllm,
     skill_info: Mapping[str, Any] | None = None,
     agent_factory: Callable[[Any, Any, Any], Any] | None = None,
+    model_info: Mapping[str, Any] | None = None,
+    backend_label: str | None = None,
+    agent_name: str | None = None,
 ) -> int:
     """Execute a suite and always materialize reports from its checkpoints."""
     validate_args(args)
@@ -1068,6 +1186,7 @@ def run_evaluation(
         condition=condition,
         android_world_root=android_world_root,
         skill_info=skill_info,
+        model_info=model_info,
     )
     config["config_signature"] = _config_signature(config)
     _ensure_resume_compatible(run_dir, config)
@@ -1081,15 +1200,22 @@ def run_evaluation(
     llm = None
     planned_episodes = 0
     caught_error: BaseException | None = None
-    checkpointer = checkpointer_lib.IncrementalCheckpointer(
+    incremental_checkpointer = checkpointer_lib.IncrementalCheckpointer(
         str(checkpoint_dir)
     )
+    checkpointer: Any = incremental_checkpointer
+    if args.max_consecutive_infrastructure_errors:
+        checkpointer = _FailFastCheckpointer(
+            incremental_checkpointer,
+            args.max_consecutive_infrastructure_errors,
+        )
 
     print(f"Run directory: {run_dir}", flush=True)
     try:
         print("Loading Android environment...", flush=True)
         env = env_launcher.load_and_setup_env(
             console_port=args.console_port,
+            grpc_port=args.grpc_port,
             emulator_setup=args.perform_emulator_setup,
             adb_path=args.adb_path,
         )
@@ -1114,13 +1240,33 @@ def run_evaluation(
             flush=True,
         )
 
-        print(f"Initializing vLLM model backend: {args.model_path}", flush=True)
+        model_config = config["model"]
+        model_identifier = (
+            model_config.get("model_path")
+            or model_config.get("model")
+            or model_config.get("model_id")
+            or "unknown"
+        )
+        resolved_backend_label = backend_label or (
+            "vLLM"
+            if model_config.get("backend") == "vllm"
+            else str(model_config.get("backend") or "model")
+        )
+        print(
+            f"Initializing {resolved_backend_label} backend: "
+            f"{model_identifier}",
+            flush=True,
+        )
         llm = model_factory(args)
+        resolved_agent_name = agent_name or (
+            f"t3a_{_slug(str(model_config.get('backend') or 'model'))}_"
+            f"{condition}"
+        )
         if agent_factory is None:
-            agent = t3a.T3A(env, llm, name=f"t3a_vllm_{condition}")
+            agent = t3a.T3A(env, llm, name=resolved_agent_name)
         else:
             agent = agent_factory(env, llm, t3a)
-            agent.name = f"t3a_vllm_{condition}"
+            agent.name = resolved_agent_name
         agent.transition_pause = args.transition_pause
 
         run_status = "running"

@@ -15,6 +15,8 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import task_runner_skvm as runner  # noqa: E402
+import skvm_reporting  # noqa: E402
+import task_runner_detail  # noqa: E402
 from vllm_wrapper import VLLMOpenAIWrapper  # noqa: E402
 
 
@@ -327,6 +329,242 @@ class KernelArtifactTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(len(runner._variant_purposes(jit)), 2)
+
+
+class AndroidRecoveryTests(unittest.TestCase):
+    def test_a11y_reset_refreshes_environment_and_retries(self):
+        class Controller:
+            def __init__(self):
+                self.ready = False
+                self.refresh_count = 0
+
+            def refresh_env(self):
+                self.refresh_count += 1
+                self.ready = True
+
+        class T3A:
+            def __init__(self, env, llm, name):
+                self.env = env
+                self.llm = llm
+                self.name = name
+                self.reset_count = 0
+
+            def reset(self, go_home_on_reset=False):
+                del go_home_on_reset
+                self.reset_count += 1
+                if not self.env.controller.ready:
+                    raise RuntimeError("Could not get a11y tree.")
+
+        class AdaptiveLLM:
+            def __init__(self):
+                self.session_resets = 0
+                self.events = []
+
+            def reset_skill_session(self):
+                self.session_resets += 1
+
+            def record_environment_event(self, kind, error):
+                self.events.append((kind, str(error)))
+
+        controller = Controller()
+        adaptive = AdaptiveLLM()
+        agent = runner._agent_factory(
+            SimpleNamespace(controller=controller),
+            adaptive,
+            SimpleNamespace(T3A=T3A),
+            reset_retries=1,
+            retry_wait_s=0,
+            a11y_fallback="none",
+        )
+
+        agent.reset()
+
+        self.assertEqual(agent.reset_count, 2)
+        self.assertEqual(controller.refresh_count, 1)
+        self.assertEqual(adaptive.session_resets, 1)
+        self.assertEqual(adaptive.events[0][0], "a11y_reset_failure")
+
+    def test_fail_fast_saves_diagnostic_episode_before_aborting(self):
+        class Delegate:
+            def __init__(self):
+                self.saved = []
+
+            def save_episodes(self, episodes, task_name):
+                self.saved.append((task_name, episodes))
+
+            def load(self, fields=None):
+                del fields
+                return [
+                    episode
+                    for _, episodes in self.saved
+                    for episode in episodes
+                ]
+
+        delegate = Delegate()
+        checkpointer = task_runner_detail._FailFastCheckpointer(
+            delegate, limit=2
+        )
+        error_episode = {
+            "exception_info": "RuntimeError: Could not get a11y tree."
+        }
+
+        checkpointer.save_episodes([error_episode], "task-1")
+        with self.assertRaisesRegex(
+            RuntimeError, "2 consecutive infrastructure errors"
+        ):
+            checkpointer.save_episodes([error_episode], "task-2")
+
+        self.assertEqual(len(delegate.saved), 2)
+        self.assertEqual(len(checkpointer.load()), 2)
+
+
+class SkVMReportingTests(unittest.TestCase):
+    def test_marks_an_all_error_run_invalid_for_effect_comparison(self):
+        validity = skvm_reporting._performance_validity(
+            {
+                "summary": {
+                    "attempted_episodes": 116,
+                    "scored_episodes": 0,
+                    "error_episodes": 116,
+                }
+            },
+            {"skvm_adapted_requests": 0},
+            {"status": "complete"},
+        )
+
+        self.assertFalse(validity["valid_for_skvm_effect_comparison"])
+        self.assertIn(
+            "No episode received an Android World score.",
+            validity["invalid_reasons"],
+        )
+        self.assertIn(
+            "No model request received online SkVM skill adaptation.",
+            validity["invalid_reasons"],
+        )
+
+    def test_writes_capability_values_and_valid_run_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            cache = root / "cache"
+            skill = make_skill(root / "skill")
+            p1_path = root / "p1" / "SKILL.md"
+            p1_path.parent.mkdir(parents=True)
+            p1_content = skill.content + "\nP1 adapted.\n"
+            p1_path.write_text(p1_content, encoding="utf-8")
+            variants = [
+                runner.SkillVariant(
+                    skill=skill,
+                    source="original",
+                    tag="original",
+                    path=skill.path,
+                    content=skill.content,
+                    sha256=skill.sha256,
+                ),
+                runner.SkillVariant(
+                    skill=skill,
+                    source="aot",
+                    tag="p1",
+                    path=p1_path,
+                    content=p1_content,
+                    sha256=runner._sha256(p1_content),
+                    plan=make_plan(parallel=False),
+                ),
+            ]
+
+            profile_path = (
+                cache
+                / "profiles"
+                / "bare-agent"
+                / "vllm--test"
+                / "latest.json"
+            )
+            profile_path.parent.mkdir(parents=True)
+            profile_path.write_text(
+                json.dumps(
+                    {
+                        "version": "1.0",
+                        "model": "vllm/test",
+                        "harness": "bare-agent",
+                        "profiledAt": "2026-01-01T00:00:00Z",
+                        "capabilities": {
+                            "reason.planning": "L1",
+                            "follow.format": "L3",
+                        },
+                        "details": [
+                            {
+                                "primitiveId": "reason.planning",
+                                "levelResults": [
+                                    {"passCount": 1, "totalCount": 3}
+                                ],
+                            },
+                            {
+                                "primitiveId": "follow.format",
+                                "levelResults": [
+                                    {"passCount": 3, "totalCount": 3}
+                                ],
+                            },
+                        ],
+                        "isPartial": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            run_dir.mkdir(parents=True)
+            (run_dir / "report.json").write_text(
+                json.dumps(
+                    {
+                        "run": {"status": "completed"},
+                        "summary": {
+                            "attempted_episodes": 2,
+                            "scored_episodes": 2,
+                            "error_episodes": 0,
+                            "task_success_rate": 0.5,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = skvm_reporting.write_skvm_evaluation(
+                run_dir=run_dir,
+                cache_dir=cache,
+                target_model="vllm/test",
+                adapter="bare-agent",
+                variants=variants,
+                manifest={"skills": [{"skill_id": skill.skill_id}]},
+                runtime_stats={
+                    "skvm_adapted_requests": 4,
+                    "skvm_variant_source_counts": {"aot": 4},
+                },
+            )
+
+            capability = report["model_capability_evaluation"]
+            self.assertEqual(capability["mean_level_value"], 2.0)
+            self.assertEqual(
+                capability["normalized_capability_score"], 0.6667
+            )
+            self.assertEqual(capability["microbenchmark_pass_rate"], 0.6667)
+            self.assertTrue(
+                report["performance_validity"][
+                    "valid_for_skvm_effect_comparison"
+                ]
+            )
+            self.assertTrue((run_dir / "skvm_report.json").is_file())
+            self.assertTrue((run_dir / "skvm_report.md").is_file())
+            self.assertTrue(
+                (run_dir / "skvm" / "capabilities.csv").is_file()
+            )
+            self.assertTrue(
+                (
+                    run_dir
+                    / "skvm"
+                    / "artifacts"
+                    / skill.skill_id
+                    / "aot-p1"
+                    / "SKILL.md"
+                ).is_file()
+            )
 
 
 class VLLMServerWrapperTests(unittest.TestCase):

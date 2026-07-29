@@ -179,6 +179,14 @@ class CommandTests(unittest.TestCase):
             sft[sft.index("--truncation_strategy") + 1], "left"
         )
         self.assertIn("--val_dataset", sft)
+        self.assertIn("--logging_dir", sft)
+        self.assertEqual(
+            Path(sft[sft.index("--logging_dir") + 1]),
+            paths.tensorboard_dir / "training",
+        )
+        self.assertNotIn("--save_total_limit", sft)
+        self.assertFalse(args.evaluate_after_training)
+        self.assertEqual(args.sr_eval_interval_steps, 0)
 
     def test_latest_numeric_adapter_is_selected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -192,6 +200,95 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(
                 training.find_latest_adapter(root).name, "checkpoint-200"
             )
+
+    def test_periodic_checkpoint_selection_uses_interval_and_final(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for step in (50, 100, 150, 200, 230):
+                checkpoint = root / f"checkpoint-{step}"
+                checkpoint.mkdir()
+                (checkpoint / "adapter_config.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+            selected = training.select_periodic_checkpoints(
+                root,
+                interval_steps=100,
+                include_final=True,
+            )
+            self.assertEqual([step for step, _ in selected], [100, 200, 230])
+
+    def test_full_training_enables_final_and_periodic_evaluation_defaults(self):
+        parser = training.build_parser()
+        args = parser.parse_args(["--tasks", TASK_A, "--save_steps", "30"])
+        training.validate_args(args)
+        self.assertTrue(args.evaluate_after_training)
+        self.assertEqual(args.sr_eval_interval_steps, 60)
+
+    def test_training_state_summary_exposes_loss_trend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoint-20"
+            checkpoint.mkdir()
+            (checkpoint / "adapter_config.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (checkpoint / "trainer_state.json").write_text(
+                json.dumps(
+                    {
+                        "global_step": 20,
+                        "epoch": 2.0,
+                        "log_history": [
+                            {"step": 5, "loss": 1.2},
+                            {"step": 10, "eval_loss": 1.0},
+                            {"step": 20, "loss": 0.6},
+                            {"step": 20, "eval_loss": 0.7},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary = training.summarize_training_state(
+                root,
+                checkpoint,
+                output_json=root / "summary.json",
+                output_markdown=root / "summary.md",
+            )
+            self.assertTrue(summary["train"]["loss_decreased"])
+            self.assertEqual(summary["train"]["loss_change"], -0.6)
+            self.assertEqual(summary["validation"]["best_loss"], 0.7)
+            self.assertIn(
+                "DECREASED",
+                (root / "summary.md").read_text(encoding="utf-8"),
+            )
+
+    def test_merged_model_is_reused_only_for_the_same_adapter(self):
+        parser = training.build_parser()
+        args = parser.parse_args(["--tasks", TASK_A])
+        training.validate_args(args)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "checkpoint-10"
+            adapter.mkdir()
+            merged = root / "merged"
+            merged.mkdir()
+            (merged / "config.json").write_text("{}", encoding="utf-8")
+            (merged / ".distillation_merge.json").write_text(
+                json.dumps({"adapter_path": str(adapter.resolve())}),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                training.ensure_merged_adapter(
+                    args, adapter, merged, label="test merge"
+                )
+            )
+            other = root / "checkpoint-20"
+            other.mkdir()
+            with self.assertRaisesRegex(
+                FileExistsError, "different adapter"
+            ):
+                training.ensure_merged_adapter(
+                    args, other, merged, label="test merge"
+                )
 
 
 class ComparisonTests(unittest.TestCase):
@@ -249,6 +346,180 @@ class ComparisonTests(unittest.TestCase):
             self.assertIn(
                 "75.00%",
                 (root / "comparison.md").read_text(encoding="utf-8"),
+            )
+
+    def test_checkpoint_sr_history_marks_improvement(self):
+        baseline = {
+            "summary": {
+                "task_success_rate": 0.25,
+                "macro_task_success_rate": 0.25,
+                "planned_episodes": 4,
+                "scored_episodes": 4,
+                "successful_episodes": 1,
+                "error_episodes": 0,
+                "evaluation_coverage": 1.0,
+            }
+        }
+        checkpoint = {
+            "summary": {
+                "task_success_rate": 0.75,
+                "macro_task_success_rate": 0.75,
+                "planned_episodes": 4,
+                "scored_episodes": 4,
+                "successful_episodes": 3,
+                "error_episodes": 0,
+                "evaluation_coverage": 1.0,
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline_path = root / "baseline.json"
+            checkpoint_path = root / "checkpoint.json"
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+            checkpoint_path.write_text(
+                json.dumps(checkpoint), encoding="utf-8"
+            )
+            history = training.write_checkpoint_sr_history(
+                baseline_path,
+                [
+                    {
+                        "step": 100,
+                        "label": "checkpoint-100",
+                        "adapter_path": "adapter",
+                        "merged_model_path": "model",
+                        "report_path": checkpoint_path,
+                    }
+                ],
+                output_json=root / "history.json",
+                output_csv=root / "history.csv",
+                output_markdown=root / "history.md",
+            )
+            row = history["checkpoints"][0]
+            self.assertEqual(row["micro_sr_gain_over_base"], 0.5)
+            self.assertEqual(row["verdict"], "improved")
+            self.assertEqual(history["best_checkpoint"]["step"], 100)
+            self.assertIn(
+                "IMPROVED",
+                (root / "history.md").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "micro_sr_gain_over_base",
+                (root / "history.csv").read_text(encoding="utf-8"),
+            )
+
+    def test_comparison_lists_fail_to_success_examples(self):
+        shared = {
+            "task_template": TASK_A,
+            "instance_id": 2,
+            "seed": 102,
+            "goal": "Add a contact",
+            "steps": [{"action_output": "Action: click(1)"}],
+        }
+        teacher = {
+            "summary": {
+                "task_success_rate": 1.0,
+                "macro_task_success_rate": 1.0,
+            },
+            "episodes": [{**shared, "is_successful": True, "outcome": "success"}],
+        }
+        baseline = {
+            "summary": {
+                "task_success_rate": 0.0,
+                "macro_task_success_rate": 0.0,
+            },
+            "episodes": [{**shared, "is_successful": False, "outcome": "failure"}],
+        }
+        student = {
+            "summary": {
+                "task_success_rate": 1.0,
+                "macro_task_success_rate": 1.0,
+            },
+            "episodes": [{**shared, "is_successful": True, "outcome": "success"}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {}
+            for name, report in (
+                ("teacher", teacher),
+                ("baseline", baseline),
+                ("student", student),
+            ):
+                path = root / f"{name}.json"
+                path.write_text(json.dumps(report), encoding="utf-8")
+                paths[name] = path
+            comparison = training.build_sr_comparison(
+                paths["teacher"],
+                paths["student"],
+                baseline_report_path=paths["baseline"],
+                output_json=root / "comparison.json",
+                output_markdown=root / "comparison.md",
+            )
+            self.assertEqual(comparison["overall"]["verdict"], "improved")
+            self.assertEqual(
+                comparison["episode_changes"]["improved_count"], 1
+            )
+            self.assertIn(
+                "fail to success",
+                (root / "comparison.md").read_text(encoding="utf-8"),
+            )
+
+    def test_one_page_result_can_fall_back_to_checkpoint_curve(self):
+        parser = training.build_parser()
+        with tempfile.TemporaryDirectory() as directory:
+            args = parser.parse_args(
+                [
+                    "--tasks",
+                    TASK_A,
+                    "--run_dir",
+                    directory,
+                    "--no-merge_lora",
+                ]
+            )
+            training.validate_args(args)
+            paths = training.resolve_paths(args)
+            paths.run_dir.mkdir(parents=True, exist_ok=True)
+            paths.training_summary_json.write_text(
+                json.dumps(
+                    {
+                        "train": {"first_loss": 1.0, "final_loss": 0.5},
+                        "validation": {"best_loss": 0.6},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths.checkpoint_sr_json.write_text(
+                json.dumps(
+                    {
+                        "baseline": {"micro_sr": 0.2},
+                        "checkpoints": [
+                            {
+                                "step": 100,
+                                "micro_sr": 0.6,
+                                "micro_sr_gain_over_base": 0.4,
+                                "verdict": "improved",
+                            }
+                        ],
+                        "best_checkpoint": {
+                            "step": 100,
+                            "micro_sr": 0.6,
+                            "micro_sr_gain_over_base": 0.4,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = training.build_distillation_result(
+                paths,
+                include_checkpoint_history=True,
+                include_final_comparison=False,
+            )
+            self.assertEqual(result["verdict"], "improved")
+            self.assertEqual(
+                result["result_source"], "last_periodic_checkpoint"
+            )
+            self.assertIn(
+                "+40.00 pp",
+                paths.result_markdown.read_text(encoding="utf-8"),
             )
 
 

@@ -825,6 +825,15 @@ def render_markdown(report: Mapping[str, Any], step_char_limit: int) -> str:
             ("Prompt cache-hit tokens", "prompt_cache_hit_tokens", None),
             ("Prompt cache-miss tokens", "prompt_cache_miss_tokens", None),
             ("Prompt cache-hit rate", "prompt_cache_hit_rate", "percent"),
+            ("VL prompt profile", "prompt_profile", None),
+            ("VL bbox coordinate mode", "bbox_coordinate_mode", None),
+            ("VL action requests", "action_request_count", None),
+            ("VL summary requests", "summary_request_count", None),
+            ("Screenshots sent", "image_count", None),
+            ("Screenshots resized", "resized_image_count", None),
+            ("Actions normalized", "converted_action_count", None),
+            ("Native M3A actions", "native_action_count", None),
+            ("Actions left unparsed", "unparsed_action_count", None),
         )
         for label, key, value_format in optional_inference_metrics:
             if inference.get(key) is None:

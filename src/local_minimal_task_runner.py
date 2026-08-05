@@ -142,13 +142,18 @@ def _main() -> None:
     print("Agent initialized.", flush=True)
 
     print("Goal: " + str(task.goal))
-    is_done = False
-    for _ in range(int(task.complexity * 10)):
+    agent_successful = False
+    step_number = 0
+    while True:
         response = agent.step(task.goal)
-        if response.done:
-            is_done = True
+        step_number += 1
+        print(f"Completed step {step_number}.", flush=True)
+        if task.is_successful(env) == 1:
+            agent_successful = True
+            print("Environment indicates task success.", flush=True)
             break
-    agent_successful = is_done and task.is_successful(env) == 1
+        if response.done:
+            break
     print(
         f'{"Task Successful ✅" if agent_successful else "Task Failed ❌"};'
         f" {task.goal}"

@@ -162,6 +162,25 @@ def build_parser(
         help="Give repeated combinations of one template identical parameters.",
     )
     suite.add_argument(
+        "--max_steps_per_episode",
+        type=int,
+        default=0,
+        help=(
+            "Maximum agent steps for each episode. Zero removes the step "
+            "limit; a positive value applies one fixed limit to every task."
+        ),
+    )
+    suite.add_argument(
+        "--stop_on_task_success",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run the AndroidWorld task evaluator after every step and stop "
+            "as soon as the requested state has been reached, even if the "
+            "agent did not explicitly output done."
+        ),
+    )
+    suite.add_argument(
         "--list_tasks",
         action="store_true",
         help="List available Android World task names and exit.",
@@ -234,6 +253,8 @@ def normalize_tasks(raw_tasks: Sequence[str] | None) -> list[str] | None:
 def validate_args(args: argparse.Namespace) -> None:
     if args.n_task_combinations < 1:
         raise ValueError("--n_task_combinations must be at least 1.")
+    if args.max_steps_per_episode < 0:
+        raise ValueError("--max_steps_per_episode cannot be negative.")
     if (
         hasattr(args, "tensor_parallel_size")
         and args.tensor_parallel_size < 1
@@ -1074,6 +1095,8 @@ def _base_config(
             "n_task_combinations": args.n_task_combinations,
             "task_random_seed": args.task_random_seed,
             "fixed_task_seed": args.fixed_task_seed,
+            "max_steps_per_episode": args.max_steps_per_episode,
+            "stop_on_task_success": args.stop_on_task_success,
         },
         "android_runtime": {
             "adb_path": str(args.adb_path),
@@ -1285,6 +1308,8 @@ def run_evaluation(
             checkpointer=checkpointer,
             demo_mode=False,
             return_full_episode_data=False,
+            max_n_steps_override=args.max_steps_per_episode,
+            stop_on_task_success=args.stop_on_task_success,
         )
         run_status = "completed"
     except KeyboardInterrupt as exc:

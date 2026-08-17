@@ -1,0 +1,88 @@
+# PMT-Skill v2 配置示例。相对路径均以本文件所在目录 src1 为基准。
+
+[paths]
+repo_root = ".."
+android_world_root = "../libs/android_world"
+skvm_skills_root = "../libs/skvm/skvm-data/skills"
+ms_swift_root = "../libs/ms-swift"
+state_dir = "./runtime"
+
+[offline]
+teacher_model_id = "teacher-glm-vl"
+student_model_path = "/home/zmz/Workspace/models/qwen3.5-0.8b"
+trajectory_dir = "./runtime/trajectories"
+dataset_dir = "./runtime/dataset"
+output_dir = "./runtime/checkpoints"
+successful_only = true
+validation_ratio = 0.05
+max_pixels = 1003520
+freeze_vit = false
+epochs = 2.0
+learning_rate = 0.0001
+lora_rank = 16
+lora_alpha = 32
+
+[routing]
+# 总分 = log(成功率) - 延迟惩罚 - 切换惩罚 + polished 奖励 - 降级代价。
+success_weight = 1.0
+latency_weight = 0.0001
+switch_weight = 0.003
+polished_bonus = 0.05
+degradation_weight = 0.02
+minimum_capability = 0.05
+maximum_candidates_per_position = 32
+
+[maintenance]
+minimum_support = 5
+minimum_candidate_trials = 10
+minimum_subsequence_length = 2
+maximum_subsequence_length = 5
+promotion_success_rate = 0.70
+rollback_success_rate = 0.45
+baseline_margin = 0.02
+# 取消注释后，backend 每轮会用该模型编译一批 SKVM raw skills。
+# raw_skill_compiler_model_id = "teacher-glm-vl"
+raw_skill_compile_batch_size = 8
+
+[android_world]
+adb_path = "adb"
+console_port = 5554
+emulator_setup = false
+# 0 表示移除 agent 步数上限；同时仍会在任务 evaluator 成功时停止。
+max_steps = 0
+stop_on_task_success = true
+wait_after_action_seconds = 1.0
+
+[[models]]
+model_id = "teacher-glm-vl"
+served_model = "/home/zmz/Workspace/models/glm4.1-9b"
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = "PMTSKILL_TEACHER_API_KEY"
+average_latency_ms = 2200.0
+switch_cost_ms = 0.0
+enabled = true
+
+[[models]]
+model_id = "student-base"
+served_model = "/home/zmz/Workspace/models/qwen3.5-0.8b"
+base_url = "http://127.0.0.1:8001/v1"
+api_key_env = "PMTSKILL_STUDENT_API_KEY"
+average_latency_ms = 600.0
+switch_cost_ms = 50.0
+enabled = true
+
+[[models]]
+model_id = "student-ui-grounding-lora"
+served_model = "qwen3.5-0.8b-grounding"
+base_url = "http://127.0.0.1:8001/v1"
+adapter = "./runtime/checkpoints/ui_grounding"
+api_key_env = "PMTSKILL_STUDENT_API_KEY"
+average_latency_ms = 650.0
+switch_cost_ms = 50.0
+enabled = true
+
+[models.capabilities]
+"ground.text" = 0.78
+"ground.icon" = 0.74
+"ground.bbox" = 0.76
+"action.click" = 0.72

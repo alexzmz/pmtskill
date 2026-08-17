@@ -1,0 +1,5 @@
+# 本地模型地址、轨迹、截图、数据库和 checkpoint 不应提交到仓库。
+runtime/
+config.local.toml
+__pycache__/
+*.py[cod]

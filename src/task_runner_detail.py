@@ -30,7 +30,6 @@ import sys
 import traceback
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ANDROID_WORLD_ROOT = REPO_ROOT / "libs" / "android_world"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "results" / "android_world"
@@ -65,11 +64,7 @@ def _find_adb() -> str:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
         candidates.append(
-            Path(local_app_data)
-            / "Android"
-            / "Sdk"
-            / "platform-tools"
-            / "adb.exe"
+            Path(local_app_data) / "Android" / "Sdk" / "platform-tools" / "adb.exe"
         )
     for candidate in candidates:
         try:
@@ -203,8 +198,7 @@ def build_parser(
             type=float,
             default=0.0,
             help=(
-                "Sampling temperature. Zero is recommended for reproducible "
-                "evals."
+                "Sampling temperature. Zero is recommended for reproducible " "evals."
             ),
         )
         model.add_argument("--top_p", type=float, default=0.95)
@@ -255,10 +249,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--n_task_combinations must be at least 1.")
     if args.max_steps_per_episode < 0:
         raise ValueError("--max_steps_per_episode cannot be negative.")
-    if (
-        hasattr(args, "tensor_parallel_size")
-        and args.tensor_parallel_size < 1
-    ):
+    if hasattr(args, "tensor_parallel_size") and args.tensor_parallel_size < 1:
         raise ValueError("--tensor_parallel_size must be at least 1.")
     if (
         hasattr(args, "gpu_memory_utilization")
@@ -282,9 +273,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if not 1 <= args.grpc_port <= 65535:
         raise ValueError("--grpc_port must be between 1 and 65535.")
     if args.max_consecutive_infrastructure_errors < 0:
-        raise ValueError(
-            "--max_consecutive_infrastructure_errors cannot be negative."
-        )
+        raise ValueError("--max_consecutive_infrastructure_errors cannot be negative.")
     if args.markdown_step_char_limit < 80:
         raise ValueError("--markdown_step_char_limit must be at least 80.")
 
@@ -466,9 +455,7 @@ def _extract_reason_and_action(output: Any) -> tuple[str | None, str | None]:
     return match.group(1).strip(), match.group(2).strip()
 
 
-def _extract_steps(
-    episode_data: Any, *, include_prompts: bool
-) -> list[dict[str, Any]]:
+def _extract_steps(episode_data: Any, *, include_prompts: bool) -> list[dict[str, Any]]:
     if not isinstance(episode_data, Mapping):
         return []
     lengths = [
@@ -482,17 +469,15 @@ def _extract_steps(
         action_output = _step_at(episode_data, "action_output", index)
         reason, action = _extract_reason_and_action(action_output)
         step = {
-            "step_number": _json_value(
-                _step_at(episode_data, "step_number", index)
-            )
-            if _step_at(episode_data, "step_number", index) is not None
-            else index,
+            "step_number": (
+                _json_value(_step_at(episode_data, "step_number", index))
+                if _step_at(episode_data, "step_number", index) is not None
+                else index
+            ),
             "reason": reason,
             "action": action,
             "action_output": _json_value(action_output),
-            "summary": _json_value(
-                _step_at(episode_data, "summary", index)
-            ),
+            "summary": _json_value(_step_at(episode_data, "summary", index)),
         }
         if include_prompts:
             step["action_prompt"] = _json_value(
@@ -594,9 +579,7 @@ def build_report(
 ) -> dict[str, Any]:
     metadata = _load_task_metadata(android_world_root)
     episodes = [
-        _extract_episode(
-            raw, metadata, include_prompts=include_prompts
-        )
+        _extract_episode(raw, metadata, include_prompts=include_prompts)
         for raw in raw_episodes
     ]
     episodes.sort(
@@ -642,9 +625,7 @@ def build_report(
         "evaluation_coverage": _round(
             len(scored) / planned_episodes if planned_episodes else None
         ),
-        "error_rate": _round(
-            errors / len(episodes) if episodes else None
-        ),
+        "error_rate": _round(errors / len(episodes) if episodes else None),
         "mean_episode_length": _round(
             _safe_mean(row["episode_length"] for row in scored), 2
         ),
@@ -950,9 +931,7 @@ def render_markdown(report: Mapping[str, Any], step_char_limit: int) -> str:
             ]
         )
         if episode.get("exception"):
-            lines.append(
-                f"- Exception: `{_compact(episode['exception'], 1000)}`"
-            )
+            lines.append(f"- Exception: `{_compact(episode['exception'], 1000)}`")
         steps = episode.get("steps") or []
         if steps:
             lines.extend(["", "| Step | Action | Reason / summary |", "|---:|---|---|"])
@@ -992,11 +971,7 @@ def write_report_files(report: Mapping[str, Any], run_dir: Path) -> None:
         run_dir / "report.md",
         render_markdown(
             report,
-            int(
-                report["run"]["config"]["reporting"][
-                    "markdown_step_char_limit"
-                ]
-            ),
+            int(report["run"]["config"]["reporting"]["markdown_step_char_limit"]),
         ),
     )
 
@@ -1253,9 +1228,7 @@ def run_evaluation(
         )
 
         task_registry = registry.TaskRegistry()
-        family = task_registry.get_registry(
-            task_registry.ANDROID_WORLD_FAMILY
-        )
+        family = task_registry.get_registry(task_registry.ANDROID_WORLD_FAMILY)
         suite = suite_utils.create_suite(
             family,
             n_task_combinations=args.n_task_combinations,
@@ -1267,8 +1240,7 @@ def run_evaluation(
         suite.suite_family = task_registry.ANDROID_WORLD_FAMILY
         planned_episodes = sum(len(instances) for instances in suite.values())
         print(
-            f"Selected {len(suite)} task templates / "
-            f"{planned_episodes} episodes.",
+            f"Selected {len(suite)} task templates / " f"{planned_episodes} episodes.",
             flush=True,
         )
 
@@ -1285,14 +1257,12 @@ def run_evaluation(
             else str(model_config.get("backend") or "model")
         )
         print(
-            f"Initializing {resolved_backend_label} backend: "
-            f"{model_identifier}",
+            f"Initializing {resolved_backend_label} backend: " f"{model_identifier}",
             flush=True,
         )
         llm = model_factory(args)
         resolved_agent_name = agent_name or (
-            f"t3a_{_slug(str(model_config.get('backend') or 'model'))}_"
-            f"{condition}"
+            f"t3a_{_slug(str(model_config.get('backend') or 'model'))}_" f"{condition}"
         )
         if agent_factory is None:
             agent = t3a.T3A(env, llm, name=resolved_agent_name)
@@ -1331,9 +1301,7 @@ def run_evaluation(
 
         raw_episodes = checkpointer.load()
         inference_stats = (
-            llm.get_stats()
-            if llm is not None and hasattr(llm, "get_stats")
-            else {}
+            llm.get_stats() if llm is not None and hasattr(llm, "get_stats") else {}
         )
         finished_at = dt.datetime.now(dt.timezone.utc).astimezone()
         report = build_report(

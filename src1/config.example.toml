@@ -3,13 +3,13 @@
 [paths]
 repo_root = ".."
 android_world_root = "../libs/android_world"
-skvm_skills_root = "../libs/skvm/skvm-data/skills"
+skvm_skills_root = "/home/zmz/Workspace/gui/libs/skvm/skvm-data/skills"
 ms_swift_root = "../libs/ms-swift"
 state_dir = "./runtime"
 
 [offline]
-teacher_model_id = "teacher-glm-vl"
-student_model_path = "/home/zmz/Workspace/models/qwen3.5-0.8b"
+teacher_model_id = "teacher-deepseek-v4-flash"
+student_model_path = "/home/zmz/Workspace/models/qwen3-vl-4b-instruct"
 trajectory_dir = "./runtime/trajectories"
 dataset_dir = "./runtime/dataset"
 output_dir = "./runtime/checkpoints"
@@ -54,10 +54,10 @@ stop_on_task_success = true
 wait_after_action_seconds = 1.0
 
 [[models]]
-model_id = "teacher-glm-vl"
-served_model = "/home/zmz/Workspace/models/glm4.1-9b"
-base_url = "http://127.0.0.1:8000/v1"
-api_key_env = "PMTSKILL_TEACHER_API_KEY"
+model_id = "teacher-deepseek-v4-flash"
+served_model = "/home/zmz/Workspace/models/deepseek-v4-flash"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
 average_latency_ms = 2200.0
 switch_cost_ms = 0.0
 enabled = true
@@ -68,6 +68,16 @@ served_model = "/home/zmz/Workspace/models/qwen3.5-0.8b"
 base_url = "http://127.0.0.1:8001/v1"
 api_key_env = "PMTSKILL_STUDENT_API_KEY"
 average_latency_ms = 600.0
+switch_cost_ms = 50.0
+enabled = true
+
+[[models]]
+model_id = "student-qwen3-vl"
+served_model = "/home/zmz/Workspace/models/qwen3-vl-4b-instruct"
+base_url = "http://127.0.0.1:8001/v1"
+adapter = "./runtime/checkpoints/ui_grounding"
+api_key_env = ""
+average_latency_ms = 650.0
 switch_cost_ms = 50.0
 enabled = true
 

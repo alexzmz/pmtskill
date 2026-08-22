@@ -32,7 +32,9 @@ def infer_action_primitives(action_output: str) -> tuple[str, ...]:
         ("control.finish", ('"status"', "goal_status")),
         ("action.click", ('"click"', '"tap"')),
     )
-    matches = [primitive for primitive, tokens in mapping if any(t in lowered for t in tokens)]
+    matches = [
+        primitive for primitive, tokens in mapping if any(t in lowered for t in tokens)
+    ]
     return tuple(matches or ("reason.decompose",))
 
 
@@ -130,7 +132,12 @@ class AndroidWorldDistillationDatasetBuilder:
         for step in range(step_count):
             action = actions[step]
             prompt = prompts[step]
-            if not action or not prompt or raw_images[step] is None or som_images[step] is None:
+            if (
+                not action
+                or not prompt
+                or raw_images[step] is None
+                or som_images[step] is None
+            ):
                 continue
             image_dir = self.output_dir / "images" / _safe_name(task_name) / episode_key
             raw_path = (image_dir / f"step_{step:04d}_raw.png").resolve()
@@ -163,6 +170,10 @@ class AndroidWorldDistillationDatasetBuilder:
         """转换并按 episode 切分 train/validation，返回完整 manifest。"""
 
         episodes = load_episode_files(trajectory_root)
+        print("loaded episodes:", len(episodes))
+        print("trajector_root:", trajectory_root)
+        for i, ep in enumerate(episodes[:5]):
+            print(i, type(ep))
         accepted: list[list[dict[str, Any]]] = []
         rejected = 0
         for index, episode in enumerate(episodes):
@@ -218,4 +229,3 @@ class AndroidWorldDistillationDatasetBuilder:
             len(accepted),
             rejected,
         )
-

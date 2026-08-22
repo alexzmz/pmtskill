@@ -33,8 +33,7 @@ class VLModelClient(Protocol):
         system_prompt: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 1024,
-    ) -> "GenerationResult":
-        ...
+    ) -> "GenerationResult": ...
 
 
 @dataclass(slots=True)
@@ -146,7 +145,9 @@ class OpenAICompatibleVLClient:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds
+                ) as response:
                     raw = json.loads(response.read().decode("utf-8"))
                 content = raw["choices"][0]["message"]["content"]
                 if isinstance(content, list):
@@ -177,6 +178,7 @@ class OpenAICompatibleVLClient:
         """兼容 AndroidWorld ``MultimodalLlmWrapper`` 的三元组接口。"""
 
         try:
+            print("predict_mm called, images =", len(images))
             result = self.generate(text_prompt, images, max_tokens=2048)
             raw = dict(result.raw)
             raw["_pmtskill"] = {
@@ -187,6 +189,7 @@ class OpenAICompatibleVLClient:
         except Exception as exc:  # M3A 会用空 raw 识别模型调用失败。
             return f"Error calling VL model: {exc}", None, None
 
-    def predict(self, text_prompt: str) -> tuple[str, bool | None, dict[str, Any] | None]:
+    def predict(
+        self, text_prompt: str
+    ) -> tuple[str, bool | None, dict[str, Any] | None]:
         return self.predict_mm(text_prompt, [])
-

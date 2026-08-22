@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,12 +21,15 @@ from .offline.trainer import (
 )
 from .online.backend import SkillOptimizationBackend
 from .inference.vlm import OpenAICompatibleVLClient
-from .online.planner import KeywordSkillPlanner, PlannerPipeline, PrimitiveTopologyGenerator
+from .online.planner import (
+    KeywordSkillPlanner,
+    PlannerPipeline,
+    PrimitiveTopologyGenerator,
+)
 from .online.router import DynamicProgrammingRouter
 from .skills.importer import import_skvm_skills, relevant_raw_skills
 from .skills.compiler import LLMRawSkillCompiler, compile_imported_raw_skills
 from .skills.store import SkillStore
-
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.example.toml"
 
@@ -76,9 +80,12 @@ def command_doctor(args: argparse.Namespace) -> int:
         "ms_swift_cli": (
             config.paths.ms_swift_root / "swift" / "cli" / "main.py"
         ).is_file(),
-        "student_model_path": Path(config.offline.student_model_path).expanduser().exists(),
+        "student_model_path": Path(config.offline.student_model_path)
+        .expanduser()
+        .exists(),
         "teacher_model_configured": any(
-            profile.model_id == config.offline.teacher_model_id for profile in config.models
+            profile.model_id == config.offline.teacher_model_id
+            for profile in config.models
         ),
         "primitive_count_is_26": len(load_primitives()) == 26,
     }
@@ -166,6 +173,7 @@ def command_compile_skills(args: argparse.Namespace) -> int:
     """显式运行一批 SKVM→Android raw skill 云侧编译。"""
 
     config, store = _open(args.config)
+    print(len(store.list_skills()))
     model_id = args.model_id or config.maintenance.raw_skill_compiler_model_id
     if not model_id:
         raise ValueError(
@@ -280,19 +288,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="TOML 配置文件")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init = subparsers.add_parser("init", help="初始化数据库、模型画像并导入 SKVM skills")
+    init = subparsers.add_parser(
+        "init", help="初始化数据库、模型画像并导入 SKVM skills"
+    )
     init.set_defaults(handler=command_init)
 
     doctor = subparsers.add_parser("doctor", help="检查本地路径和必要组件")
     doctor.set_defaults(handler=command_doctor)
 
-    collect = subparsers.add_parser("collect", help="教师 VL 模型采集 AndroidWorld 轨迹")
-    collect.add_argument("--tasks", nargs="*", help="任务名，可空格或逗号分隔；默认全部")
+    collect = subparsers.add_parser(
+        "collect", help="教师 VL 模型采集 AndroidWorld 轨迹"
+    )
+    collect.add_argument(
+        "--tasks", nargs="*", help="任务名，可空格或逗号分隔；默认全部"
+    )
     collect.add_argument("--combinations", type=int, default=1, help="每任务参数组合数")
     collect.add_argument("--seed", type=int, default=42)
     collect.set_defaults(handler=command_collect)
 
-    dataset = subparsers.add_parser("build-dataset", help="把轨迹转换成 ms-swift VL JSONL")
+    dataset = subparsers.add_parser(
+        "build-dataset", help="把轨迹转换成 ms-swift VL JSONL"
+    )
     dataset.add_argument("--trajectory-dir", help="覆盖配置中的轨迹目录")
     dataset.set_defaults(handler=command_build_dataset)
 
@@ -320,19 +336,26 @@ def build_parser() -> argparse.ArgumentParser:
     compile_skills = subparsers.add_parser(
         "compile-skills", help="用云模型把 SKVM raw skills 编译为 Android 原语拓扑"
     )
-    compile_skills.add_argument("--model-id", help="云侧编译模型；默认读取 maintenance 配置")
+    compile_skills.add_argument(
+        "--model-id", help="云侧编译模型；默认读取 maintenance 配置"
+    )
     compile_skills.add_argument("--limit", type=int, default=8, help="本批最大技能数")
     compile_skills.set_defaults(handler=command_compile_skills)
 
     skills = subparsers.add_parser("skills", help="查看技能及其真实在线统计")
-    skills.add_argument("--status", choices=["imported", "candidate", "active", "deprecated"])
+    skills.add_argument(
+        "--status", choices=["imported", "candidate", "active", "deprecated"]
+    )
     skills.add_argument("--kind", choices=["raw", "polished"])
     skills.set_defaults(handler=command_skills)
 
     profile = subparsers.add_parser("profile", help="更新模型/LoRA 的原语能力画像")
     profile.add_argument("--model-id", required=True)
     profile.add_argument(
-        "--capability", action="append", required=True, help="primitive_id=score，可重复"
+        "--capability",
+        action="append",
+        required=True,
+        help="primitive_id=score，可重复",
     )
     profile.set_defaults(handler=command_profile)
 
@@ -341,13 +364,17 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--include-candidates", action="store_true")
     plan.set_defaults(handler=command_plan)
 
-    evaluate = subparsers.add_parser("evaluate", help="运行动态模型/技能 AndroidWorld 评测")
+    evaluate = subparsers.add_parser(
+        "evaluate", help="运行动态模型/技能 AndroidWorld 评测"
+    )
     evaluate.add_argument("--tasks", nargs="*", help="任务名；默认全部")
     evaluate.add_argument("--combinations", type=int, default=1)
     evaluate.add_argument("--seed", type=int, default=42)
     evaluate.add_argument("--family", default="android_world")
     evaluate.add_argument("--planner-model", help="可选；不填则使用低延迟关键词规划")
-    evaluate.add_argument("--include-candidates", action="store_true", help="灰度试用候选技能")
+    evaluate.add_argument(
+        "--include-candidates", action="store_true", help="灰度试用候选技能"
+    )
     evaluate.add_argument("--output-dir")
     evaluate.set_defaults(handler=command_evaluate)
     return parser
@@ -363,4 +390,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
     except Exception as exc:
         print(f"错误：{exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return 1

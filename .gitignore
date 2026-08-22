@@ -10,6 +10,7 @@ Android/Sdk/
 __pycache__/
 build/
 /results/
+src1/pmtskill_v2/runtime/*
 
 # log
 *log*

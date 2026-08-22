@@ -123,6 +123,8 @@ python -m src1 --config src1/config.local.toml collect \
 family。输出沿用 AndroidWorld `IncrementalCheckpointer` 的 `.pkl.gz`，因此中断后
 用同一目录可续跑。
 
+需要启动emulator和教师模型服务
+
 ### 4.3 生成 ms-swift 多模态数据
 
 ```bash

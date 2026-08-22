@@ -15,8 +15,7 @@ from .store import SkillStore
 class RawSkillCompiler(Protocol):
     compiler_id: str
 
-    def compile(self, skill: SkillRecord) -> SkillRecord:
-        ...
+    def compile(self, skill: SkillRecord) -> SkillRecord: ...
 
 
 @dataclass(slots=True)
@@ -62,6 +61,7 @@ class LLMRawSkillCompiler:
         self.primitives = tuple(primitives)
 
     def compile(self, skill: SkillRecord) -> SkillRecord:
+        print(skill.name)
         catalog = [
             {
                 "primitive_id": item.primitive_id,
@@ -70,11 +70,23 @@ class LLMRawSkillCompiler:
             for item in self.primitives
         ]
         prompt = (
-            "判断下面的通用技能能否安全适配为 AndroidWorld 手机操作技能。"
-            "若无关，不要牵强映射。只输出严格 JSON："
-            '{"android_relevant":true|false,"primitives":[],"adapted_instruction":"",'
-            '"reason":""}。primitives 必须按执行顺序且只能使用给定 ID。\n'
-            f"技能名：{skill.name}\n描述：{skill.description}\n"
+            "你正在将通用 Agent skill 编译为 AndroidWorld GUI skill。"
+            "请判断该 skill 所表达的任务目标，是否可以通过 Android 手机上的应用、"
+            "系统界面或常见 GUI 交互合理实现。"
+            "不要要求原始 skill 本身包含 Android、点击、滑动等字样。"
+            "只要其任务语义可以合理落地到 Android GUI，就设 android_relevant=true。"
+            "只有明显属于纯后端、纯编程、纯服务器、纯专业知识推理、"
+            "且无法通过 Android GUI 实现的任务，才设为 false。"
+            "\n"
+            "若可适配，请给出完成该任务语义所需的最小 primitive 执行序列。"
+            "primitives 必须按执行顺序，且只能使用给定 primitive ID。"
+            "不要输出分析过程，不要解释，不要使用 markdown。"
+            "reason 不超过 40 个中文字符。"
+            "只输出严格 JSON："
+            '{"android_relevant":true|false,"primitives":[],'
+            '"adapted_instruction":"","reason":""}。\n'
+            f"技能名：{skill.name}\n"
+            f"描述：{skill.description}\n"
             f"技能正文：{skill.body[:6000]}\n"
             f"允许原语：{json.dumps(catalog, ensure_ascii=False)}"
         )
@@ -88,6 +100,12 @@ class LLMRawSkillCompiler:
         skill.metadata["raw_skill_compile_reason"] = str(value.get("reason", ""))
         skill.metadata["raw_skill_compiled"] = True
         skill.metadata["approved_for_planning"] = relevant
+        print(
+            "RELEVANT",
+            relevant,
+            "PRIMITIVES",
+            sequence,
+        )
         if relevant:
             skill.topology = SkillTopology.from_sequence(sequence)
             instruction = str(value.get("adapted_instruction", "")).strip()

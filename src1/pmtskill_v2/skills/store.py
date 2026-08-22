@@ -12,7 +12,13 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..core.models import ExecutionTrace, ModelProfile, SkillRecord, SkillStatus, utc_now
+from ..core.models import (
+    ExecutionTrace,
+    ModelProfile,
+    SkillRecord,
+    SkillStatus,
+    utc_now,
+)
 
 
 class SkillStore:
@@ -195,13 +201,75 @@ class SkillStore:
                 (profile.model_id, payload, utc_now()),
             )
 
+    def rollback_raw_skill_compile(self, skill_id: str) -> SkillRecord:
+        """
+        将一个经过 raw-skill compiler 的 skill
+        恢复到编译前的 raw-skill 状态。
+
+        返回回溯后的 SkillRecord。
+        """
+
+        skill = self.get_skill(skill_id)
+        if skill is None:
+            raise KeyError(f"技能不存在: {skill_id}")
+
+        if skill.kind != "raw":
+            raise ValueError(f"技能 {skill_id} 不是 raw skill，当前 kind={skill.kind}")
+
+        if not skill.metadata.get("raw_skill_compiled"):
+            raise ValueError(f"技能 {skill_id} 尚未经过 raw skill compile")
+
+        # 1. 恢复 compiler 可能修改的正文
+        original_body = skill.metadata.get("original_body")
+        if original_body is not None:
+            skill.body = original_body
+
+        # 2. 恢复 topology
+        skill.topology = None
+
+        # 3. 清除 compiler 产生的 metadata
+        compile_metadata_keys = (
+            "raw_skill_compiler",
+            "raw_skill_compiler_model",
+            "raw_skill_compile_reason",
+            "raw_skill_compiled",
+            "approved_for_planning",
+            "original_body",
+            "original_topology",
+        )
+
+        for key in compile_metadata_keys:
+            skill.metadata.pop(key, None)
+
+        # 4. 强制保证还是 raw
+        skill.kind = "raw"
+        skill.updated_at = utc_now()
+
+        # 5. 写回同一条记录
+        self.upsert_skill(skill)
+
+        # 6. 留 maintenance log
+        self.log_maintenance_event(
+            "raw_skill_compile_rollback",
+            skill.skill_id,
+            {
+                "skill_name": skill.name,
+            },
+        )
+
+        return skill
+
     def list_model_profiles(self, *, enabled_only: bool = True) -> list[ModelProfile]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT profile_json FROM model_profiles ORDER BY model_id"
             ).fetchall()
         profiles = [ModelProfile.from_dict(json.loads(row[0])) for row in rows]
-        return [profile for profile in profiles if profile.enabled] if enabled_only else profiles
+        return (
+            [profile for profile in profiles if profile.enabled]
+            if enabled_only
+            else profiles
+        )
 
     def record_skill_trial(
         self, skill_id: str, model_id: str, success: bool, latency_ms: float
@@ -223,7 +291,9 @@ class SkillStore:
                 (skill_id, model_id, int(success), max(0.0, latency_ms), utc_now()),
             )
 
-    def skill_metrics(self, skill_id: str, model_id: str | None = None) -> dict[str, Any]:
+    def skill_metrics(
+        self, skill_id: str, model_id: str | None = None
+    ) -> dict[str, Any]:
         """汇总技能统计；Beta(1,1) 平滑避免小样本得到 0 或 1。"""
 
         sql = "SELECT SUM(successes), SUM(trials), SUM(latency_sum_ms) FROM skill_metrics WHERE skill_id = ?"
@@ -337,7 +407,12 @@ class SkillStore:
                 INSERT INTO maintenance_events(event_type, subject_id, detail_json, created_at)
                 VALUES(?, ?, ?, ?)
                 """,
-                (event_type, subject_id, json.dumps(detail, ensure_ascii=False), utc_now()),
+                (
+                    event_type,
+                    subject_id,
+                    json.dumps(detail, ensure_ascii=False),
+                    utc_now(),
+                ),
             )
 
 
@@ -349,5 +424,7 @@ def wilson_lower_bound(successes: int, trials: int, z: float = 1.96) -> float:
     probability = successes / trials
     denominator = 1 + z * z / trials
     centre = probability + z * z / (2 * trials)
-    margin = z * ((probability * (1 - probability) / trials + z * z / (4 * trials**2)) ** 0.5)
+    margin = z * (
+        (probability * (1 - probability) / trials + z * z / (4 * trials**2)) ** 0.5
+    )
     return max(0.0, (centre - margin) / denominator)

@@ -39,7 +39,7 @@ class OfflineConfig:
     trajectory_dir: Path
     dataset_dir: Path
     output_dir: Path
-    successful_only: bool = True
+    successful_only: bool = False
     validation_ratio: float = 0.05
     max_pixels: int = 1003520
     freeze_vit: bool = False
@@ -163,7 +163,7 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         output_dir=_resolve_path(
             base, offline_raw.get("output_dir", "./runtime/checkpoints")
         ),
-        successful_only=bool(offline_raw.get("successful_only", True)),
+        successful_only=bool(offline_raw.get("successful_only", False)),
         validation_ratio=float(offline_raw.get("validation_ratio", 0.05)),
         max_pixels=int(offline_raw.get("max_pixels", 1003520)),
         freeze_vit=bool(offline_raw.get("freeze_vit", False)),

@@ -131,6 +131,19 @@ family。输出沿用 AndroidWorld `IncrementalCheckpointer` 的 `.pkl.gz`，因
 python -m src1 --config src1/config.local.toml build-dataset
 ```
 
+默认同时使用成功、失败和结果未知的 episode，并逐 step 过滤：只要存在可辨认的
+教师输出、任务 prompt（缺失时回退到 goal）以及至少一张有效截图，就生成训练样本。
+episode 的结果保存在 `metadata.episode_outcome`，不会再作为默认丢弃条件。
+
+如果旧的 `config.local.toml` 仍写着 `successful_only = true`，可以改成 `false`，
+或直接覆盖：
+
+```bash
+python -m src1 --config src1/config.local.toml build-dataset --include-failed
+```
+
+只有确实需要严格成功数据集时才使用 `--successful-only`。
+
 每个有效 step 生成：
 
 ```json
@@ -144,8 +157,8 @@ python -m src1 --config src1/config.local.toml build-dataset
 }
 ```
 
-默认只学习成功 episode；训练/验证按完整 episode 切分，避免一条轨迹的相邻
-截图同时出现在两边。
+训练/验证仍按完整 episode 切分，避免一条轨迹的相邻截图同时出现在两边。
+`manifest.json` 会记录 episode 结果分布、候选/接受/拒绝 step 数量和逐项拒绝原因。
 
 ### 4.4 训练通用或定向 LoRA
 

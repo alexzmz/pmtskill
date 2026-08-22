@@ -106,7 +106,9 @@ def command_collect(args: argparse.Namespace) -> int:
 def command_build_dataset(args: argparse.Namespace) -> int:
     config, _ = _open(args.config)
     root = Path(args.trajectory_dir).resolve() if args.trajectory_dir else None
-    result = OfflineDistillationPipeline(config).build_dataset(root)
+    result = OfflineDistillationPipeline(config).build_dataset(
+        root, successful_only=args.successful_only
+    )
     _print(result.to_dict())
     return 0
 
@@ -310,6 +312,20 @@ def build_parser() -> argparse.ArgumentParser:
         "build-dataset", help="把轨迹转换成 ms-swift VL JSONL"
     )
     dataset.add_argument("--trajectory-dir", help="覆盖配置中的轨迹目录")
+    outcome_filter = dataset.add_mutually_exclusive_group()
+    outcome_filter.add_argument(
+        "--include-failed",
+        dest="successful_only",
+        action="store_false",
+        help="包含失败/未知结果 episode 中可学习的 step（默认）",
+    )
+    outcome_filter.add_argument(
+        "--successful-only",
+        dest="successful_only",
+        action="store_true",
+        help="仅转换 AndroidWorld 判定成功的 episode",
+    )
+    dataset.set_defaults(successful_only=None)
     dataset.set_defaults(handler=command_build_dataset)
 
     train = subparsers.add_parser("train", help="运行 ms-swift 多模态 LoRA SFT")

@@ -31,10 +31,19 @@ class OfflineDistillationPipeline:
             seed=seed,
         )
 
-    def build_dataset(self, trajectory_root: Path | None = None) -> DatasetBuildResult:
+    def build_dataset(
+        self,
+        trajectory_root: Path | None = None,
+        *,
+        successful_only: bool | None = None,
+    ) -> DatasetBuildResult:
         builder = AndroidWorldDistillationDatasetBuilder(
             self.config.offline.dataset_dir,
-            successful_only=self.config.offline.successful_only,
+            successful_only=(
+                self.config.offline.successful_only
+                if successful_only is None
+                else successful_only
+            ),
             validation_ratio=self.config.offline.validation_ratio,
         )
         return builder.build(trajectory_root or self.config.offline.trajectory_dir)

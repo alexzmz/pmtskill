@@ -5,12 +5,14 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import pickle
 import random
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from ..core.io import write_json_atomic, write_jsonl
 
@@ -38,11 +40,30 @@ def infer_action_primitives(action_output: str) -> tuple[str, ...]:
     return tuple(matches or ("reason.decompose",))
 
 
-def _episode_value(episode: dict[str, Any], *keys: str, default: Any = None) -> Any:
+def _episode_value(
+    episode: Mapping[str, Any], *keys: str, default: Any = None
+) -> Any:
     for key in keys:
         if key in episode:
             return episode[key]
     return default
+
+
+_EPISODE_HINT_KEYS = frozenset(
+    {"episode_data", "goal", "task_template", "task_name", "is_successful"}
+)
+
+
+def _iter_episode_records(value: Any):
+    """兼容新旧 checkpointer 的 list、单 dict 和嵌套 tuple 包装。"""
+
+    if isinstance(value, Mapping):
+        if _EPISODE_HINT_KEYS.intersection(value):
+            yield dict(value)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_episode_records(item)
 
 
 def load_episode_files(root: str | Path) -> list[dict[str, Any]]:
@@ -52,9 +73,50 @@ def load_episode_files(root: str | Path) -> list[dict[str, Any]]:
     for path in sorted(Path(root).rglob("*.pkl.gz")):
         with gzip.open(path, "rb") as handle:
             value = pickle.load(handle)  # noqa: S301 - 文件来自本地 AndroidWorld。
-        if isinstance(value, list):
-            episodes.extend(item for item in value if isinstance(item, dict))
+        episodes.extend(_iter_episode_records(value))
     return episodes
+
+
+def _is_successful(value: Any) -> bool:
+    """解析 AndroidWorld 的 0/1 成功分数，并把失败占位 NaN 判为 False。"""
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "success", "successful"}
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric > 0.5
+
+
+def _normalize_episode_data(value: Any) -> Mapping[str, Any] | None:
+    """把字段列表或按 step 保存的字典列表归一化为 dict-of-lists。"""
+
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, (list, tuple)):
+        return None
+    if not value:
+        return {}
+    if not all(isinstance(step, Mapping) for step in value):
+        return None
+    keys = {
+        key
+        for step in value
+        for key in step
+        if isinstance(key, str)
+    }
+    return {key: [step.get(key) for step in value] for key in keys}
+
+
+def _step_values(value: Any) -> list[Any]:
+    """允许旧轨迹把单步字段直接保存成标量，而不是长度为 1 的列表。"""
+
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
 
 
 def _safe_name(value: str) -> str:
@@ -115,11 +177,15 @@ class AndroidWorldDistillationDatasetBuilder:
     def _convert_episode(
         self, episode: dict[str, Any], episode_index: int
     ) -> list[dict[str, Any]]:
-        episode_data = _episode_value(episode, "episode_data", default={}) or {}
-        actions = episode_data.get("action_output", [])
-        prompts = episode_data.get("action_prompt", [])
-        raw_images = episode_data.get("raw_screenshot", [])
-        som_images = episode_data.get("before_screenshot_with_som", [])
+        episode_data = _normalize_episode_data(
+            _episode_value(episode, "episode_data", default={})
+        )
+        if episode_data is None:
+            return []
+        actions = _step_values(episode_data.get("action_output"))
+        prompts = _step_values(episode_data.get("action_prompt"))
+        raw_images = _step_values(episode_data.get("raw_screenshot"))
+        som_images = _step_values(episode_data.get("before_screenshot_with_som"))
         task_name = str(
             _episode_value(episode, "task_template", "task_name", default="unknown")
         )
@@ -170,24 +236,23 @@ class AndroidWorldDistillationDatasetBuilder:
         """转换并按 episode 切分 train/validation，返回完整 manifest。"""
 
         episodes = load_episode_files(trajectory_root)
-        print("loaded episodes:", len(episodes))
-        print("trajector_root:", trajectory_root)
-        for i, ep in enumerate(episodes[:5]):
-            print(i, type(ep))
         accepted: list[list[dict[str, Any]]] = []
         rejected = 0
+        rejection_reasons = {"unsuccessful": 0, "invalid_or_empty": 0}
         for index, episode in enumerate(episodes):
-            successful = bool(
+            successful = _is_successful(
                 _episode_value(episode, "is_successful", "successful", default=False)
             )
             if self.successful_only and not successful:
                 rejected += 1
+                rejection_reasons["unsuccessful"] += 1
                 continue
             samples = self._convert_episode(episode, index)
             if samples:
                 accepted.append(samples)
             else:
                 rejected += 1
+                rejection_reasons["invalid_or_empty"] += 1
 
         rng = random.Random(self.seed)
         rng.shuffle(accepted)
@@ -199,7 +264,13 @@ class AndroidWorldDistillationDatasetBuilder:
         train_rows = [sample for group in train_groups for sample in group]
         validation_rows = [sample for group in validation_groups for sample in group]
         if not train_rows:
-            raise ValueError("没有可用训练样本；请检查轨迹目录、成功标记和截图字段")
+            raise ValueError(
+                "没有可用训练样本；"
+                f"读取 episode={len(episodes)}，"
+                f"unsuccessful={rejection_reasons['unsuccessful']}，"
+                f"invalid_or_empty={rejection_reasons['invalid_or_empty']}；"
+                "请检查成功标记和截图字段"
+            )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         train_path = self.output_dir / "train.jsonl"
@@ -218,6 +289,7 @@ class AndroidWorldDistillationDatasetBuilder:
             "validation_samples": validation_count,
             "accepted_episodes": len(accepted),
             "rejected_episodes": rejected,
+            "rejection_reasons": rejection_reasons,
         }
         write_json_atomic(manifest_path, manifest)
         return DatasetBuildResult(

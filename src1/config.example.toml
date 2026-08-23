@@ -48,8 +48,8 @@ raw_skill_compile_batch_size = 8
 adb_path = "adb"
 console_port = 5554
 emulator_setup = false
-# 0 表示移除 agent 步数上限；同时仍会在任务 evaluator 成功时停止。
-max_steps = 0
+# 每个 episode 最多 50 步；collector 还会在运行时强制执行这一硬上限。
+max_steps = 50
 stop_on_task_success = true
 wait_after_action_seconds = 1.0
 

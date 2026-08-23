@@ -80,7 +80,7 @@ class AndroidWorldConfig:
     console_port: int = 5554
     emulator_setup: bool = False
     task_registry: str = "android_world.task_evals.registry.TaskRegistry"
-    max_steps: int = 0
+    max_steps: int = 50
     stop_on_task_success: bool = True
     wait_after_action_seconds: float = 1.0
 

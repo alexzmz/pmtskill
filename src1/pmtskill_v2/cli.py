@@ -97,7 +97,10 @@ def command_doctor(args: argparse.Namespace) -> int:
 def command_collect(args: argparse.Namespace) -> int:
     config, _ = _open(args.config)
     result = OfflineDistillationPipeline(config).collect(
-        _tasks(args.tasks), combinations=args.combinations, seed=args.seed
+        _tasks(args.tasks),
+        combinations=args.combinations,
+        seed=args.seed,
+        max_steps=args.max_steps,
     )
     _print(result.to_dict())
     return 0
@@ -306,6 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--combinations", type=int, default=1, help="每任务参数组合数")
     collect.add_argument("--seed", type=int, default=42)
+    collect.add_argument(
+        "--max-steps",
+        type=int,
+        help="每个 episode 的步数上限；可调低，但无论配置为何都不会超过 50",
+    )
     collect.set_defaults(handler=command_collect)
 
     dataset = subparsers.add_parser(

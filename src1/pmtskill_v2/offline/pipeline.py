@@ -23,12 +23,14 @@ class OfflineDistillationPipeline:
         *,
         combinations: int = 1,
         seed: int = 42,
+        max_steps: int | None = None,
     ) -> CollectionResult:
         return collect_teacher_trajectories(
             self.config,
             tasks=tasks,
             n_task_combinations=combinations,
             seed=seed,
+            max_steps=max_steps,
         )
 
     def build_dataset(

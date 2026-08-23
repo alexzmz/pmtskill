@@ -77,8 +77,8 @@ cp src1/config.example.toml src1/config.local.toml
 - `offline.student_model_path` 是 ms-swift 训练的学生 VL 基座；
 - 每个 `[[models]]` 是在线可选的基座或 LoRA served model；
 - `[models.capabilities]` 保存该模型在每个原语上的成功率画像；
-- `android_world.max_steps = 0` 表示不设置 agent steps 上限；任务 evaluator
-  一旦成功仍会因 `stop_on_task_success = true` 正常停止；
+- `android_world.max_steps = 50` 表示每个 episode 最多执行 50 步；collector
+  会在 AndroidWorld 的 episode runner 外层再次强制这一硬上限，任务完成时仍会提前停止；
 - API key 只通过 `api_key_env` 指定的环境变量读取，不写入 TOML。
 
 初始化数据库、导入 SKVM 技能并登记模型：
@@ -118,6 +118,9 @@ python -m src1 --config src1/config.local.toml collect \
   --tasks ContactsAddContact SimpleCalendarAddOneEvent \
   --combinations 10 --seed 42
 ```
+
+每个 episode 默认最多执行 50 步。可以临时调低，例如 `--max-steps 30`，但不能
+把上限提高到 50 以上；到达上限时只结束当前 episode，checkpoint 保存后继续下一个。
 
 `--tasks` 正是“选择哪些任务做蒸馏”的参数；也接受逗号分隔。不传时运行整个
 family。输出沿用 AndroidWorld `IncrementalCheckpointer` 的 `.pkl.gz`，因此中断后

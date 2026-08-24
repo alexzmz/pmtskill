@@ -155,6 +155,8 @@ def command_build_dataset(args: argparse.Namespace) -> int:
 
 def command_train(args: argparse.Namespace) -> int:
     config, store = _open(args.config)
+    if args.train_cuda_visible_devices is not None:
+        config.offline.cuda_visible_devices = args.train_cuda_visible_devices
     trainer = MSSwiftLoraTrainer(config)
     if args.primitives:
         name = args.adapter_name or "directional_adapter"
@@ -231,6 +233,18 @@ def command_train(args: argparse.Namespace) -> int:
                 "job": job.name,
                 "with_android_evaluation": True,
                 "evaluation_output_dir": run_dir,
+                "resource_assignment": {
+                    "training_cuda_visible_devices": (
+                        config.offline.cuda_visible_devices
+                    ),
+                    "evaluation_cuda_visible_devices": (
+                        settings.cuda_visible_devices
+                    ),
+                    "evaluation_max_model_len": settings.max_model_len,
+                    "evaluation_gpu_memory_utilization": (
+                        settings.gpu_memory_utilization
+                    ),
+                },
                 "tasks": selected_tasks or {
                     "sample_count": settings.task_count,
                     "seed": settings.seed,
@@ -287,6 +301,16 @@ def command_train(args: argparse.Namespace) -> int:
                 seed=settings.seed,
                 every_epochs=settings.every_epochs,
                 include_candidate_skills=settings.include_candidate_skills,
+                training_cuda_visible_devices=(
+                    config.offline.cuda_visible_devices
+                ),
+                evaluation_cuda_visible_devices=(
+                    settings.cuda_visible_devices
+                ),
+                evaluation_max_model_len=settings.max_model_len,
+                evaluation_gpu_memory_utilization=(
+                    settings.gpu_memory_utilization
+                ),
             ),
         )
         _print({"job": job.name, "with_android_evaluation": True, **result.to_dict()})
@@ -332,6 +356,21 @@ def _training_evaluation_settings(
             else current.deploy_port
         ),
         infer_backend=args.eval_infer_backend or current.infer_backend,
+        max_model_len=(
+            args.eval_max_model_len
+            if args.eval_max_model_len is not None
+            else current.max_model_len
+        ),
+        gpu_memory_utilization=(
+            args.eval_gpu_memory_utilization
+            if args.eval_gpu_memory_utilization is not None
+            else current.gpu_memory_utilization
+        ),
+        cuda_visible_devices=(
+            args.eval_cuda_visible_devices
+            if args.eval_cuda_visible_devices is not None
+            else current.cuda_visible_devices
+        ),
     )
     if resolved.task_count <= 0:
         raise ValueError("--eval-task-count 必须是正整数")
@@ -341,6 +380,10 @@ def _training_evaluation_settings(
         raise ValueError("--eval-every-epochs 必须是正整数")
     if not 1 <= resolved.deploy_port <= 65535:
         raise ValueError("--eval-deploy-port 必须在 [1, 65535]")
+    if resolved.max_model_len <= 0:
+        raise ValueError("--eval-max-model-len 必须是正整数")
+    if not 0 < resolved.gpu_memory_utilization <= 1:
+        raise ValueError("--eval-gpu-memory-utilization 必须在 (0, 1]")
     if resolved.startup_timeout_seconds <= 0:
         raise ValueError("training_evaluation.startup_timeout_seconds 必须为正数")
     if resolved.startup_poll_seconds <= 0:
@@ -553,6 +596,13 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--adapter-name", help="输出 adapter 名称")
     train.add_argument("--primitives", nargs="*", help="仅训练指定原语的定向 LoRA")
     train.add_argument(
+        "--train-cuda-visible-devices",
+        help=(
+            "ms-swift SFT 使用的物理 GPU，例如 2 或 2,3；"
+            "覆盖 [offline].cuda_visible_devices"
+        ),
+    )
+    train.add_argument(
         "--extra-arg",
         action="append",
         help="传给 ms-swift 的单个额外参数；可重复，例如 --extra-arg=--bf16",
@@ -601,6 +651,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--eval-output-dir", help="本次训练、checkpoint 和评测总目录")
     train.add_argument("--eval-deploy-port", type=int, help="临时 ms-swift 服务端口")
+    train.add_argument(
+        "--eval-cuda-visible-devices",
+        help=(
+            "评测 swift deploy 使用的物理 GPU，例如 1；"
+            "覆盖 [training_evaluation].cuda_visible_devices"
+        ),
+    )
+    train.add_argument(
+        "--eval-max-model-len",
+        type=int,
+        help="评测 vLLM 最大上下文；默认 32768，用于限制 KV cache",
+    )
+    train.add_argument(
+        "--eval-gpu-memory-utilization",
+        type=float,
+        help="评测 vLLM 可使用的显存比例，范围 (0,1]",
+    )
     train.add_argument(
         "--eval-infer-backend",
         choices=["vllm", "transformers", "sglang", "lmdeploy"],

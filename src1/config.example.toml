@@ -23,6 +23,8 @@ epochs = 2.0
 learning_rate = 0.0001
 lora_rank = 16
 lora_alpha = 32
+# ms-swift SFT 使用的物理 GPU；多卡可写成 "2,3"。不设置则继承当前 shell。
+# cuda_visible_devices = "2"
 
 [training_evaluation]
 # 默认保持 train 为纯训练；CLI 传 --with-evaluation 时临时启用完整评测闭环。
@@ -42,14 +44,16 @@ include_candidate_skills = false
 deploy_host = "127.0.0.1"
 deploy_port = 8002
 infer_backend = "vllm"
+# 显式覆盖模型 config.json 中的 262144，控制 vLLM KV cache 显存。
+max_model_len = 32768
+gpu_memory_utilization = 0.90
+# 评测模型使用的物理 GPU，应与上面的训练 GPU 分开。
+# cuda_visible_devices = "1"
 startup_timeout_seconds = 600.0
 startup_poll_seconds = 2.0
 max_new_tokens = 2048
-# 可按显存和模型上下文覆盖 ms-swift deploy 参数。
-deploy_extra_args = [
-  "--vllm_gpu_memory_utilization", "0.90",
-  "--vllm_max_model_len", "8192",
-]
+# 其余未结构化的 swift deploy 参数仍可从这里扩展。
+deploy_extra_args = []
 
 [routing]
 # 总分 = log(成功率) - 延迟惩罚 - 切换惩罚 + polished 奖励 - 降级代价。

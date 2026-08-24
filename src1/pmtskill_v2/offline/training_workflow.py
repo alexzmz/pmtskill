@@ -90,6 +90,10 @@ class TrainingEvaluationOptions:
     seed: int = 42
     every_epochs: int = 1
     include_candidate_skills: bool = False
+    training_cuda_visible_devices: str | None = None
+    evaluation_cuda_visible_devices: str | None = None
+    evaluation_max_model_len: int | None = None
+    evaluation_gpu_memory_utilization: float | None = None
 
 
 @dataclass(slots=True)
@@ -477,6 +481,18 @@ class TrainingEvaluationWorkflow:
             "total_epochs": self.config.offline.epochs,
             "epoch_targets": targets,
             "include_candidate_skills": options.include_candidate_skills,
+            "resource_assignment": {
+                "training_cuda_visible_devices": (
+                    options.training_cuda_visible_devices
+                ),
+                "evaluation_cuda_visible_devices": (
+                    options.evaluation_cuda_visible_devices
+                ),
+                "evaluation_max_model_len": options.evaluation_max_model_len,
+                "evaluation_gpu_memory_utilization": (
+                    options.evaluation_gpu_memory_utilization
+                ),
+            },
         }
         recorder = TrainingEvaluationRecorder(options.output_dir, manifest)
         checkpoint: Path | None = None

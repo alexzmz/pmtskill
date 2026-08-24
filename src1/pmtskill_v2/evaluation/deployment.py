@@ -70,6 +70,15 @@ class MSSwiftEvaluationDeployment:
             )
         )
         command.extend(self.settings.deploy_extra_args)
+        # 放在 extra args 之后，确保正式 TOML 字段是最终生效值。
+        command.extend(
+            (
+                "--vllm_max_model_len",
+                str(self.settings.max_model_len),
+                "--vllm_gpu_memory_utilization",
+                str(self.settings.gpu_memory_utilization),
+            )
+        )
         return command
 
     def profile(self, checkpoint: Path | None) -> ModelProfile:
@@ -94,6 +103,21 @@ class MSSwiftEvaluationDeployment:
                 ),
             },
         )
+
+    def build_environment(self) -> dict[str, str]:
+        """构造评测服务环境；GPU 可见性与训练进程完全独立。"""
+
+        environment = os.environ.copy()
+        old_pythonpath = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = str(self.config.paths.ms_swift_root) + (
+            os.pathsep + old_pythonpath if old_pythonpath else ""
+        )
+        environment.setdefault("MAX_PIXELS", str(self.config.offline.max_pixels))
+        if self.settings.cuda_visible_devices is not None:
+            environment["CUDA_VISIBLE_DEVICES"] = (
+                self.settings.cuda_visible_devices
+            )
+        return environment
 
     def _assert_port_available(self) -> None:
         """提前拒绝端口冲突，避免 ms-swift 自动换端口后客户端一直空等。"""
@@ -162,12 +186,7 @@ class MSSwiftEvaluationDeployment:
 
         self._assert_port_available()
         command = self.build_command(checkpoint)
-        environment = os.environ.copy()
-        old_pythonpath = environment.get("PYTHONPATH", "")
-        environment["PYTHONPATH"] = str(self.config.paths.ms_swift_root) + (
-            os.pathsep + old_pythonpath if old_pythonpath else ""
-        )
-        environment.setdefault("MAX_PIXELS", str(self.config.offline.max_pixels))
+        environment = self.build_environment()
         process = subprocess.Popen(
             command,
             cwd=self.config.paths.ms_swift_root,

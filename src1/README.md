@@ -276,6 +276,51 @@ runtime/checkpoints/<adapter>/training_runs/<time>/
 周期评测阶段只测裸模型；最终阶段再测一次技能库，减少 emulator 时间。训练评测产生
 的 trace 不会写回技能数据库，避免测试集结果污染在线路由统计。
 
+#### 显存、上下文和训练/评测 GPU 分配
+
+若模型原始配置声明了 262K 上下文，vLLM 会按该长度预留 KV cache。即使 AndroidWorld
+实际 prompt 远小于 262K，也可能在服务启动阶段直接 OOM。建议在本地 TOML 中明确设置：
+
+```toml
+[offline]
+# 其余训练配置省略；物理 GPU 2 专用于 ms-swift SFT。
+cuda_visible_devices = "2"
+
+[training_evaluation]
+# 物理 GPU 1 专用于基座/checkpoint 的临时评测服务。
+cuda_visible_devices = "1"
+max_model_len = 32768
+gpu_memory_utilization = 0.90
+```
+
+框架会分别向两个子进程注入：
+
+```text
+训练进程：CUDA_VISIBLE_DEVICES=2 ... swift sft
+评测进程：CUDA_VISIBLE_DEVICES=1 ... swift deploy \
+          --vllm_max_model_len 32768 \
+          --vllm_gpu_memory_utilization 0.9
+```
+
+注意，设置 `CUDA_VISIBLE_DEVICES=2` 后，该进程内部通常把物理 GPU 2 映射成
+`cuda:0`，这是 CUDA 的正常行为。训练和评测在当前编排中不会同时运行，但分别指定
+GPU 可以避免继承错误的 shell 显卡环境，也方便后续改成并行部署。
+
+以上参数也可以临时从 CLI 覆盖：
+
+```bash
+python -m src1 --config src1/config.local.toml train \
+  --with-evaluation \
+  --train-cuda-visible-devices 2 \
+  --eval-cuda-visible-devices 1 \
+  --eval-max-model-len 32768 \
+  --eval-gpu-memory-utilization 0.90
+```
+
+如果 32768 仍不够，可依次降到 24576 或 16384；AndroidWorld 一般不需要 262K。
+启动失败后出现的 `destroy_process_group() was not called` 通常是 vLLM/NCCL 在前述
+OOM 异常退出后的清理警告，不是另一处独立故障。
+
 ## 5. 在线动态模型与技能选择
 
 先不连 emulator 查看路由解释：

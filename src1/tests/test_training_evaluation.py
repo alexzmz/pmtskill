@@ -24,6 +24,7 @@ from src1.pmtskill_v2.evaluation.deployment import MSSwiftEvaluationDeployment
 from src1.pmtskill_v2.evaluation.reporter import EvaluationArtifacts
 from src1.pmtskill_v2.offline.trainer import (
     AdapterJob,
+    MSSwiftLoraTrainer,
     find_latest_adapter_checkpoint,
 )
 from src1.pmtskill_v2.offline.training_workflow import (
@@ -57,10 +58,14 @@ def _config(root: Path) -> ProjectConfig:
             dataset_dir=root / "dataset",
             output_dir=root / "outputs",
             epochs=2.0,
+            cuda_visible_devices="2",
         ),
         training_evaluation=TrainingEvaluationConfig(
             enabled=True,
             model_id="student-vl",
+            max_model_len=32768,
+            gpu_memory_utilization=0.9,
+            cuda_visible_devices="1",
         ),
         routing=RoutingConfig(),
         maintenance=MaintenanceConfig(),
@@ -163,12 +168,29 @@ class TrainingEvaluationTest(unittest.TestCase):
             command = deployment.build_command(checkpoint)
             self.assertIn("--adapters", command)
             self.assertIn(str(checkpoint.resolve()), command)
+            max_len_index = command.index("--vllm_max_model_len")
+            memory_index = command.index("--vllm_gpu_memory_utilization")
+            self.assertEqual(command[max_len_index + 1], "32768")
+            self.assertEqual(command[memory_index + 1], "0.9")
+            self.assertEqual(
+                deployment.build_environment()["CUDA_VISIBLE_DEVICES"], "1"
+            )
             profile = deployment.profile(checkpoint)
             self.assertIsNone(profile.adapter)
             self.assertEqual(
                 profile.metadata["evaluation_checkpoint"], str(checkpoint.resolve())
             )
             self.assertIn("checkpoint-10", profile.served_model)
+
+    def test_training_and_evaluation_have_independent_gpu_environments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            trainer_environment = MSSwiftLoraTrainer(config).build_environment()
+            deployment_environment = MSSwiftEvaluationDeployment(
+                config, config.training_evaluation, config.models[0]
+            ).build_environment()
+            self.assertEqual(trainer_environment["CUDA_VISIBLE_DEVICES"], "2")
+            self.assertEqual(deployment_environment["CUDA_VISIBLE_DEVICES"], "1")
 
     def test_workflow_runs_fair_baselines_each_epoch_and_final_skills(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -195,6 +217,10 @@ class TrainingEvaluationTest(unittest.TestCase):
                     output_dir=root / "run",
                     tasks=("TaskA", "TaskB"),
                     every_epochs=1,
+                    training_cuda_visible_devices="2",
+                    evaluation_cuda_visible_devices="1",
+                    evaluation_max_model_len=32768,
+                    evaluation_gpu_memory_utilization=0.9,
                 ),
             )
 
@@ -218,6 +244,15 @@ class TrainingEvaluationTest(unittest.TestCase):
             self.assertEqual(history["status"], "completed")
             self.assertEqual(history["manifest"]["tasks"], ["TaskA", "TaskB"])
             self.assertEqual(
+                history["manifest"]["resource_assignment"],
+                {
+                    "training_cuda_visible_devices": "2",
+                    "evaluation_cuda_visible_devices": "1",
+                    "evaluation_max_model_len": 32768,
+                    "evaluation_gpu_memory_utilization": 0.9,
+                },
+            )
+            self.assertEqual(
                 history["summary"]["final_standalone"]["micro_sr"], 0.4
             )
             self.assertIn("最终模型+技能库 SR", result.comparison_markdown.read_text(encoding="utf-8"))
@@ -227,12 +262,26 @@ class TrainingEvaluationTest(unittest.TestCase):
         parser = build_parser()
         plain = parser.parse_args(["train"])
         enabled = parser.parse_args(
-            ["train", "--with-evaluation", "--eval-task-count", "24"]
+            [
+                "train",
+                "--with-evaluation",
+                "--eval-task-count",
+                "24",
+                "--train-cuda-visible-devices",
+                "2",
+                "--eval-cuda-visible-devices",
+                "1",
+                "--eval-max-model-len",
+                "32768",
+            ]
         )
         disabled = parser.parse_args(["train", "--without-evaluation"])
         self.assertIsNone(plain.with_evaluation)
         self.assertTrue(enabled.with_evaluation)
         self.assertEqual(enabled.eval_task_count, 24)
+        self.assertEqual(enabled.train_cuda_visible_devices, "2")
+        self.assertEqual(enabled.eval_cuda_visible_devices, "1")
+        self.assertEqual(enabled.eval_max_model_len, 32768)
         self.assertFalse(disabled.with_evaluation)
 
 

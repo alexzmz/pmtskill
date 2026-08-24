@@ -106,6 +106,20 @@ class MSSwiftLoraTrainer:
         command.extend(job.extra_args)
         return command
 
+    def build_environment(self) -> dict[str, str]:
+        """构造训练子进程环境，并只在已配置时限制可见物理 GPU。"""
+
+        environment = os.environ.copy()
+        old_pythonpath = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = str(self.config.paths.ms_swift_root) + (
+            os.pathsep + old_pythonpath if old_pythonpath else ""
+        )
+        if self.config.offline.cuda_visible_devices is not None:
+            environment["CUDA_VISIBLE_DEVICES"] = (
+                self.config.offline.cuda_visible_devices
+            )
+        return environment
+
     def run(self, job: AdapterJob, *, dry_run: bool = False) -> int:
         command = self.build_command(job)
         job.output_dir.mkdir(parents=True, exist_ok=True)
@@ -118,11 +132,7 @@ class MSSwiftLoraTrainer:
         )
         if dry_run:
             return 0
-        environment = os.environ.copy()
-        old_pythonpath = environment.get("PYTHONPATH", "")
-        environment["PYTHONPATH"] = str(self.config.paths.ms_swift_root) + (
-            os.pathsep + old_pythonpath if old_pythonpath else ""
-        )
+        environment = self.build_environment()
         # 使用两个 PIPE 并发转发，保证 ms-swift 的 stdout 进入 runtime.log，
         # stderr 同时进入 runtime.log 与 errors.log；并发读取可避免管道写满死锁。
         process = subprocess.Popen(

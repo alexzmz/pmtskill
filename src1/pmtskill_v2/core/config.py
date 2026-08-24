@@ -48,6 +48,8 @@ class OfflineConfig:
     learning_rate: float = 1e-4
     lora_rank: int = 16
     lora_alpha: int = 32
+    # 物理 GPU 编号，例如 "2" 或 "2,3"；子进程内部会重新映射为 cuda:0,1。
+    cuda_visible_devices: str | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -70,6 +72,11 @@ class TrainingEvaluationConfig:
     deploy_host: str = "127.0.0.1"
     deploy_port: int = 8002
     infer_backend: str = "vllm"
+    # 单独约束 vLLM 的 KV cache 上下文，避免读取模型原始 262K 配置后 OOM。
+    max_model_len: int = 32768
+    gpu_memory_utilization: float = 0.90
+    # 与训练进程独立的物理 GPU 编号，例如 "1"。
+    cuda_visible_devices: str | None = None
     startup_timeout_seconds: float = 600.0
     startup_poll_seconds: float = 2.0
     max_new_tokens: int = 2048
@@ -202,6 +209,11 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         learning_rate=float(offline_raw.get("learning_rate", 1e-4)),
         lora_rank=int(offline_raw.get("lora_rank", 16)),
         lora_alpha=int(offline_raw.get("lora_alpha", 32)),
+        cuda_visible_devices=(
+            str(offline_raw["cuda_visible_devices"])
+            if offline_raw.get("cuda_visible_devices") is not None
+            else None
+        ),
     )
     training_evaluation_raw = _section(raw, "training_evaluation")
     training_evaluation = TrainingEvaluationConfig(
@@ -225,6 +237,15 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         ),
         deploy_port=int(training_evaluation_raw.get("deploy_port", 8002)),
         infer_backend=str(training_evaluation_raw.get("infer_backend", "vllm")),
+        max_model_len=int(training_evaluation_raw.get("max_model_len", 32768)),
+        gpu_memory_utilization=float(
+            training_evaluation_raw.get("gpu_memory_utilization", 0.90)
+        ),
+        cuda_visible_devices=(
+            str(training_evaluation_raw["cuda_visible_devices"])
+            if training_evaluation_raw.get("cuda_visible_devices") is not None
+            else None
+        ),
         startup_timeout_seconds=float(
             training_evaluation_raw.get("startup_timeout_seconds", 600.0)
         ),
@@ -244,6 +265,12 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         raise ValueError("training_evaluation.every_epochs 必须是正整数")
     if not 1 <= training_evaluation.deploy_port <= 65535:
         raise ValueError("training_evaluation.deploy_port 必须在 [1, 65535]")
+    if training_evaluation.max_model_len <= 0:
+        raise ValueError("training_evaluation.max_model_len 必须是正整数")
+    if not 0 < training_evaluation.gpu_memory_utilization <= 1:
+        raise ValueError(
+            "training_evaluation.gpu_memory_utilization 必须在 (0, 1]"
+        )
     if training_evaluation.startup_timeout_seconds <= 0:
         raise ValueError("training_evaluation.startup_timeout_seconds 必须为正数")
     if training_evaluation.startup_poll_seconds <= 0:

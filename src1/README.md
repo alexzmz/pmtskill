@@ -221,6 +221,61 @@ python -m src1 --config src1/config.local.toml train \
 `--extra-arg=--bf16 --extra-arg=true`。训练完成后把 adapter 作为新的 `[[models]]`
 登记，并给出初始能力画像。
 
+### 4.5 可选：训练前、逐 epoch 与训练后 AndroidWorld 评测
+
+普通 `train` 仍然只训练，不会占用 emulator 做 SR 测试。需要完整闭环时显式增加：
+
+```bash
+python -m src1 --config src1/config.local.toml train \
+  --adapter-name android_world_all \
+  --with-evaluation \
+  --eval-task-count 30 \
+  --eval-every-epochs 1 \
+  --eval-seed 42
+```
+
+这条命令严格复用同一批任务、同一 seed 和同一组合数，顺序为：
+
+1. 学生基座裸模型（原生 M3A，不使用技能库）；
+2. 同一个学生基座 + 当前技能库；
+3. 累计训练到第 1、2、… 个 epoch，每个节点部署真实 LoRA checkpoint，测试裸模型；
+4. 最终 checkpoint 裸模型 + 最终 checkpoint 与技能库的组合效果。
+
+为避免训练进程与评测服务争用 GPU，每个阶段会先结束 ms-swift SFT 进程，再用
+`swift deploy --adapters <checkpoint>` 临时启动 OpenAI-compatible 服务；评测后关闭
+服务，从该 checkpoint 恢复 optimizer、随机种子和训练进度，继续下一段。训练命令
+会自动补充 `save_strategy=epoch`、`add_version=false` 和 checkpoint symlink 参数。
+
+若希望明确只训练（包括 TOML 中设置了 `enabled = true` 的情况），使用：
+
+```bash
+python -m src1 --config src1/config.local.toml train --without-evaluation
+```
+
+可用 `--eval-tasks TaskA TaskB` 代替随机抽样；不传时读取
+`[training_evaluation].task_count`，推荐 20～50。先用 `--dry-run --with-evaluation`
+可以查看全部分段训练命令、部署命令和评测顺序而不启动 GPU/emulator。
+
+每次带评测训练使用独立目录，不覆盖旧 checkpoint：
+
+```text
+runtime/checkpoints/<adapter>/training_runs/<time>/
+├── sample_manifest.json              # 固定任务、seed、计划 episode 数
+├── training_stage_commands.json      # 各累计 epoch 的命令与恢复来源
+├── history.json                      # 完整机器可读 SR 历史和最佳 checkpoint
+├── history.csv                       # 方便表格/画图的 SR 曲线
+├── comparison.md                     # 基座、逐 epoch、最终技能增益总览
+├── training/                         # ms-swift checkpoint 与 trainer state
+└── evaluations/
+    ├── baseline_standalone/           # summary.json/report.md/traces/checkpoints
+    ├── baseline_skills/
+    ├── epoch_001_standalone/
+    └── final_skills/
+```
+
+周期评测阶段只测裸模型；最终阶段再测一次技能库，减少 emulator 时间。训练评测产生
+的 trace 不会写回技能数据库，避免测试集结果污染在线路由统计。
+
 ## 5. 在线动态模型与技能选择
 
 先不连 emulator 查看路由解释：

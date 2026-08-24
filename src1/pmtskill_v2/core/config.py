@@ -51,6 +51,32 @@ class OfflineConfig:
 
 
 @dataclasses.dataclass(slots=True)
+class TrainingEvaluationConfig:
+    """训练前、中、后的 AndroidWorld 小样本评测配置。
+
+    该功能默认关闭，确保普通 ``train`` 仍然只是一次 ms-swift 训练。启用后会
+    临时部署学生基座或当前 LoRA checkpoint，并在同一组任务上比较 SR。
+    """
+
+    enabled: bool = False
+    model_id: str | None = None
+    family: str = "android_world"
+    tasks: tuple[str, ...] = ()
+    task_count: int = 30
+    combinations: int = 1
+    seed: int = 42
+    every_epochs: int = 1
+    include_candidate_skills: bool = False
+    deploy_host: str = "127.0.0.1"
+    deploy_port: int = 8002
+    infer_backend: str = "vllm"
+    startup_timeout_seconds: float = 600.0
+    startup_poll_seconds: float = 2.0
+    max_new_tokens: int = 2048
+    deploy_extra_args: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(slots=True)
 class RoutingConfig:
     success_weight: float = 1.0
     latency_weight: float = 0.0001
@@ -93,6 +119,7 @@ class ProjectConfig:
     config_path: Path
     paths: PathConfig
     offline: OfflineConfig
+    training_evaluation: TrainingEvaluationConfig
     routing: RoutingConfig
     maintenance: MaintenanceConfig
     android_world: AndroidWorldConfig
@@ -176,6 +203,53 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         lora_rank=int(offline_raw.get("lora_rank", 16)),
         lora_alpha=int(offline_raw.get("lora_alpha", 32)),
     )
+    training_evaluation_raw = _section(raw, "training_evaluation")
+    training_evaluation = TrainingEvaluationConfig(
+        enabled=bool(training_evaluation_raw.get("enabled", False)),
+        model_id=(
+            str(training_evaluation_raw["model_id"])
+            if training_evaluation_raw.get("model_id")
+            else None
+        ),
+        family=str(training_evaluation_raw.get("family", "android_world")),
+        tasks=tuple(str(item) for item in training_evaluation_raw.get("tasks", ())),
+        task_count=int(training_evaluation_raw.get("task_count", 30)),
+        combinations=int(training_evaluation_raw.get("combinations", 1)),
+        seed=int(training_evaluation_raw.get("seed", 42)),
+        every_epochs=int(training_evaluation_raw.get("every_epochs", 1)),
+        include_candidate_skills=bool(
+            training_evaluation_raw.get("include_candidate_skills", False)
+        ),
+        deploy_host=str(
+            training_evaluation_raw.get("deploy_host", "127.0.0.1")
+        ),
+        deploy_port=int(training_evaluation_raw.get("deploy_port", 8002)),
+        infer_backend=str(training_evaluation_raw.get("infer_backend", "vllm")),
+        startup_timeout_seconds=float(
+            training_evaluation_raw.get("startup_timeout_seconds", 600.0)
+        ),
+        startup_poll_seconds=float(
+            training_evaluation_raw.get("startup_poll_seconds", 2.0)
+        ),
+        max_new_tokens=int(training_evaluation_raw.get("max_new_tokens", 2048)),
+        deploy_extra_args=tuple(
+            str(item) for item in training_evaluation_raw.get("deploy_extra_args", ())
+        ),
+    )
+    if training_evaluation.task_count <= 0:
+        raise ValueError("training_evaluation.task_count 必须是正整数")
+    if training_evaluation.combinations <= 0:
+        raise ValueError("training_evaluation.combinations 必须是正整数")
+    if training_evaluation.every_epochs <= 0:
+        raise ValueError("training_evaluation.every_epochs 必须是正整数")
+    if not 1 <= training_evaluation.deploy_port <= 65535:
+        raise ValueError("training_evaluation.deploy_port 必须在 [1, 65535]")
+    if training_evaluation.startup_timeout_seconds <= 0:
+        raise ValueError("training_evaluation.startup_timeout_seconds 必须为正数")
+    if training_evaluation.startup_poll_seconds <= 0:
+        raise ValueError("training_evaluation.startup_poll_seconds 必须为正数")
+    if training_evaluation.max_new_tokens <= 0:
+        raise ValueError("training_evaluation.max_new_tokens 必须是正整数")
     routing = RoutingConfig(**_section(raw, "routing"))
     maintenance = MaintenanceConfig(**_section(raw, "maintenance"))
     android_world = AndroidWorldConfig(**_section(raw, "android_world"))
@@ -191,6 +265,7 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         config_path=config_path,
         paths=paths,
         offline=offline,
+        training_evaluation=training_evaluation,
         routing=routing,
         maintenance=maintenance,
         android_world=android_world,

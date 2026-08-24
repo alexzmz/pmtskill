@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,6 +21,7 @@ from .offline.trainer import (
     MSSwiftLoraTrainer,
     default_training_job,
     filter_dataset_by_primitives,
+    staged_training_job,
 )
 from .online.backend import SkillOptimizationBackend
 from .inference.vlm import OpenAICompatibleVLClient
@@ -151,7 +154,7 @@ def command_build_dataset(args: argparse.Namespace) -> int:
 
 
 def command_train(args: argparse.Namespace) -> int:
-    config, _ = _open(args.config)
+    config, store = _open(args.config)
     trainer = MSSwiftLoraTrainer(config)
     if args.primitives:
         name = args.adapter_name or "directional_adapter"
@@ -185,13 +188,179 @@ def command_train(args: argparse.Namespace) -> int:
         if args.adapter_name:
             job.name = args.adapter_name
             job.output_dir = config.offline.output_dir / args.adapter_name
+    with_evaluation = (
+        args.with_evaluation
+        if args.with_evaluation is not None
+        else config.training_evaluation.enabled
+    )
     command = trainer.build_command(job)
     if args.dry_run:
-        _print({"dry_run": True, "job": job.name, "command": command})
+        if not with_evaluation:
+            _print({"dry_run": True, "job": job.name, "command": command})
+            return 0
+        from .evaluation.deployment import MSSwiftEvaluationDeployment
+        from .offline.training_workflow import (
+            build_epoch_targets,
+            resolve_student_profile,
+        )
+
+        settings = _training_evaluation_settings(config, args)
+        run_dir = _training_evaluation_output_dir(job, args)
+        profile = resolve_student_profile(config, settings.model_id)
+        deployment = MSSwiftEvaluationDeployment(config, settings, profile)
+        targets = build_epoch_targets(config.offline.epochs, settings.every_epochs)
+        stage_commands = []
+        for index, target in enumerate(targets):
+            stage_job = staged_training_job(
+                job,
+                output_dir=run_dir / "training",
+                target_epoch=target,
+                resume_from_checkpoint=None,
+            )
+            stage_commands.append(
+                {
+                    "target_epoch": target,
+                    "resume_from_previous_checkpoint": index > 0,
+                    "command": trainer.build_command(stage_job),
+                }
+            )
+        selected_tasks = _tasks(args.eval_tasks) or list(settings.tasks)
+        _print(
+            {
+                "dry_run": True,
+                "job": job.name,
+                "with_android_evaluation": True,
+                "evaluation_output_dir": run_dir,
+                "tasks": selected_tasks or {
+                    "sample_count": settings.task_count,
+                    "seed": settings.seed,
+                    "family": settings.family,
+                },
+                "baseline_deploy_command": deployment.build_command(None),
+                "checkpoint_deploy_command_template": deployment.build_command(
+                    Path("CHECKPOINT_FROM_PREVIOUS_STAGE")
+                ),
+                "training_stages": stage_commands,
+                "evaluation_sequence": [
+                    "baseline_standalone",
+                    "baseline_skills",
+                    *[f"epoch_{target:g}_standalone" for target in targets],
+                    "final_skills",
+                ],
+            }
+        )
         return 0
+    if with_evaluation:
+        # 延迟导入：关闭该开关时，train 不加载 AndroidWorld 评测模块。
+        from .evaluation.android_world import sample_android_world_tasks
+        from .evaluation.deployment import MSSwiftEvaluationDeployment
+        from .offline.training_workflow import (
+            TrainingEvaluationOptions,
+            TrainingEvaluationWorkflow,
+            resolve_student_profile,
+        )
+
+        settings = _training_evaluation_settings(config, args)
+        requested_tasks = _tasks(args.eval_tasks) or list(settings.tasks) or None
+        selected_tasks = sample_android_world_tasks(
+            config,
+            tasks=requested_tasks,
+            task_count=settings.task_count,
+            seed=settings.seed,
+            family=settings.family,
+        )
+        run_dir = _training_evaluation_output_dir(job, args)
+        profile = resolve_student_profile(config, settings.model_id)
+        deployment = MSSwiftEvaluationDeployment(config, settings, profile)
+        result = TrainingEvaluationWorkflow(
+            config,
+            store,
+            trainer,
+            deployment=deployment,
+        ).run(
+            job,
+            TrainingEvaluationOptions(
+                output_dir=run_dir,
+                tasks=tuple(selected_tasks),
+                family=settings.family,
+                combinations=settings.combinations,
+                seed=settings.seed,
+                every_epochs=settings.every_epochs,
+                include_candidate_skills=settings.include_candidate_skills,
+            ),
+        )
+        _print({"job": job.name, "with_android_evaluation": True, **result.to_dict()})
+        return result.return_code
     code = trainer.run(job)
     _print({"job": job.name, "return_code": code, "output_dir": job.output_dir})
     return code
+
+
+def _training_evaluation_settings(
+    config: ProjectConfig, args: argparse.Namespace
+):
+    """合并 TOML 与 train CLI 覆盖值，不修改全局配置对象。"""
+
+    current = config.training_evaluation
+    resolved = dataclasses.replace(
+        current,
+        model_id=args.eval_model_id or current.model_id,
+        task_count=(
+            args.eval_task_count
+            if args.eval_task_count is not None
+            else current.task_count
+        ),
+        combinations=(
+            args.eval_combinations
+            if args.eval_combinations is not None
+            else current.combinations
+        ),
+        seed=args.eval_seed if args.eval_seed is not None else current.seed,
+        every_epochs=(
+            args.eval_every_epochs
+            if args.eval_every_epochs is not None
+            else current.every_epochs
+        ),
+        include_candidate_skills=(
+            args.eval_include_candidates
+            if args.eval_include_candidates is not None
+            else current.include_candidate_skills
+        ),
+        deploy_port=(
+            args.eval_deploy_port
+            if args.eval_deploy_port is not None
+            else current.deploy_port
+        ),
+        infer_backend=args.eval_infer_backend or current.infer_backend,
+    )
+    if resolved.task_count <= 0:
+        raise ValueError("--eval-task-count 必须是正整数")
+    if resolved.combinations <= 0:
+        raise ValueError("--eval-combinations 必须是正整数")
+    if resolved.every_epochs <= 0:
+        raise ValueError("--eval-every-epochs 必须是正整数")
+    if not 1 <= resolved.deploy_port <= 65535:
+        raise ValueError("--eval-deploy-port 必须在 [1, 65535]")
+    if resolved.startup_timeout_seconds <= 0:
+        raise ValueError("training_evaluation.startup_timeout_seconds 必须为正数")
+    if resolved.startup_poll_seconds <= 0:
+        raise ValueError("training_evaluation.startup_poll_seconds 必须为正数")
+    if resolved.max_new_tokens <= 0:
+        raise ValueError("training_evaluation.max_new_tokens 必须是正整数")
+    return resolved
+
+
+def _training_evaluation_output_dir(
+    job: AdapterJob, args: argparse.Namespace
+) -> Path:
+    """每次带评测训练使用独立目录，避免覆盖已有 checkpoint 与报告。"""
+
+    if args.eval_output_dir:
+        return Path(args.eval_output_dir).expanduser().resolve()
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    return (
+        job.output_dir / "training_runs" / f"{stamp}_{uuid.uuid4().hex[:8]}"
+    ).resolve()
 
 
 def command_maintain(args: argparse.Namespace) -> int:
@@ -389,6 +558,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="传给 ms-swift 的单个额外参数；可重复，例如 --extra-arg=--bf16",
     )
     train.add_argument("--dry-run", action="store_true", help="只显示命令，不启动训练")
+    evaluation_switch = train.add_mutually_exclusive_group()
+    evaluation_switch.add_argument(
+        "--with-evaluation",
+        dest="with_evaluation",
+        action="store_true",
+        help="启用训练前/逐 epoch/训练后的 AndroidWorld 固定子集评测",
+    )
+    evaluation_switch.add_argument(
+        "--without-evaluation",
+        dest="with_evaluation",
+        action="store_false",
+        help="即使 TOML 默认启用，也只训练、不运行 AndroidWorld",
+    )
+    train.set_defaults(with_evaluation=None)
+    train.add_argument(
+        "--eval-model-id",
+        help="学生模型画像 ID；默认读取 [training_evaluation].model_id",
+    )
+    train.add_argument(
+        "--eval-tasks",
+        nargs="*",
+        help="固定评测任务；不传则按 seed 从 AndroidWorld 抽样",
+    )
+    train.add_argument(
+        "--eval-task-count",
+        type=int,
+        help="未显式指定任务时的抽样数，推荐 20～50",
+    )
+    train.add_argument("--eval-combinations", type=int, help="每个任务的参数组合数")
+    train.add_argument("--eval-seed", type=int, help="任务抽样和实例参数随机种子")
+    train.add_argument(
+        "--eval-every-epochs",
+        type=int,
+        help="每完成多少个 epoch 做一次裸模型 SR；默认每 1 个",
+    )
+    train.add_argument(
+        "--eval-include-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="模型+技能库评测时也允许 candidate 技能参与灰度",
+    )
+    train.add_argument("--eval-output-dir", help="本次训练、checkpoint 和评测总目录")
+    train.add_argument("--eval-deploy-port", type=int, help="临时 ms-swift 服务端口")
+    train.add_argument(
+        "--eval-infer-backend",
+        choices=["vllm", "transformers", "sglang", "lmdeploy"],
+        help="临时模型服务推理后端",
+    )
     train.set_defaults(handler=command_train)
 
     maintain = subparsers.add_parser("maintain", help="运行一次 backend 技能优化周期")

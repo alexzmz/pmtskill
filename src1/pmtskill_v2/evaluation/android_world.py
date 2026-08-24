@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import datetime as dt
-import sys
+import random
 import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
 from ..core.config import ProjectConfig
 from ..core.io import load_primitives
-from ..core.models import ExecutionTrace, TraceEvent
+from ..core.models import ExecutionTrace, ModelProfile, TraceEvent
 from ..inference.model_pool import ModelPool
 from ..inference.vlm import OpenAICompatibleVLClient
 from ..offline.collector import bootstrap_android_world
@@ -83,6 +83,124 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
     return traces
 
 
+def sample_android_world_tasks(
+    config: ProjectConfig,
+    *,
+    tasks: Sequence[str] | None,
+    task_count: int,
+    seed: int,
+    family: str = "android_world",
+) -> list[str]:
+    """解析一组固定评测任务，供所有训练阶段公平复用。
+
+    显式传入任务时保留用户顺序且仅去重；未传入时从 family 的完整注册表中
+    按 seed 抽样。这里只读取任务注册表，不会连接 emulator。
+    """
+
+    if tasks:
+        return list(dict.fromkeys(str(item) for item in tasks))
+    if task_count <= 0:
+        raise ValueError("评测 task_count 必须是正整数")
+    bootstrap_android_world(config.paths.android_world_root)
+    from android_world import registry
+
+    available = sorted(registry.TaskRegistry().get_registry(family=family))
+    if not available:
+        raise ValueError(f"AndroidWorld family 没有可评测任务: {family}")
+    count = min(task_count, len(available))
+    return sorted(random.Random(seed).sample(available, count))
+
+
+class AndroidWorldStandaloneEvaluator:
+    """用单个 VL 模型和原生 M3A 评测，不注入任何技能或动态路由。"""
+
+    def __init__(self, config: ProjectConfig):
+        self.config = config
+
+    def run(
+        self,
+        *,
+        profile: ModelProfile,
+        tasks: Sequence[str] | None,
+        n_task_combinations: int = 1,
+        seed: int = 42,
+        family: str = "android_world",
+        output_dir: str | Path | None = None,
+    ) -> EvaluationArtifacts:
+        bootstrap_android_world(self.config.paths.android_world_root)
+        from android_world import checkpointer as checkpointer_lib
+        from android_world import registry, suite_utils
+        from android_world.agents import m3a
+        from android_world.env import env_launcher
+
+        run_stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        target = Path(output_dir).resolve() if output_dir else (
+            self.config.paths.state_dir
+            / "evaluations"
+            / f"standalone_{run_stamp}_{uuid.uuid4().hex[:8]}"
+        )
+        checkpoint_dir = target / "checkpoints"
+        model = OpenAICompatibleVLClient(profile)
+        environment = env_launcher.load_and_setup_env(
+            console_port=self.config.android_world.console_port,
+            emulator_setup=self.config.android_world.emulator_setup,
+            adb_path=self.config.android_world.adb_path,
+        )
+        try:
+            task_registry = registry.TaskRegistry()
+            suite = suite_utils.create_suite(
+                task_registry.get_registry(family=family),
+                n_task_combinations=n_task_combinations,
+                seed=seed,
+                tasks=list(tasks) if tasks else None,
+                env=environment,
+            )
+            suite.suite_family = family
+            agent = m3a.M3A(
+                environment,
+                model,
+                name=f"standalone:{profile.model_id}",
+                wait_after_action_seconds=(
+                    self.config.android_world.wait_after_action_seconds
+                ),
+            )
+            episodes = suite_utils.run(
+                suite,
+                agent,
+                checkpointer=checkpointer_lib.IncrementalCheckpointer(
+                    str(checkpoint_dir)
+                ),
+                demo_mode=False,
+                return_full_episode_data=True,
+                max_n_steps_override=self.config.android_world.max_steps,
+                stop_on_task_success=self.config.android_world.stop_on_task_success,
+            )
+        finally:
+            environment.close()
+
+        traces = episodes_to_traces(episodes)
+        return write_evaluation_report(
+            target,
+            episodes,
+            traces,
+            metadata={
+                "evaluation_mode": "standalone",
+                "model_id": profile.model_id,
+                "served_model": profile.served_model,
+                "adapter": profile.adapter,
+                "evaluation_checkpoint": profile.metadata.get(
+                    "evaluation_checkpoint"
+                ),
+                "family": family,
+                "tasks": list(tasks) if tasks else "all",
+                "n_task_combinations": n_task_combinations,
+                "seed": seed,
+                "max_steps": self.config.android_world.max_steps,
+                "stop_on_task_success": self.config.android_world.stop_on_task_success,
+            },
+        )
+
+
 class AndroidWorldOnlineEvaluator:
     """建立动态 M3A agent、运行 suite 并生成报告。"""
 
@@ -107,6 +225,8 @@ class AndroidWorldOnlineEvaluator:
         planner_model_id: str | None = None,
         include_candidate_skills: bool = False,
         output_dir: str | Path | None = None,
+        model_profiles: Sequence[ModelProfile] | None = None,
+        record_traces: bool = True,
     ) -> EvaluationArtifacts:
         bootstrap_android_world(self.config.paths.android_world_root)
         from android_world import checkpointer as checkpointer_lib
@@ -116,7 +236,9 @@ class AndroidWorldOnlineEvaluator:
 
         raw_skills = relevant_raw_skills(self.store.list_skills(kind="raw"))
         polished = self.store.list_skills(kind="polished")
-        profiles = self.store.list_model_profiles()
+        profiles = list(model_profiles or ())
+        if not profiles:
+            profiles = self.store.list_model_profiles()
         if not profiles:
             profiles = [profile for profile in self.config.models if profile.enabled]
         model_pool = ModelPool(profiles)
@@ -195,8 +317,9 @@ class AndroidWorldOnlineEvaluator:
             environment.close()
 
         traces = episodes_to_traces(episodes)
-        for trace in traces:
-            self.store.append_trace(trace)
+        if record_traces:
+            for trace in traces:
+                self.store.append_trace(trace)
         return write_evaluation_report(
             target,
             episodes,
@@ -208,6 +331,9 @@ class AndroidWorldOnlineEvaluator:
                 "seed": seed,
                 "planner_model_id": planner_model_id,
                 "include_candidate_skills": include_candidate_skills,
+                "evaluation_mode": "model_with_skill_library",
+                "model_ids": [profile.model_id for profile in profiles],
+                "record_traces": record_traces,
                 "max_steps": self.config.android_world.max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
             },

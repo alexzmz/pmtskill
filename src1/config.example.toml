@@ -24,6 +24,33 @@ learning_rate = 0.0001
 lora_rank = 16
 lora_alpha = 32
 
+[training_evaluation]
+# 默认保持 train 为纯训练；CLI 传 --with-evaluation 时临时启用完整评测闭环。
+enabled = false
+# 用这个画像继承模型能力先验；临时服务地址和 served_model 会由框架自动覆盖。
+model_id = "student-qwen3-vl"
+family = "android_world"
+# 留空表示从 family 中按 seed 固定抽样；也可写成 ["TaskA", "TaskB"]。
+tasks = []
+task_count = 30
+combinations = 1
+seed = 42
+# 1 表示每完成一个 epoch 测一次裸模型 SR；改成 2 就每两个 epoch 测一次。
+every_epochs = 1
+include_candidate_skills = false
+# 训练进程退出后，框架在该端口临时执行 swift deploy，评测完立即回收。
+deploy_host = "127.0.0.1"
+deploy_port = 8002
+infer_backend = "vllm"
+startup_timeout_seconds = 600.0
+startup_poll_seconds = 2.0
+max_new_tokens = 2048
+# 可按显存和模型上下文覆盖 ms-swift deploy 参数。
+deploy_extra_args = [
+  "--vllm_gpu_memory_utilization", "0.90",
+  "--vllm_max_model_len", "8192",
+]
+
 [routing]
 # 总分 = log(成功率) - 延迟惩罚 - 切换惩罚 + polished 奖励 - 降级代价。
 success_weight = 1.0

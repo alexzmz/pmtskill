@@ -12,6 +12,7 @@ from typing import Any, Sequence
 
 from .core.config import ProjectConfig, load_config
 from .core.io import load_primitives
+from .core.run_records import CommandRunLogger, active_run_logger
 from .offline.pipeline import OfflineDistillationPipeline
 from .offline.trainer import (
     AdapterJob,
@@ -35,7 +36,40 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.example.toml"
 
 
 def _print(value: Any) -> None:
+    current_run = active_run_logger()
+    if current_run is not None:
+        current_run.record_result(value)
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _run_label(args: argparse.Namespace) -> str:
+    """从命令参数中提取便于人眼识别、不会过长的日志目录标签。"""
+
+    task_values = _tasks(getattr(args, "tasks", None))
+    if task_values:
+        suffix = f"+{len(task_values) - 3}more" if len(task_values) > 3 else ""
+        return "+".join(task_values[:3]) + suffix
+    for name in ("adapter_name", "model_id", "family"):
+        value = getattr(args, name, None)
+        if value:
+            return str(value)
+    goal = getattr(args, "goal", None)
+    if goal:
+        return str(goal)[:56]
+    if getattr(args, "command", None) in {"collect", "evaluate"}:
+        return "all-tasks"
+    return ""
+
+
+def _resolve_log_root(args: argparse.Namespace) -> Path:
+    """优先使用 CLI 覆盖值；配置损坏时仍把失败日志写到默认 runtime。"""
+
+    if args.log_dir:
+        return Path(args.log_dir).expanduser().resolve()
+    try:
+        return load_config(args.config).paths.log_dir
+    except Exception:
+        return (DEFAULT_CONFIG.parent / "runtime" / "logs").resolve()
 
 
 def _tasks(values: Sequence[str] | None) -> list[str] | None:
@@ -291,6 +325,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="PMT-Skill v2：AndroidWorld VL 蒸馏、动态模型/技能路由和技能维护",
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="TOML 配置文件")
+    parser.add_argument(
+        "--log-dir",
+        help="覆盖 [paths].log_dir；每次调用仍会在其中创建独立运行目录",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="runtime.log 中 Python logging 的最低级别",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init = subparsers.add_parser(
@@ -407,12 +451,35 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    try:
-        return int(args.handler(args))
-    except KeyboardInterrupt:
-        print("用户中断。", file=sys.stderr)
-        return 130
-    except Exception as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        return 1
+    argv_list = list(argv) if argv is not None else list(sys.argv[1:])
+    run_logger = CommandRunLogger(
+        _resolve_log_root(args),
+        command=args.command,
+        label=_run_label(args),
+        argv=argv_list,
+        arguments=vars(args),
+        log_level=args.log_level,
+    )
+    exit_code = 1
+    error: BaseException | None = None
+    traceback_text: str | None = None
+    with run_logger.capture():
+        try:
+            exit_code = int(args.handler(args))
+        except KeyboardInterrupt as exc:
+            error = exc
+            exit_code = 130
+            print("用户中断。", file=sys.stderr)
+        except Exception as exc:
+            error = exc
+            exit_code = 1
+            print(f"错误：{exc}", file=sys.stderr)
+            traceback_text = traceback.format_exc()
+            print(traceback_text, file=sys.stderr, end="")
+        finally:
+            run_logger.finalize(
+                exit_code,
+                error=error,
+                traceback_text=traceback_text,
+            )
+    return exit_code

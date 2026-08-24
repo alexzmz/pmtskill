@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import math
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from ..core.config import ProjectConfig
 from ..inference.vlm import OpenAICompatibleVLClient
+from .reporting import summarize_collection
 
 
 HARD_EPISODE_STEP_LIMIT = 50
@@ -119,6 +121,7 @@ class CollectionResult:
     tasks: list[str]
     episode_step_limit: int = HARD_EPISODE_STEP_LIMIT
     episodes_at_step_limit: int = 0
+    summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -129,6 +132,7 @@ class CollectionResult:
             "success_rate": self.successes / self.episodes if self.episodes else 0.0,
             "episode_step_limit": self.episode_step_limit,
             "episodes_at_step_limit": self.episodes_at_step_limit,
+            "summary": self.summary,
         }
 
 
@@ -205,6 +209,23 @@ def collect_teacher_trajectories(
         _episode_length(item.get("episode_length", 0)) >= episode_step_limit
         for item in results
     )
+    # Checkpointer 中保存了完整 step_data，可用于最终的 primitive 调用统计。
+    # 读取失败不应让已经完成的 AndroidWorld 采集整体失败，因此退化为空明细。
+    try:
+        full_episodes = checkpointer_lib.IncrementalCheckpointer(
+            str(trajectory_dir)
+        ).load()
+    except Exception:
+        logging.warning(
+            "无法读取完整 checkpoint，collect 的 per_primitive 汇总将为空。",
+            exc_info=True,
+        )
+        full_episodes = []
+    summary = summarize_collection(
+        results,
+        full_episodes=full_episodes,
+        episode_step_limit=episode_step_limit,
+    )
     return CollectionResult(
         output_dir=trajectory_dir,
         episodes=len(results),
@@ -212,5 +233,6 @@ def collect_teacher_trajectories(
         tasks=list(tasks or suite.keys()),
         episode_step_limit=episode_step_limit,
         episodes_at_step_limit=episodes_at_step_limit,
+        summary=summary,
     )
 

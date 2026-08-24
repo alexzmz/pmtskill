@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import math
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,24 @@ class EvaluationArtifacts:
     summary: dict[str, Any]
 
 
+def successful_episode_value(value: Any) -> bool:
+    """只把有限且大于 0.5 的 reward 计为成功，避免 ``bool(NaN)`` 误报。"""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric > 0.5
+
+
+def _finite_float(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return numeric if math.isfinite(numeric) else 0.0
+
+
 def _episode_field(episode: dict[str, Any], *keys: str, default: Any = None) -> Any:
     for key in keys:
         if key in episode:
@@ -36,7 +55,10 @@ def summarize_episodes(
     episode_list = list(episodes)
     trace_list = list(traces)
     valid = [episode for episode in episode_list if not _episode_field(episode, "exception_info")]
-    successes = sum(bool(_episode_field(item, "is_successful", default=False)) for item in valid)
+    successes = sum(
+        successful_episode_value(_episode_field(item, "is_successful", default=False))
+        for item in valid
+    )
     by_task: dict[str, list[bool]] = collections.defaultdict(list)
     failure_reasons: collections.Counter[str] = collections.Counter()
     step_counts: list[int] = []
@@ -46,10 +68,12 @@ def summarize_episodes(
         if _episode_field(episode, "exception_info"):
             failure_reasons["exception"] += 1
             continue
-        successful = bool(_episode_field(episode, "is_successful", default=False))
+        successful = successful_episode_value(
+            _episode_field(episode, "is_successful", default=False)
+        )
         by_task[task].append(successful)
-        step_counts.append(int(_episode_field(episode, "episode_length", default=0) or 0))
-        run_times.append(float(_episode_field(episode, "run_time", default=0.0) or 0.0))
+        step_counts.append(int(_finite_float(_episode_field(episode, "episode_length", default=0))))
+        run_times.append(_finite_float(_episode_field(episode, "run_time", default=0.0)))
         if not successful:
             episode_data = _episode_field(episode, "episode_data", default={}) or {}
             outputs = episode_data.get("action_output", [])
@@ -162,4 +186,3 @@ def write_evaluation_report(
     write_jsonl(traces_path, (trace.to_dict() for trace in traces))
     markdown_path.write_text(_markdown(summary), encoding="utf-8")
     return EvaluationArtifacts(target, summary_path, markdown_path, traces_path, summary)
-

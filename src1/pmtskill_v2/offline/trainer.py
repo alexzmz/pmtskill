@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, Sequence
@@ -103,13 +104,38 @@ class MSSwiftLoraTrainer:
         environment["PYTHONPATH"] = str(self.config.paths.ms_swift_root) + (
             os.pathsep + old_pythonpath if old_pythonpath else ""
         )
-        completed = subprocess.run(
+        # 使用两个 PIPE 并发转发，保证 ms-swift 的 stdout 进入 runtime.log，
+        # stderr 同时进入 runtime.log 与 errors.log；并发读取可避免管道写满死锁。
+        process = subprocess.Popen(
             command,
             cwd=self.config.paths.ms_swift_root,
             env=environment,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
-        return completed.returncode
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        def forward(stream, target) -> None:
+            for line in stream:
+                print(line, end="", file=target, flush=True)
+
+        stdout_thread = threading.Thread(
+            target=forward, args=(process.stdout, sys.stdout), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=forward, args=(process.stderr, sys.stderr), daemon=True
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        return_code = process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+        return return_code
 
 
 def filter_dataset_by_primitives(

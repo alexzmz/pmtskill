@@ -73,6 +73,7 @@ cp src1/config.example.toml src1/config.local.toml
 
 关键项：
 
+- `paths.log_dir` 是所有 CLI 运行日志的根目录；
 - `offline.teacher_model_id` 必须匹配一个 `[[models]].model_id`；
 - `offline.student_model_path` 是 ms-swift 训练的学生 VL 基座；
 - 每个 `[[models]]` 是在线可选的基座或 LoRA served model；
@@ -80,6 +81,32 @@ cp src1/config.example.toml src1/config.local.toml
 - `android_world.max_steps = 50` 表示每个 episode 最多执行 50 步；collector
   会在 AndroidWorld 的 episode runner 外层再次强制这一硬上限，任务完成时仍会提前停止；
 - API key 只通过 `api_key_env` 指定的环境变量读取，不写入 TOML。
+
+### 3.1 每次 CLI 调用的日志
+
+所有实际子命令都会自动创建独立目录：
+
+```text
+runtime/logs/20260824T153012_collect_ContactsAddContact_a1b2c3d4/
+├── runtime.log   # print、进度、INFO/WARNING/ERROR、训练子进程输出
+├── errors.log    # stderr、warning、error 和 traceback
+├── run.json      # 命令、参数、主机、时间、状态、退出码
+├── result.json   # 完整机器可读最终结果
+└── result.md     # 适合实验结束后直接阅读的最终报告
+```
+
+日志根目录可在 TOML 中设置，也可临时覆盖：
+
+```bash
+python -m src1 --config src1/config.local.toml \
+  --log-dir /data/pmtskill-logs --log-level DEBUG collect --tasks TaskA
+```
+
+即使命令报错，CLI 也会尽量生成 `result.json`/`result.md`，并把完整 traceback
+写入运行日志。`collect` 的最终报告包含 Micro/Macro TSR、每任务 SR、平均步数、
+耗时、异常数、达到步数上限次数，以及按最终 episode 成功做保守信用分配的
+primitive 成功率。AndroidWorld 每个 episode 后打印的累计表仍完整保留在
+`runtime.log`。
 
 初始化数据库、导入 SKVM 技能并登记模型：
 

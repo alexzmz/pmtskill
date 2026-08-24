@@ -24,7 +24,11 @@ from ..online.planner import (
 from ..online.router import DynamicProgrammingRouter
 from ..skills.importer import relevant_raw_skills
 from ..skills.store import SkillStore
-from .reporter import EvaluationArtifacts, write_evaluation_report
+from .reporter import (
+    EvaluationArtifacts,
+    successful_episode_value,
+    write_evaluation_report,
+)
 
 
 def _extract_route_metadata(raw: Any) -> dict[str, Any]:
@@ -39,7 +43,7 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
 
     traces: list[ExecutionTrace] = []
     for episode in episodes:
-        successful = bool(episode.get("is_successful", False))
+        successful = successful_episode_value(episode.get("is_successful", False))
         episode_data = episode.get("episode_data", {}) or {}
         raw_responses = episode_data.get("action_raw_response", [])
         actions = episode_data.get("action_output", [])

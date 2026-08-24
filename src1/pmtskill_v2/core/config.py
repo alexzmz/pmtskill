@@ -26,6 +26,7 @@ class PathConfig:
     skvm_skills_root: Path
     ms_swift_root: Path
     state_dir: Path
+    log_dir: Path
 
     @property
     def database(self) -> Path:
@@ -111,6 +112,7 @@ class ProjectConfig:
             self.offline.trajectory_dir,
             self.offline.dataset_dir,
             self.offline.output_dir,
+            self.paths.log_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -136,6 +138,7 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
     base = config_path.parent
 
     path_raw = _section(raw, "paths")
+    state_dir = _resolve_path(base, path_raw.get("state_dir", "./runtime"))
     paths = PathConfig(
         repo_root=_resolve_path(base, path_raw.get("repo_root", "..")),
         android_world_root=_resolve_path(
@@ -147,7 +150,8 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         ms_swift_root=_resolve_path(
             base, path_raw.get("ms_swift_root", "../libs/ms-swift")
         ),
-        state_dir=_resolve_path(base, path_raw.get("state_dir", "./runtime")),
+        state_dir=state_dir,
+        log_dir=_resolve_path(base, path_raw.get("log_dir", state_dir / "logs")),
     )
 
     offline_raw = _section(raw, "offline")

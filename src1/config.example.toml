@@ -6,6 +6,8 @@ android_world_root = "../libs/android_world"
 skvm_skills_root = "/home/zmz/Workspace/gui/libs/skvm/skvm-data/skills"
 ms_swift_root = "../libs/ms-swift"
 state_dir = "./runtime"
+# 每次 CLI 调用都会在该目录下创建“时间_命令_任务”子目录。
+log_dir = "./runtime/logs"
 
 [offline]
 teacher_model_id = "teacher-deepseek-v4-flash"

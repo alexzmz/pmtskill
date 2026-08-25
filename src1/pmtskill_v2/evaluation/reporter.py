@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import math
 import statistics
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,12 +33,51 @@ def successful_episode_value(value: Any) -> bool:
     return math.isfinite(numeric) and numeric > 0.5
 
 
-def _finite_float(value: Any) -> float:
+def finite_float_value(value: Any) -> float:
+    """把 NaN、无穷值和非数值统一收敛为 0。"""
+
     try:
         numeric = float(value)
     except (TypeError, ValueError):
         return 0.0
     return numeric if math.isfinite(numeric) else 0.0
+
+
+def episode_data_is_usable(value: Any) -> bool:
+    """判断 episode_data 是否属于已知的 mapping 或 step-major 结构。"""
+
+    return isinstance(value, Mapping) or (
+        isinstance(value, (list, tuple))
+        and all(isinstance(step, Mapping) for step in value)
+    )
+
+
+def normalize_episode_data(value: Any) -> Mapping[str, Any]:
+    """兼容 dict-of-steps、step-major list；异常标量（含 NaN）视为空。"""
+
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, (list, tuple)) or not value:
+        return {}
+    if not all(isinstance(step, Mapping) for step in value):
+        return {}
+    keys = {
+        key
+        for step in value
+        for key in step
+        if isinstance(key, str)
+    }
+    return {key: [step.get(key) for step in value] for key in keys}
+
+
+def episode_step_values(value: Any) -> list[Any]:
+    """AndroidWorld 的单步字段有时是标量，有时是 list/tuple。"""
+
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
 
 
 def _episode_field(episode: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -72,11 +112,21 @@ def summarize_episodes(
             _episode_field(episode, "is_successful", default=False)
         )
         by_task[task].append(successful)
-        step_counts.append(int(_finite_float(_episode_field(episode, "episode_length", default=0))))
-        run_times.append(_finite_float(_episode_field(episode, "run_time", default=0.0)))
+        step_counts.append(
+            int(finite_float_value(_episode_field(episode, "episode_length", default=0)))
+        )
+        run_times.append(
+            finite_float_value(_episode_field(episode, "run_time", default=0.0))
+        )
         if not successful:
-            episode_data = _episode_field(episode, "episode_data", default={}) or {}
-            outputs = episode_data.get("action_output", [])
+            raw_episode_data = _episode_field(episode, "episode_data", default={})
+            episode_data = normalize_episode_data(raw_episode_data)
+            outputs = episode_step_values(episode_data.get("action_output"))
+            if raw_episode_data is not None and not episode_data_is_usable(
+                raw_episode_data
+            ):
+                failure_reasons["invalid_episode_data"] += 1
+                continue
             if outputs and "infeasible" in str(outputs[-1]).lower():
                 failure_reasons["agent_infeasible"] += 1
             elif outputs and "status" not in str(outputs[-1]).lower():

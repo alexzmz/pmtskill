@@ -294,6 +294,11 @@ runtime/checkpoints/<adapter>/training_runs/<time>/
 周期评测阶段只测裸模型；最终阶段再测一次技能库，减少 emulator 时间。训练评测产生
 的 trace 不会写回技能数据库，避免测试集结果污染在线路由统计。
 
+AndroidWorld 把任务初始化异常保存成 `episode_data = NaN` 等标量时，评测后处理会将其
+记录为异常 episode 和空事件 trace，不会让整轮训练退出。临时 `swift deploy` 默认关闭
+请求级 verbose，避免把完整 prompt/base64 截图写入日志；持久化的 runtime/error/result
+文件还会按敏感字段名和常见密钥格式统一脱敏。
+
 `--checkpoint-every-epochs N` 控制永久保留间隔，默认 `1`（逐 epoch 保留）；设为
 `2` 时保留第 2、4、… epoch 和最终结果，设为 `0` 时仅保留最终 checkpoint。为完成
 中间评测/续训而创建的临时 checkpoint 会在整个流程成功后删除；若流程失败则保留，

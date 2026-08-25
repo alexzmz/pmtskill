@@ -189,6 +189,7 @@ class TrainingEvaluationTest(unittest.TestCase):
             memory_index = command.index("--vllm_gpu_memory_utilization")
             self.assertEqual(command[max_len_index + 1], "32768")
             self.assertEqual(command[memory_index + 1], "0.9")
+            self.assertEqual(command[command.index("--verbose") + 1], "false")
             self.assertEqual(
                 deployment.build_environment()["CUDA_VISIBLE_DEVICES"], "1"
             )

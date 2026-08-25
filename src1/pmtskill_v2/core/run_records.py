@@ -38,6 +38,62 @@ _ACTIVE_RUN: contextvars.ContextVar["CommandRunLogger | None"] = (
     contextvars.ContextVar("pmtskill_active_run", default=None)
 )
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SENSITIVE_NAME_PATTERN = (
+    r"(?:[A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET_KEY|PASSWORD|"
+    r"CREDENTIALS)[A-Z0-9_]*|HF_TOKEN|HUGGINGFACE_TOKEN)"
+)
+_SENSITIVE_KEY = re.compile(_SENSITIVE_NAME_PATTERN)
+_QUOTED_SECRET = re.compile(
+    rf"(?P<prefix>['\"]?{_SENSITIVE_NAME_PATTERN}['\"]?\s*:\s*)"
+    r"(?P<quote>['\"])(?P<value>.*?)(?P=quote)"
+)
+_ASSIGNED_SECRET = re.compile(
+    rf"(?P<prefix>\b{_SENSITIVE_NAME_PATTERN}\s*=\s*)"
+    r"(?P<value>[^\s,;}]+)"
+)
+_TOKEN_LITERAL = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_.-]{16,}|AIza[A-Za-z0-9_-]{20,})\b"
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """从持久日志中移除常见 API key/credential 表达形式。"""
+
+    redacted = _QUOTED_SECRET.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}"
+            f"[REDACTED]{match.group('quote')}"
+        ),
+        text,
+    )
+    redacted = _ASSIGNED_SECRET.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]", redacted
+    )
+    return _TOKEN_LITERAL.sub("[REDACTED]", redacted)
+
+
+def _redact_jsonable(value: Any, key: str | None = None) -> Any:
+    """按字段名和字符串内容递归脱敏，供 run/result JSON 使用。"""
+
+    if key is not None and _SENSITIVE_KEY.fullmatch(key.upper()):
+        return "[REDACTED]"
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _redact_jsonable(item, str(item_key))
+            for item_key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_redact_jsonable(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secrets(value)
+    return value
+
+
+class _RedactingFormatter(logging.Formatter):
+    """确保 logging handler 写终端或文件前统一脱敏。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _redact_secrets(super().format(record))
 
 
 def _jsonable(value: Any) -> Any:
@@ -91,7 +147,7 @@ class _TeeStream:
         with self._lock:
             written = self.console.write(text)
             self.console.flush()
-            clean = _ANSI_ESCAPE.sub("", text)
+            clean = _redact_secrets(_ANSI_ESCAPE.sub("", text))
             for handle in self.files:
                 handle.write(clean)
                 handle.flush()
@@ -277,12 +333,14 @@ class CommandRunLogger:
             result_markdown=run_dir / "result.md",
         )
         self.command = command
-        self.argv = list(argv or ())
-        self.arguments = {
-            str(key): _jsonable(value)
-            for key, value in dict(arguments or {}).items()
-            if key != "handler"
-        }
+        self.argv = [_redact_secrets(str(item)) for item in (argv or ())]
+        self.arguments = _redact_jsonable(
+            {
+                str(key): _jsonable(value)
+                for key, value in dict(arguments or {}).items()
+                if key != "handler"
+            }
+        )
         self.log_level = log_level.upper()
         self.started_wall = time.time()
         self.started_perf = time.perf_counter()
@@ -368,7 +426,7 @@ class CommandRunLogger:
             root.removeHandler(handler)
         level = getattr(logging, self.log_level, logging.INFO)
         root.setLevel(level)
-        formatter = logging.Formatter(
+        formatter = _RedactingFormatter(
             "%(asctime)s %(levelname)s %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
@@ -415,7 +473,7 @@ class CommandRunLogger:
     def record_result(self, value: Any) -> None:
         """记录命令最近一次结构化输出；maintain watch 会保留最后一个周期。"""
 
-        self.last_result = _jsonable(value)
+        self.last_result = _redact_jsonable(_jsonable(value))
 
     def finalize(
         self,
@@ -445,10 +503,14 @@ class CommandRunLogger:
         if error is not None:
             error_value = {
                 "type": type(error).__name__,
-                "message": str(error),
-                "traceback": traceback_text
-                or "".join(
-                    traceback_module.format_exception(type(error), error, error.__traceback__)
+                "message": _redact_secrets(str(error)),
+                "traceback": _redact_secrets(
+                    traceback_text
+                    or "".join(
+                        traceback_module.format_exception(
+                            type(error), error, error.__traceback__
+                        )
+                    )
                 ),
             }
         envelope = {

@@ -94,6 +94,37 @@ class CommandRunLoggerTest(unittest.TestCase):
                 session.artifacts.errors_log.read_text(encoding="utf-8"),
             )
 
+    def test_persistent_logs_and_json_redact_credentials(self):
+        fake_secret = "sk-test-1234567890abcdef1234567890"
+        with tempfile.TemporaryDirectory() as temporary:
+            session = CommandRunLogger(
+                temporary,
+                command="evaluate",
+                argv=["evaluate", f"OPENAI_API_KEY={fake_secret}"],
+                arguments={"api_key": fake_secret},
+            )
+            with session.capture():
+                print({"OPENAI_API_KEY": fake_secret})
+                logging.error("PASSWORD=%s", fake_secret)
+                session.record_result({"access_token": fake_secret})
+                session.finalize(
+                    1,
+                    error=RuntimeError(f"request failed with {fake_secret}"),
+                )
+
+            persisted = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in (
+                    session.artifacts.runtime_log,
+                    session.artifacts.errors_log,
+                    session.artifacts.run_json,
+                    session.artifacts.result_json,
+                    session.artifacts.result_markdown,
+                )
+            )
+            self.assertNotIn(fake_secret, persisted)
+            self.assertIn("[REDACTED]", persisted)
+
 
 if __name__ == "__main__":
     unittest.main()

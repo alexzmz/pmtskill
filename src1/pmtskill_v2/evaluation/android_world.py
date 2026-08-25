@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import random
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -26,15 +27,19 @@ from ..skills.importer import relevant_raw_skills
 from ..skills.store import SkillStore
 from .reporter import (
     EvaluationArtifacts,
+    episode_data_is_usable,
+    episode_step_values,
+    finite_float_value,
+    normalize_episode_data,
     successful_episode_value,
     write_evaluation_report,
 )
 
 
 def _extract_route_metadata(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
+    if isinstance(raw, Mapping):
         value = raw.get("_pmtskill", {})
-        return value if isinstance(value, dict) else {}
+        return dict(value) if isinstance(value, Mapping) else {}
     return {}
 
 
@@ -44,16 +49,23 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
     traces: list[ExecutionTrace] = []
     for episode in episodes:
         successful = successful_episode_value(episode.get("is_successful", False))
-        episode_data = episode.get("episode_data", {}) or {}
-        raw_responses = episode_data.get("action_raw_response", [])
-        actions = episode_data.get("action_output", [])
-        parsed_actions = episode_data.get("action_output_json", [])
+        raw_episode_data = episode.get("episode_data", {})
+        episode_data = normalize_episode_data(raw_episode_data)
+        raw_responses = episode_step_values(
+            episode_data.get("action_raw_response")
+        )
+        actions = episode_step_values(episode_data.get("action_output"))
+        parsed_actions = episode_step_values(
+            episode_data.get("action_output_json")
+        )
         events: list[TraceEvent] = []
         for index, raw in enumerate(raw_responses):
             route = _extract_route_metadata(raw)
             if not route:
                 continue
-            action_parsed = index < len(parsed_actions) and parsed_actions[index] is not None
+            action_parsed = index < len(parsed_actions) and isinstance(
+                parsed_actions[index], Mapping
+            )
             # 组合技能只有在动作可解析且 episode 最终成功时计为成功，避免把局部
             # 看似正确、实际使任务失败的动作错误地用于技能晋升。
             event_success = bool(action_parsed and successful)
@@ -61,10 +73,19 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
                 TraceEvent(
                     index=len(events),
                     model_id=str(route.get("model_id", "unknown")),
-                    skill_id=route.get("skill_id"),
-                    primitive_ids=tuple(route.get("primitive_ids", ())),
+                    skill_id=(
+                        str(route["skill_id"])
+                        if route.get("skill_id") is not None
+                        else None
+                    ),
+                    primitive_ids=tuple(
+                        str(item)
+                        for item in episode_step_values(
+                            route.get("primitive_ids")
+                        )
+                    ),
                     success=event_success,
-                    latency_ms=float(route.get("latency_ms", 0.0) or 0.0),
+                    latency_ms=finite_float_value(route.get("latency_ms")),
                     action=str(actions[index]) if index < len(actions) else None,
                     metadata={"credit_assignment": "parsed_action_and_episode_success"},
                 )
@@ -76,8 +97,12 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
                 successful=successful,
                 events=events,
                 reward=float(successful),
-                duration_ms=float(episode.get("run_time", 0.0) or 0.0) * 1000,
-                metadata={"source": "android_world_m3a"},
+                duration_ms=finite_float_value(episode.get("run_time")) * 1000,
+                metadata={
+                    "source": "android_world_m3a",
+                    "episode_data_valid": episode_data_is_usable(raw_episode_data),
+                    "had_exception": bool(episode.get("exception_info")),
+                },
             )
         )
     return traces

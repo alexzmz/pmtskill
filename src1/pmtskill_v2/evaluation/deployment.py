@@ -73,6 +73,9 @@ class MSSwiftEvaluationDeployment:
         # 放在 extra args 之后，确保正式 TOML 字段是最终生效值。
         command.extend(
             (
+                # 避免把完整 AndroidWorld prompt、base64 截图和响应写入 runtime.log。
+                "--verbose",
+                "false",
                 "--vllm_max_model_len",
                 str(self.settings.max_model_len),
                 "--vllm_gpu_memory_utilization",

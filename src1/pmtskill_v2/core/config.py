@@ -68,6 +68,8 @@ class TrainingEvaluationConfig:
     combinations: int = 1
     seed: int = 42
     every_epochs: int = 1
+    # 0 仅保留最终 checkpoint；N>0 每 N 个 epoch 永久保留一次。
+    checkpoint_every_epochs: int = 1
     include_candidate_skills: bool = False
     deploy_host: str = "127.0.0.1"
     deploy_port: int = 8002
@@ -229,6 +231,9 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         combinations=int(training_evaluation_raw.get("combinations", 1)),
         seed=int(training_evaluation_raw.get("seed", 42)),
         every_epochs=int(training_evaluation_raw.get("every_epochs", 1)),
+        checkpoint_every_epochs=int(
+            training_evaluation_raw.get("checkpoint_every_epochs", 1)
+        ),
         include_candidate_skills=bool(
             training_evaluation_raw.get("include_candidate_skills", False)
         ),
@@ -263,6 +268,10 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         raise ValueError("training_evaluation.combinations 必须是正整数")
     if training_evaluation.every_epochs <= 0:
         raise ValueError("training_evaluation.every_epochs 必须是正整数")
+    if training_evaluation.checkpoint_every_epochs < 0:
+        raise ValueError(
+            "training_evaluation.checkpoint_every_epochs 必须是非负整数"
+        )
     if not 1 <= training_evaluation.deploy_port <= 65535:
         raise ValueError("training_evaluation.deploy_port 必须在 [1, 65535]")
     if training_evaluation.max_model_len <= 0:

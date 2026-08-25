@@ -231,6 +231,7 @@ python -m src1 --config src1/config.local.toml train \
   --with-evaluation \
   --eval-task-count 30 \
   --eval-every-epochs 1 \
+  --checkpoint-every-epochs 1 \
   --eval-seed 42
 ```
 
@@ -244,7 +245,16 @@ python -m src1 --config src1/config.local.toml train \
 为避免训练进程与评测服务争用 GPU，每个阶段会先结束 ms-swift SFT 进程，再用
 `swift deploy --adapters <checkpoint>` 临时启动 OpenAI-compatible 服务；评测后关闭
 服务，从该 checkpoint 恢复 optimizer、随机种子和训练进度，继续下一段。训练命令
-会自动补充 `save_strategy=epoch`、`add_version=false` 和 checkpoint symlink 参数。
+会自动补充 `save_strategy=epoch`、`save_total_limit=1`、`add_version=false` 和
+checkpoint symlink 参数；同时显式设置 `load_args=false`、`load_data_args=false`，
+不允许旧 checkpoint 的 `args.json` 覆盖本次数据参数。每个累计 epoch 节点使用独立
+目录，避免后续阶段覆盖记录。
+
+正式启动基线评测前，框架会把 train/validation JSONL 冻结到本次 run 的
+`dataset_snapshot/`。如果合并数据集后样本仍引用旧的
+`.../dataset/images/...`，会按 `images/` 后的相对路径重定位到当前 TOML 的
+`dataset_dir`；缺失或损坏的图片会在预检报告中记录，只剔除完全没有可读图片的样本。
+之后所有训练阶段只使用这份固定索引，不会回退到默认 `./runtime/dataset`。
 
 若希望明确只训练（包括 TOML 中设置了 `enabled = true` 的情况），使用：
 
@@ -265,16 +275,30 @@ runtime/checkpoints/<adapter>/training_runs/<time>/
 ├── history.json                      # 完整机器可读 SR 历史和最佳 checkpoint
 ├── history.csv                       # 方便表格/画图的 SR 曲线
 ├── comparison.md                     # 基座、逐 epoch、最终技能增益总览
-├── training/                         # ms-swift checkpoint 与 trainer state
+├── checkpoints.json                  # epoch→checkpoint、是否永久保留
+├── dataset_snapshot/                 # 固定 JSONL、路径修复/坏图过滤报告
+├── training/
+│   ├── epoch_001/                    # 该累计 epoch 的命令、checkpoint、trainer state
+│   └── epoch_002/
 └── evaluations/
-    ├── baseline_standalone/           # summary.json/report.md/traces/checkpoints
-    ├── baseline_skills/
-    ├── epoch_001_standalone/
-    └── final_skills/
+    ├── baseline/
+    │   ├── standalone/               # summary.json/report.md/traces/checkpoints
+    │   └── skills/
+    ├── epoch_001/
+    │   └── standalone/
+    └── epoch_002/
+        ├── standalone/
+        └── skills/                   # 最终 checkpoint + 技能库
 ```
 
 周期评测阶段只测裸模型；最终阶段再测一次技能库，减少 emulator 时间。训练评测产生
 的 trace 不会写回技能数据库，避免测试集结果污染在线路由统计。
+
+`--checkpoint-every-epochs N` 控制永久保留间隔，默认 `1`（逐 epoch 保留）；设为
+`2` 时保留第 2、4、… epoch 和最终结果，设为 `0` 时仅保留最终 checkpoint。为完成
+中间评测/续训而创建的临时 checkpoint 会在整个流程成功后删除；若流程失败则保留，
+便于定位问题和手动恢复。也可在 `[training_evaluation]` 中配置
+`checkpoint_every_epochs = 1`。
 
 #### 显存、上下文和训练/评测 GPU 分配
 

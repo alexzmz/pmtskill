@@ -21,6 +21,7 @@ from .offline.trainer import (
     MSSwiftLoraTrainer,
     default_training_job,
     filter_dataset_by_primitives,
+    prepare_training_job,
     staged_training_job,
 )
 from .online.backend import SkillOptimizationBackend
@@ -202,7 +203,8 @@ def command_train(args: argparse.Namespace) -> int:
             return 0
         from .evaluation.deployment import MSSwiftEvaluationDeployment
         from .offline.training_workflow import (
-            build_epoch_targets,
+            build_epoch_plan,
+            epoch_label,
             resolve_student_profile,
         )
 
@@ -210,18 +212,28 @@ def command_train(args: argparse.Namespace) -> int:
         run_dir = _training_evaluation_output_dir(job, args)
         profile = resolve_student_profile(config, settings.model_id)
         deployment = MSSwiftEvaluationDeployment(config, settings, profile)
-        targets = build_epoch_targets(config.offline.epochs, settings.every_epochs)
+        plan = build_epoch_plan(
+            config.offline.epochs,
+            settings.every_epochs,
+            settings.checkpoint_every_epochs,
+        )
         stage_commands = []
-        for index, target in enumerate(targets):
+        for index, stage in enumerate(plan):
+            target = stage.target_epoch
             stage_job = staged_training_job(
                 job,
-                output_dir=run_dir / "training",
+                output_dir=run_dir / "training" / epoch_label(target),
                 target_epoch=target,
-                resume_from_checkpoint=None,
+                resume_from_checkpoint=(
+                    Path("CHECKPOINT_FROM_PREVIOUS_STAGE") if index > 0 else None
+                ),
             )
             stage_commands.append(
                 {
+                    "stage": epoch_label(target),
                     "target_epoch": target,
+                    "evaluate_after_stage": stage.evaluate,
+                    "retain_checkpoint": stage.retain_checkpoint,
                     "resume_from_previous_checkpoint": index > 0,
                     "command": trainer.build_command(stage_job),
                 }
@@ -233,6 +245,8 @@ def command_train(args: argparse.Namespace) -> int:
                 "job": job.name,
                 "with_android_evaluation": True,
                 "evaluation_output_dir": run_dir,
+                "dataset_source": job.train_dataset,
+                "dataset_snapshot_at_runtime": run_dir / "dataset_snapshot",
                 "resource_assignment": {
                     "training_cuda_visible_devices": (
                         config.offline.cuda_visible_devices
@@ -258,7 +272,11 @@ def command_train(args: argparse.Namespace) -> int:
                 "evaluation_sequence": [
                     "baseline_standalone",
                     "baseline_skills",
-                    *[f"epoch_{target:g}_standalone" for target in targets],
+                    *[
+                        f"{epoch_label(stage.target_epoch)}_standalone"
+                        for stage in plan
+                        if stage.evaluate
+                    ],
                     "final_skills",
                 ],
             }
@@ -300,6 +318,7 @@ def command_train(args: argparse.Namespace) -> int:
                 combinations=settings.combinations,
                 seed=settings.seed,
                 every_epochs=settings.every_epochs,
+                checkpoint_every_epochs=settings.checkpoint_every_epochs,
                 include_candidate_skills=settings.include_candidate_skills,
                 training_cuda_visible_devices=(
                     config.offline.cuda_visible_devices
@@ -315,8 +334,20 @@ def command_train(args: argparse.Namespace) -> int:
         )
         _print({"job": job.name, "with_android_evaluation": True, **result.to_dict()})
         return result.return_code
-    code = trainer.run(job)
-    _print({"job": job.name, "return_code": code, "output_dir": job.output_dir})
+    prepared = prepare_training_job(
+        job,
+        configured_dataset_dir=config.offline.dataset_dir,
+        snapshot_dir=job.output_dir / "dataset_snapshot",
+    )
+    code = trainer.run(prepared.job)
+    _print(
+        {
+            "job": job.name,
+            "return_code": code,
+            "output_dir": job.output_dir,
+            "dataset_manifest": prepared.manifest_path,
+        }
+    )
     return code
 
 
@@ -344,6 +375,11 @@ def _training_evaluation_settings(
             args.eval_every_epochs
             if args.eval_every_epochs is not None
             else current.every_epochs
+        ),
+        checkpoint_every_epochs=(
+            args.checkpoint_every_epochs
+            if args.checkpoint_every_epochs is not None
+            else current.checkpoint_every_epochs
         ),
         include_candidate_skills=(
             args.eval_include_candidates
@@ -378,6 +414,8 @@ def _training_evaluation_settings(
         raise ValueError("--eval-combinations 必须是正整数")
     if resolved.every_epochs <= 0:
         raise ValueError("--eval-every-epochs 必须是正整数")
+    if resolved.checkpoint_every_epochs < 0:
+        raise ValueError("--checkpoint-every-epochs 必须是非负整数")
     if not 1 <= resolved.deploy_port <= 65535:
         raise ValueError("--eval-deploy-port 必须在 [1, 65535]")
     if resolved.max_model_len <= 0:
@@ -642,6 +680,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-every-epochs",
         type=int,
         help="每完成多少个 epoch 做一次裸模型 SR；默认每 1 个",
+    )
+    train.add_argument(
+        "--checkpoint-every-epochs",
+        type=int,
+        help="永久保留 checkpoint 的 epoch 间隔；默认 1，0 表示只保留最终结果",
     )
     train.add_argument(
         "--eval-include-candidates",

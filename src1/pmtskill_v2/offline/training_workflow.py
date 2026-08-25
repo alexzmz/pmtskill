@@ -5,9 +5,10 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import math
+import shutil
 import traceback
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -21,6 +22,7 @@ from .trainer import (
     AdapterJob,
     MSSwiftLoraTrainer,
     find_latest_adapter_checkpoint,
+    prepare_training_job,
     staged_training_job,
     validate_staged_training_args,
 )
@@ -57,6 +59,47 @@ def epoch_label(value: float) -> str:
     return f"epoch_{whole:03d}_{fraction:03d}"
 
 
+@dataclass(frozen=True, slots=True)
+class EpochStage:
+    """一个需要停下训练的累计 epoch 节点及其用途。"""
+
+    target_epoch: float
+    evaluate: bool
+    retain_checkpoint: bool
+    final: bool
+
+
+def build_epoch_plan(
+    total_epochs: float,
+    evaluation_every_epochs: int,
+    checkpoint_every_epochs: int,
+) -> list[EpochStage]:
+    """合并评测与持久 checkpoint 节点；0 表示仅保留最终 checkpoint。"""
+
+    if checkpoint_every_epochs < 0:
+        raise ValueError("checkpoint_every_epochs 必须是非负整数")
+    evaluation_targets = build_epoch_targets(total_epochs, evaluation_every_epochs)
+    checkpoint_targets = (
+        [float(total_epochs)]
+        if checkpoint_every_epochs == 0
+        else build_epoch_targets(total_epochs, checkpoint_every_epochs)
+    )
+    targets = sorted(set(evaluation_targets + checkpoint_targets))
+
+    def contains(values: Sequence[float], target: float) -> bool:
+        return any(math.isclose(value, target, abs_tol=1e-9) for value in values)
+
+    return [
+        EpochStage(
+            target_epoch=target,
+            evaluate=contains(evaluation_targets, target),
+            retain_checkpoint=contains(checkpoint_targets, target),
+            final=math.isclose(target, total_epochs, abs_tol=1e-9),
+        )
+        for target in targets
+    ]
+
+
 def resolve_student_profile(
     config: ProjectConfig, model_id: str | None
 ) -> ModelProfile:
@@ -89,6 +132,7 @@ class TrainingEvaluationOptions:
     combinations: int = 1
     seed: int = 42
     every_epochs: int = 1
+    checkpoint_every_epochs: int = 1
     include_candidate_skills: bool = False
     training_cuda_visible_devices: str | None = None
     evaluation_cuda_visible_devices: str | None = None
@@ -107,6 +151,8 @@ class TrainingEvaluationResult:
     history_json: Path
     history_csv: Path
     comparison_markdown: Path
+    dataset_manifest: Path
+    checkpoints_manifest: Path
     stages: list[dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,6 +166,8 @@ class TrainingEvaluationResult:
             "history_json": str(self.history_json),
             "history_csv": str(self.history_csv),
             "comparison_markdown": str(self.comparison_markdown),
+            "dataset_manifest": str(self.dataset_manifest),
+            "checkpoints_manifest": str(self.checkpoints_manifest),
             "stages": self.stages,
         }
 
@@ -207,28 +255,67 @@ class TrainingEvaluationRecorder:
         self.comparison_markdown = self.output_dir / "comparison.md"
         self.manifest_path = self.output_dir / "sample_manifest.json"
         self.command_path = self.output_dir / "training_stage_commands.json"
+        self.checkpoints_path = self.output_dir / "checkpoints.json"
         self.state: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": dt.datetime.now().astimezone().isoformat(),
             "status": "running",
             "manifest": manifest,
             "stages": [],
             "training_commands": [],
+            "checkpoints": [],
             "error": None,
         }
         write_json_atomic(self.manifest_path, manifest)
         self.flush()
 
     def record_command(
-        self, *, target_epoch: float, resume: Path | None, command: Sequence[str]
+        self,
+        *,
+        target_epoch: float,
+        stage_output_dir: Path,
+        evaluate: bool,
+        retain_checkpoint: bool,
+        resume: Path | None,
+        command: Sequence[str],
     ) -> None:
         self.state["training_commands"].append(
             {
+                "stage": epoch_label(target_epoch),
                 "target_epoch": target_epoch,
+                "stage_output_dir": str(stage_output_dir),
+                "evaluate_after_stage": evaluate,
+                "retain_checkpoint": retain_checkpoint,
                 "resume_from_checkpoint": str(resume) if resume else None,
                 "command": list(command),
             }
         )
+        self.flush()
+
+    def record_checkpoint(
+        self,
+        *,
+        epoch: float,
+        checkpoint: Path,
+        stage_output_dir: Path,
+        retained: bool,
+    ) -> dict[str, Any]:
+        row = {
+            "stage": epoch_label(epoch),
+            "epoch": epoch,
+            "checkpoint": str(checkpoint),
+            "stage_output_dir": str(stage_output_dir),
+            "retained": retained,
+            "exists": checkpoint.exists(),
+            "removed_after_completion": False,
+        }
+        self.state["checkpoints"].append(row)
+        self.flush()
+        return row
+
+    def mark_checkpoint_removed(self, row: dict[str, Any]) -> None:
+        row["exists"] = False
+        row["removed_after_completion"] = True
         self.flush()
 
     def record_evaluation(
@@ -244,6 +331,7 @@ class TrainingEvaluationRecorder:
         summary = artifacts.summary
         row = {
             "label": label,
+            "stage": "baseline" if epoch <= 0 else epoch_label(epoch),
             "mode": mode,
             "epoch": epoch,
             "checkpoint": str(checkpoint) if checkpoint else None,
@@ -256,6 +344,7 @@ class TrainingEvaluationRecorder:
             "summary_json": str(artifacts.summary_json),
             "report_markdown": str(artifacts.report_markdown),
             "traces_jsonl": str(artifacts.traces_jsonl),
+            "artifact_dir": str(artifacts.output_dir),
         }
         self.state["stages"].append(row)
         self.flush()
@@ -304,6 +393,7 @@ class TrainingEvaluationRecorder:
     def _write_csv(self) -> None:
         columns = (
             "label",
+            "stage",
             "mode",
             "epoch",
             "is_final_checkpoint",
@@ -315,6 +405,7 @@ class TrainingEvaluationRecorder:
             "average_steps",
             "checkpoint",
             "summary_json",
+            "artifact_dir",
         )
         temporary = self.history_csv.with_suffix(".csv.tmp")
         with temporary.open("w", encoding="utf-8", newline="") as handle:
@@ -390,8 +481,36 @@ class TrainingEvaluationRecorder:
         write_json_atomic(
             self.command_path, {"commands": self.state["training_commands"]}
         )
+        write_json_atomic(
+            self.checkpoints_path,
+            {
+                "schema_version": 1,
+                "checkpoint_every_epochs": self.state["manifest"].get(
+                    "checkpoint_every_epochs"
+                ),
+                "checkpoints": self.state["checkpoints"],
+            },
+        )
         self._write_csv()
         self._write_markdown(derived)
+
+
+def _remove_transient_checkpoint(checkpoint: Path) -> None:
+    """成功完成全部阶段后，精确移除未请求永久保留的中间 checkpoint。"""
+
+    resolved = checkpoint.resolve()
+    if checkpoint.parent.is_dir():
+        for child in checkpoint.parent.iterdir():
+            if not child.is_symlink():
+                continue
+            try:
+                points_to_checkpoint = child.resolve() == resolved
+            except OSError:
+                points_to_checkpoint = False
+            if points_to_checkpoint:
+                child.unlink()
+    if checkpoint.is_dir():
+        shutil.rmtree(checkpoint)
 
 
 class TrainingEvaluationWorkflow:
@@ -431,6 +550,7 @@ class TrainingEvaluationWorkflow:
         final_checkpoint: bool = False,
     ) -> dict[str, Any]:
         mode = "skills" if use_skills else "standalone"
+        stage = "baseline" if epoch <= 0 else epoch_label(epoch)
         artifacts = self.evaluator.run(
             profile=profile,
             use_skills=use_skills,
@@ -439,7 +559,7 @@ class TrainingEvaluationWorkflow:
             seed=options.seed,
             family=options.family,
             include_candidate_skills=options.include_candidate_skills,
-            output_dir=options.output_dir / "evaluations" / label,
+            output_dir=options.output_dir / "evaluations" / stage / mode,
         )
         return recorder.record_evaluation(
             label=label,
@@ -463,12 +583,20 @@ class TrainingEvaluationWorkflow:
                 f"{options.output_dir}"
             )
         validate_staged_training_args(job)
-        targets = build_epoch_targets(
-            self.config.offline.epochs, options.every_epochs
+        plan = build_epoch_plan(
+            self.config.offline.epochs,
+            options.every_epochs,
+            options.checkpoint_every_epochs,
         )
         training_output = options.output_dir / "training"
+        prepared = prepare_training_job(
+            job,
+            configured_dataset_dir=self.config.offline.dataset_dir,
+            snapshot_dir=options.output_dir / "dataset_snapshot",
+        )
+        job = prepared.job
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "job": job.name,
             "family": options.family,
             "tasks": list(options.tasks),
@@ -478,9 +606,17 @@ class TrainingEvaluationWorkflow:
             * options.combinations,
             "seed": options.seed,
             "every_epochs": options.every_epochs,
+            "checkpoint_every_epochs": options.checkpoint_every_epochs,
             "total_epochs": self.config.offline.epochs,
-            "epoch_targets": targets,
+            "epoch_plan": [asdict(stage) for stage in plan],
+            "dataset_snapshot_manifest": str(prepared.manifest_path),
+            "dataset": prepared.manifest,
             "include_candidate_skills": options.include_candidate_skills,
+            "output_layout": {
+                "training": "training/epoch_XXX/",
+                "evaluations": "evaluations/epoch_XXX/{standalone,skills}/",
+                "baseline": "evaluations/baseline/{standalone,skills}/",
+            },
             "resource_assignment": {
                 "training_cuda_visible_devices": (
                     options.training_cuda_visible_devices
@@ -496,6 +632,7 @@ class TrainingEvaluationWorkflow:
         }
         recorder = TrainingEvaluationRecorder(options.output_dir, manifest)
         checkpoint: Path | None = None
+        transient_checkpoints: list[tuple[Path, dict[str, Any]]] = []
         return_code = 0
         try:
             # 基座只部署一次，连续跑裸模型与“同模型+技能库”，避免重复加载权重。
@@ -519,15 +656,20 @@ class TrainingEvaluationWorkflow:
                     checkpoint=None,
                 )
 
-            for index, target_epoch in enumerate(targets):
+            for stage in plan:
+                target_epoch = stage.target_epoch
+                stage_output = training_output / epoch_label(target_epoch)
                 stage_job = staged_training_job(
                     job,
-                    output_dir=training_output,
+                    output_dir=stage_output,
                     target_epoch=target_epoch,
                     resume_from_checkpoint=checkpoint,
                 )
                 recorder.record_command(
                     target_epoch=target_epoch,
+                    stage_output_dir=stage_output,
+                    evaluate=stage.evaluate,
+                    retain_checkpoint=stage.retain_checkpoint,
                     resume=checkpoint,
                     command=self.trainer.build_command(stage_job),
                 )
@@ -541,32 +683,43 @@ class TrainingEvaluationWorkflow:
                         ),
                     )
                     break
-                checkpoint = find_latest_adapter_checkpoint(training_output)
-                is_final = index == len(targets) - 1
-                with self.deployment.activate(checkpoint) as profile:
-                    self._evaluate(
-                        recorder=recorder,
-                        profile=profile,
-                        options=options,
-                        label=f"{epoch_label(target_epoch)}_standalone",
-                        use_skills=False,
-                        epoch=target_epoch,
-                        checkpoint=checkpoint,
-                        final_checkpoint=is_final,
-                    )
-                    # 中间 epoch 只测裸模型；最终 checkpoint 再补一次技能库总评。
-                    if is_final:
+                checkpoint = find_latest_adapter_checkpoint(stage_output)
+                checkpoint_row = recorder.record_checkpoint(
+                    epoch=target_epoch,
+                    checkpoint=checkpoint,
+                    stage_output_dir=stage_output,
+                    retained=stage.retain_checkpoint,
+                )
+                if not stage.retain_checkpoint:
+                    transient_checkpoints.append((checkpoint, checkpoint_row))
+                if stage.evaluate:
+                    with self.deployment.activate(checkpoint) as profile:
                         self._evaluate(
                             recorder=recorder,
                             profile=profile,
                             options=options,
-                            label="final_skills",
-                            use_skills=True,
+                            label=f"{epoch_label(target_epoch)}_standalone",
+                            use_skills=False,
                             epoch=target_epoch,
                             checkpoint=checkpoint,
-                            final_checkpoint=True,
+                            final_checkpoint=stage.final,
                         )
+                        # 中间 epoch 只测裸模型；最终 checkpoint 再补一次技能库总评。
+                        if stage.final:
+                            self._evaluate(
+                                recorder=recorder,
+                                profile=profile,
+                                options=options,
+                                label="final_skills",
+                                use_skills=True,
+                                epoch=target_epoch,
+                                checkpoint=checkpoint,
+                                final_checkpoint=True,
+                            )
             if return_code == 0:
+                for transient, checkpoint_row in transient_checkpoints:
+                    _remove_transient_checkpoint(transient)
+                    recorder.mark_checkpoint_removed(checkpoint_row)
                 recorder.finish("completed")
         except Exception as exc:
             recorder.finish(
@@ -583,5 +736,7 @@ class TrainingEvaluationWorkflow:
             history_json=recorder.history_json,
             history_csv=recorder.history_csv,
             comparison_markdown=recorder.comparison_markdown,
+            dataset_manifest=prepared.manifest_path,
+            checkpoints_manifest=recorder.checkpoints_path,
             stages=list(recorder.state["stages"]),
         )

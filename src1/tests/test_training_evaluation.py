@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import tempfile
@@ -26,10 +27,13 @@ from src1.pmtskill_v2.offline.trainer import (
     AdapterJob,
     MSSwiftLoraTrainer,
     find_latest_adapter_checkpoint,
+    prepare_training_job,
+    staged_training_job,
 )
 from src1.pmtskill_v2.offline.training_workflow import (
     TrainingEvaluationOptions,
     TrainingEvaluationWorkflow,
+    build_epoch_plan,
     build_epoch_targets,
 )
 
@@ -144,6 +148,19 @@ class TrainingEvaluationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "正整数"):
             build_epoch_targets(2.0, 0)
 
+    def test_epoch_plan_merges_evaluation_and_checkpoint_intervals(self):
+        plan = build_epoch_plan(5.0, 2, 1)
+        self.assertEqual([stage.target_epoch for stage in plan], [1, 2, 3, 4, 5])
+        self.assertEqual(
+            [stage.evaluate for stage in plan], [False, True, False, True, True]
+        )
+        self.assertTrue(all(stage.retain_checkpoint for stage in plan))
+
+        final_only = build_epoch_plan(2.0, 1, 0)
+        self.assertEqual(
+            [stage.retain_checkpoint for stage in final_only], [False, True]
+        )
+
     def test_latest_checkpoint_ignores_incomplete_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -192,6 +209,101 @@ class TrainingEvaluationTest(unittest.TestCase):
             self.assertEqual(trainer_environment["CUDA_VISIBLE_DEVICES"], "2")
             self.assertEqual(deployment_environment["CUDA_VISIBLE_DEVICES"], "1")
 
+    def test_staged_command_never_reloads_dataset_args_from_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            swift_cli = root / "ms-swift" / "swift" / "cli" / "main.py"
+            swift_cli.parent.mkdir(parents=True)
+            swift_cli.write_text("# placeholder", encoding="utf-8")
+            job = staged_training_job(
+                AdapterJob("all", root / "train.jsonl", None, root / "unused"),
+                output_dir=root / "run" / "training" / "epoch_002",
+                target_epoch=2,
+                resume_from_checkpoint=root / "checkpoint-10",
+            )
+            command = MSSwiftLoraTrainer(config).build_command(job)
+
+            self.assertEqual(command[command.index("--load_args") + 1], "false")
+            self.assertEqual(
+                command[command.index("--load_data_args") + 1], "false"
+            )
+            self.assertIn(str((root / "train.jsonl").resolve()), command)
+
+    def test_training_snapshot_rebases_old_image_root_and_filters_only_bad_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_dir = root / "dataset_all"
+            image_dir = dataset_dir / "images" / "TaskA"
+            image_dir.mkdir(parents=True)
+            good = image_dir / "good.png"
+            try:
+                from PIL import Image
+            except ModuleNotFoundError:
+                good.write_bytes(
+                    base64.b64decode(
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+                    )
+                )
+            else:
+                Image.new("RGB", (2, 2), "white").save(good)
+            corrupt = image_dir / "corrupt.png"
+            corrupt.write_text("not an image", encoding="utf-8")
+            old_root = root / "dataset" / "images" / "TaskA"
+            rows = [
+                {
+                    "messages": [
+                        {"role": "user", "content": "<image>\nvalid"},
+                        {"role": "assistant", "content": "answer"},
+                    ],
+                    "images": [str(old_root / "good.png")],
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": "<image>\nbad"},
+                        {"role": "assistant", "content": "answer"},
+                    ],
+                    "images": [str(old_root / "corrupt.png")],
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": "<image><image>\npartial"},
+                        {"role": "assistant", "content": "answer"},
+                    ],
+                    "images": [
+                        str(old_root / "good.png"),
+                        str(old_root / "missing.png"),
+                    ],
+                },
+            ]
+            train = dataset_dir / "train.jsonl"
+            train.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            prepared = prepare_training_job(
+                AdapterJob("all", train, None, root / "output"),
+                configured_dataset_dir=dataset_dir,
+                snapshot_dir=root / "run" / "dataset_snapshot",
+            )
+
+            snapshot_rows = [
+                json.loads(line)
+                for line in prepared.job.train_dataset.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(len(snapshot_rows), 2)
+            self.assertEqual(snapshot_rows[0]["images"], [str(good.resolve())])
+            self.assertEqual(snapshot_rows[1]["images"], [str(good.resolve())])
+            self.assertTrue(
+                snapshot_rows[1]["messages"][0]["content"].startswith("<image>\n")
+            )
+            self.assertEqual(prepared.manifest["train"]["rejected_rows"], 1)
+            self.assertEqual(
+                prepared.manifest["train"]["rebased_image_references"], 2
+            )
+
     def test_workflow_runs_fair_baselines_each_epoch_and_final_skills(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -204,6 +316,18 @@ class TrainingEvaluationTest(unittest.TestCase):
                 train_dataset=root / "train.jsonl",
                 validation_dataset=None,
                 output_dir=root / "unused",
+            )
+            job.train_dataset.write_text(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "world"},
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
             )
             result = TrainingEvaluationWorkflow(
                 config,
@@ -230,6 +354,12 @@ class TrainingEvaluationTest(unittest.TestCase):
             self.assertEqual(
                 trainer.jobs[1].resume_from_checkpoint.name, "checkpoint-10"
             )
+            self.assertEqual(trainer.jobs[0].output_dir.name, "epoch_001")
+            self.assertEqual(trainer.jobs[1].output_dir.name, "epoch_002")
+            self.assertEqual(
+                trainer.jobs[0].train_dataset, trainer.jobs[1].train_dataset
+            )
+            self.assertIn("dataset_snapshot", str(trainer.jobs[0].train_dataset))
             self.assertEqual(
                 [row["label"] for row in result.stages],
                 [
@@ -257,6 +387,54 @@ class TrainingEvaluationTest(unittest.TestCase):
             )
             self.assertIn("最终模型+技能库 SR", result.comparison_markdown.read_text(encoding="utf-8"))
             self.assertTrue(result.history_csv.is_file())
+            self.assertTrue(
+                (root / "run" / "evaluations" / "epoch_001" / "standalone").is_dir()
+            )
+            checkpoints = json.loads(
+                result.checkpoints_manifest.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [row["stage"] for row in checkpoints["checkpoints"]],
+                ["epoch_001", "epoch_002"],
+            )
+
+    def test_checkpoint_interval_zero_keeps_only_final_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            trainer = _FakeTrainer()
+            job = AdapterJob("all", root / "train.jsonl", None, root / "unused")
+            job.train_dataset.write_text(
+                json.dumps({"messages": []}) + "\n", encoding="utf-8"
+            )
+            result = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                trainer,
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=_FakeEvaluator(),
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=root / "run",
+                    tasks=("TaskA",),
+                    every_epochs=1,
+                    checkpoint_every_epochs=0,
+                ),
+            )
+
+            manifest = json.loads(
+                result.checkpoints_manifest.read_text(encoding="utf-8")
+            )["checkpoints"]
+            self.assertFalse(manifest[0]["retained"])
+            self.assertFalse(manifest[0]["exists"])
+            self.assertTrue(manifest[0]["removed_after_completion"])
+            self.assertTrue(manifest[1]["retained"])
+            self.assertTrue(manifest[1]["exists"])
+            self.assertFalse(
+                (root / "run" / "training" / "epoch_001" / "checkpoint-10").exists()
+            )
+            self.assertTrue(result.final_checkpoint.is_dir())
 
     def test_cli_keeps_evaluation_opt_in(self):
         parser = build_parser()
@@ -273,6 +451,8 @@ class TrainingEvaluationTest(unittest.TestCase):
                 "1",
                 "--eval-max-model-len",
                 "32768",
+                "--checkpoint-every-epochs",
+                "2",
             ]
         )
         disabled = parser.parse_args(["train", "--without-evaluation"])
@@ -282,6 +462,7 @@ class TrainingEvaluationTest(unittest.TestCase):
         self.assertEqual(enabled.train_cuda_visible_devices, "2")
         self.assertEqual(enabled.eval_cuda_visible_devices, "1")
         self.assertEqual(enabled.eval_max_model_len, 32768)
+        self.assertEqual(enabled.checkpoint_every_epochs, 2)
         self.assertFalse(disabled.with_evaluation)
 
 

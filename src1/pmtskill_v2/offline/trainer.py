@@ -8,11 +8,13 @@ import subprocess
 import sys
 import re
 import threading
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 from ..core.config import ProjectConfig
+from ..core.io import write_json_atomic, write_jsonl
 
 
 @dataclass(slots=True)
@@ -32,6 +34,268 @@ class AdapterJob:
     # 分段训练时使用累计 epoch 目标，例如先训练到 1，再从 checkpoint 恢复到 2。
     num_train_epochs: float | None = None
     resume_from_checkpoint: Path | None = None
+
+
+@dataclass(slots=True)
+class PreparedTrainingJob:
+    """本次训练使用的固定 JSONL 索引及其兼容性检查报告。"""
+
+    job: AdapterJob
+    manifest_path: Path
+    manifest: dict[str, Any]
+
+
+def _image_candidates(
+    value: str, *, source_dataset: Path, configured_dataset_dir: Path
+) -> list[Path]:
+    """给旧绝对路径和相对路径生成确定性的本地候选位置。"""
+
+    original = Path(value).expanduser()
+    candidates: list[Path] = []
+    if original.is_absolute():
+        candidates.append(original)
+    else:
+        candidates.extend(
+            (source_dataset.parent / original, configured_dataset_dir / original)
+        )
+
+    # 合并/迁移数据集后，JSONL 常仍指向旧的 .../dataset/images/...。
+    # 只从稳定的 images 锚点以后重定位，不根据文件名做模糊搜索。
+    normalized_parts = Path(value.replace("\\", "/")).parts
+    image_indexes = [
+        index
+        for index, part in enumerate(normalized_parts)
+        if part.lower() == "images"
+    ]
+    if image_indexes:
+        relative = Path(*normalized_parts[image_indexes[-1] :])
+        candidates.append(configured_dataset_dir / relative)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        key = os.path.normcase(str(resolved))
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def _readable_image(path: Path, cache: dict[Path, bool]) -> bool:
+    cached = cache.get(path)
+    if cached is not None:
+        return cached
+    try:
+        from PIL import Image
+    except ModuleNotFoundError:
+        # 轻量单测环境可能没有 Pillow；至少用常见格式魔数拒绝空文件/文本文件。
+        try:
+            header = path.read_bytes()[:16]
+            readable = bool(
+                header.startswith(b"\x89PNG\r\n\x1a\n")
+                or header.startswith(b"\xff\xd8\xff")
+                or header.startswith((b"GIF87a", b"GIF89a", b"BM"))
+                or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
+            )
+        except OSError:
+            readable = False
+    else:
+        try:
+            with Image.open(path) as image:
+                image.verify()
+            readable = True
+        except (OSError, SyntaxError, ValueError, TypeError):
+            readable = False
+    cache[path] = readable
+    return readable
+
+
+def _align_leading_image_placeholders(row: dict[str, Any], image_count: int) -> None:
+    """在部分图片损坏但仍有可用图片时，同步构建器生成的前置占位符。"""
+
+    messages = row.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.startswith("<image>"):
+            return
+        body = content
+        while body.startswith("<image>"):
+            body = body[len("<image>") :]
+        message["content"] = "<image>" * image_count + body
+        return
+
+
+def _prepare_dataset_split(
+    source: Path,
+    destination: Path,
+    *,
+    configured_dataset_dir: Path,
+) -> dict[str, Any]:
+    """冻结一个 JSONL split，并修复路径、过滤真正不可读取的图片样本。"""
+
+    rows: list[dict[str, Any]] = []
+    counters: Counter[str] = Counter()
+    rejected_examples: list[dict[str, Any]] = []
+    image_cache: dict[Path, bool] = {}
+    with source.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            counters["source_rows"] += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                counters["rejected_invalid_json"] += 1
+                if len(rejected_examples) < 20:
+                    rejected_examples.append(
+                        {"line": line_number, "reason": "invalid_json"}
+                    )
+                continue
+            if not isinstance(row, dict):
+                counters["rejected_non_object"] += 1
+                if len(rejected_examples) < 20:
+                    rejected_examples.append(
+                        {"line": line_number, "reason": "non_object"}
+                    )
+                continue
+
+            raw_images = row.get("images")
+            if raw_images is None:
+                rows.append(row)
+                counters["accepted_rows"] += 1
+                counters["text_only_rows"] += 1
+                continue
+            references = raw_images if isinstance(raw_images, list) else [raw_images]
+            valid_images: list[str] = []
+            invalid_reasons: list[str] = []
+            for reference in references:
+                if not isinstance(reference, str) or not reference.strip():
+                    invalid_reasons.append("invalid_image_reference")
+                    counters["invalid_image_references"] += 1
+                    continue
+                if reference.startswith(("http://", "https://", "data:")):
+                    valid_images.append(reference)
+                    counters["remote_images_unchecked"] += 1
+                    continue
+                candidates = _image_candidates(
+                    reference,
+                    source_dataset=source,
+                    configured_dataset_dir=configured_dataset_dir,
+                )
+                existing = [candidate for candidate in candidates if candidate.is_file()]
+                selected = next(
+                    (
+                        candidate
+                        for candidate in existing
+                        if _readable_image(candidate, image_cache)
+                    ),
+                    None,
+                )
+                if selected is None:
+                    reason = "corrupt_image" if existing else "missing_image"
+                    invalid_reasons.append(reason)
+                    counters[f"{reason}_references"] += 1
+                    continue
+                selected_text = str(selected)
+                valid_images.append(selected_text)
+                original = Path(reference).expanduser().resolve(strict=False)
+                if selected != original:
+                    counters["rebased_image_references"] += 1
+
+            if references and not valid_images:
+                reason = (
+                    "corrupt_or_invalid_images"
+                    if any(item != "missing_image" for item in invalid_reasons)
+                    else "missing_images"
+                )
+                counters[f"rejected_{reason}"] += 1
+                if len(rejected_examples) < 20:
+                    rejected_examples.append(
+                        {
+                            "line": line_number,
+                            "reason": reason,
+                            "declared_images": len(references),
+                        }
+                    )
+                continue
+            if invalid_reasons:
+                counters["repaired_partial_image_rows"] += 1
+                counters["dropped_image_references"] += len(invalid_reasons)
+                _align_leading_image_placeholders(row, len(valid_images))
+            row["images"] = valid_images
+            rows.append(row)
+            counters["accepted_rows"] += 1
+
+    write_jsonl(destination, rows)
+    return {
+        "source_path": str(source.resolve()),
+        "snapshot_path": str(destination.resolve()),
+        **dict(sorted(counters.items())),
+        "rejected_rows": counters["source_rows"] - counters["accepted_rows"],
+        "rejected_examples": rejected_examples,
+    }
+
+
+def prepare_training_job(
+    job: AdapterJob,
+    *,
+    configured_dataset_dir: Path,
+    snapshot_dir: Path,
+) -> PreparedTrainingJob:
+    """为一次训练生成不可漂移、可审计且已验证图片的 JSONL 快照。"""
+
+    if not job.train_dataset.is_file():
+        raise FileNotFoundError(f"训练数据集不存在: {job.train_dataset}")
+    snapshot_dir = snapshot_dir.resolve()
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    train_path = snapshot_dir / "train.jsonl"
+    train_report = _prepare_dataset_split(
+        job.train_dataset.resolve(),
+        train_path,
+        configured_dataset_dir=configured_dataset_dir.resolve(),
+    )
+    validation_path: Path | None = None
+    validation_report: dict[str, Any] | None = None
+    if job.validation_dataset is not None and job.validation_dataset.is_file():
+        candidate = snapshot_dir / "validation.jsonl"
+        validation_report = _prepare_dataset_split(
+            job.validation_dataset.resolve(),
+            candidate,
+            configured_dataset_dir=configured_dataset_dir.resolve(),
+        )
+        if int(validation_report.get("accepted_rows", 0)) > 0:
+            validation_path = candidate
+
+    manifest = {
+        "schema_version": 1,
+        "configured_dataset_dir": str(configured_dataset_dir.resolve()),
+        "policy": (
+            "rebase old paths at the images/ anchor; keep readable rows; "
+            "drop only invalid JSON or rows without any readable declared image"
+        ),
+        "train": train_report,
+        "validation": validation_report,
+    }
+    manifest_path = snapshot_dir / "manifest.json"
+    write_json_atomic(manifest_path, manifest)
+    if int(train_report.get("accepted_rows", 0)) <= 0:
+        raise ValueError(
+            "训练集预检后没有可用样本；请查看 " f"{manifest_path}"
+        )
+    return PreparedTrainingJob(
+        job=replace(
+            job,
+            train_dataset=train_path,
+            validation_dataset=validation_path,
+        ),
+        manifest_path=manifest_path,
+        manifest=manifest,
+    )
 
 
 class TrainingAlgorithm(Protocol):
@@ -202,7 +466,10 @@ def validate_staged_training_args(job: AdapterJob) -> None:
         "--resume_from_checkpoint",
         "--add_version",
         "--save_strategy",
+        "--save_total_limit",
         "--create_checkpoint_symlink",
+        "--load_args",
+        "--load_data_args",
     }
     conflicts = sorted(reserved.intersection(job.extra_args))
     if conflicts:
@@ -221,8 +488,8 @@ def staged_training_job(
 ) -> AdapterJob:
     """构造一次可恢复的累计 epoch 训练 job。
 
-    ``add_version=false`` 让各段共享同一 checkpoint 目录；``save_strategy=epoch``
-    保证每个评测点都有完整 adapter 和 optimizer 状态可用于下一段恢复。
+    每段使用独立的 epoch 目录；``save_strategy=epoch`` 保证段末有完整 adapter 和
+    optimizer 状态可恢复，``save_total_limit=1`` 则只保留该段最新 checkpoint。
     """
 
     validate_staged_training_args(job)
@@ -231,8 +498,15 @@ def staged_training_job(
         "false",
         "--save_strategy",
         "epoch",
+        "--save_total_limit",
+        "1",
         "--create_checkpoint_symlink",
         "true",
+        # 防止未来 ms-swift 默认值变化时，从 checkpoint/args.json 回载旧数据路径。
+        "--load_args",
+        "false",
+        "--load_data_args",
+        "false",
     )
     return replace(
         job,

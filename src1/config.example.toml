@@ -27,6 +27,10 @@ lora_alpha = 32
 # cuda_visible_devices = "2"
 
 [training_evaluation]
+# 训练进程退出后，框架在该端口临时执行 swift deploy，评测完立即回收。
+deploy_host = "127.0.0.1"
+deploy_port = 8002
+infer_backend = "vllm"
 # 默认保持 train 为纯训练；CLI 传 --with-evaluation 时临时启用完整评测闭环。
 enabled = false
 # 用这个画像继承模型能力先验；临时服务地址和 served_model 会由框架自动覆盖。
@@ -42,10 +46,6 @@ every_epochs = 1
 # 永久保留 checkpoint 的间隔；默认逐 epoch 保留，0 表示只保留最终 checkpoint。
 checkpoint_every_epochs = 1
 include_candidate_skills = false
-# 训练进程退出后，框架在该端口临时执行 swift deploy，评测完立即回收。
-deploy_host = "127.0.0.1"
-deploy_port = 8002
-infer_backend = "vllm"
 # 显式覆盖模型 config.json 中的 262144，控制 vLLM KV cache 显存。
 max_model_len = 32768
 gpu_memory_utilization = 0.90

@@ -11,6 +11,6 @@ __pycache__/
 build/
 /results/
 src1/pmtskill_v2/runtime/*
-
+config.local*
 # log
 *log*

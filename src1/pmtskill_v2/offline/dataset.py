@@ -42,9 +42,7 @@ def infer_action_primitives(action_output: str) -> tuple[str, ...]:
     return tuple(matches or ("reason.decompose",))
 
 
-def _episode_value(
-    episode: Mapping[str, Any], *keys: str, default: Any = None
-) -> Any:
+def _episode_value(episode: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
     for key in keys:
         if key in episode:
             return episode[key]
@@ -109,12 +107,7 @@ def _normalize_episode_data(value: Any) -> Mapping[str, Any] | None:
         return {}
     if not all(isinstance(step, Mapping) for step in value):
         return None
-    keys = {
-        key
-        for step in value
-        for key in step
-        if isinstance(key, str)
-    }
+    keys = {key for step in value for key in step if isinstance(key, str)}
     return {key: [step.get(key) for step in value] for key in keys}
 
 
@@ -378,7 +371,8 @@ class AndroidWorldDistillationDatasetBuilder:
 
     def build(self, trajectory_root: str | Path) -> DatasetBuildResult:
         """转换并按 episode 切分 train/validation，返回完整 manifest。"""
-
+        print(trajectory_root)
+        print(self.output_dir)
         episodes = load_episode_files(trajectory_root)
         accepted: list[list[dict[str, Any]]] = []
         rejected = 0
@@ -445,9 +439,7 @@ class AndroidWorldDistillationDatasetBuilder:
             "rejected_episodes": rejected,
             "rejection_reasons": rejection_reasons,
             "episode_outcomes": dict(sorted(outcome_counts.items())),
-            "accepted_episode_outcomes": dict(
-                sorted(accepted_outcome_counts.items())
-            ),
+            "accepted_episode_outcomes": dict(sorted(accepted_outcome_counts.items())),
             "candidate_steps": candidate_steps,
             "accepted_steps": train_count + validation_count,
             "rejected_steps": rejected_steps,

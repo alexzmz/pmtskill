@@ -298,6 +298,35 @@ def prepare_training_job(
     )
 
 
+def load_prepared_training_job(
+    job: AdapterJob, *, snapshot_dir: Path
+) -> PreparedTrainingJob:
+    """续训时加载原运行的数据快照，避免重新读取已变化的 TOML 数据目录。"""
+
+    snapshot_dir = snapshot_dir.resolve()
+    manifest_path = snapshot_dir / "manifest.json"
+    train_path = snapshot_dir / "train.jsonl"
+    if not manifest_path.is_file() or not train_path.is_file():
+        raise FileNotFoundError(f"续训数据快照不完整: {snapshot_dir}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"续训数据快照 manifest 不是合法 JSON: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"续训数据快照 manifest 必须是 JSON object: {manifest_path}")
+    validation_candidate = snapshot_dir / "validation.jsonl"
+    validation_path = validation_candidate if validation_candidate.is_file() else None
+    return PreparedTrainingJob(
+        job=replace(
+            job,
+            train_dataset=train_path,
+            validation_dataset=validation_path,
+        ),
+        manifest_path=manifest_path,
+        manifest=manifest,
+    )
+
+
 class TrainingAlgorithm(Protocol):
     """训练算法替换点；实现者只需构建和运行 job。"""
 

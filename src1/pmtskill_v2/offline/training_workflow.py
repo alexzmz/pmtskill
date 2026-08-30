@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import json
+import logging
 import math
 import shutil
 import traceback
@@ -22,6 +24,7 @@ from .trainer import (
     AdapterJob,
     MSSwiftLoraTrainer,
     find_latest_adapter_checkpoint,
+    load_prepared_training_job,
     prepare_training_job,
     staged_training_job,
     validate_staged_training_args,
@@ -138,6 +141,7 @@ class TrainingEvaluationOptions:
     evaluation_cuda_visible_devices: str | None = None
     evaluation_max_model_len: int | None = None
     evaluation_gpu_memory_utilization: float | None = None
+    resume: bool = True
 
 
 @dataclass(slots=True)
@@ -145,6 +149,8 @@ class TrainingEvaluationResult:
     """CLI 可直接序列化的训练评测结果。"""
 
     return_code: int
+    resumed: bool
+    resumed_from_checkpoint: Path | None
     output_dir: Path
     training_output_dir: Path
     final_checkpoint: Path | None
@@ -158,6 +164,12 @@ class TrainingEvaluationResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "return_code": self.return_code,
+            "resumed": self.resumed,
+            "resumed_from_checkpoint": (
+                str(self.resumed_from_checkpoint)
+                if self.resumed_from_checkpoint
+                else None
+            ),
             "output_dir": str(self.output_dir),
             "training_output_dir": str(self.training_output_dir),
             "final_checkpoint": (
@@ -247,7 +259,13 @@ class AndroidWorldTrainingStageEvaluator:
 class TrainingEvaluationRecorder:
     """增量维护 JSON/CSV/Markdown，异常退出时也保留已完成阶段。"""
 
-    def __init__(self, output_dir: Path, manifest: dict[str, Any]):
+    def __init__(
+        self,
+        output_dir: Path,
+        manifest: dict[str, Any],
+        *,
+        resume_state: dict[str, Any] | None = None,
+    ):
         self.output_dir = output_dir.resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.history_json = self.output_dir / "history.json"
@@ -256,18 +274,64 @@ class TrainingEvaluationRecorder:
         self.manifest_path = self.output_dir / "sample_manifest.json"
         self.command_path = self.output_dir / "training_stage_commands.json"
         self.checkpoints_path = self.output_dir / "checkpoints.json"
-        self.state: dict[str, Any] = {
-            "schema_version": 2,
-            "created_at": dt.datetime.now().astimezone().isoformat(),
-            "status": "running",
-            "manifest": manifest,
-            "stages": [],
-            "training_commands": [],
-            "checkpoints": [],
-            "error": None,
-        }
+        now = dt.datetime.now().astimezone().isoformat()
+        if resume_state is None:
+            self.state = {
+                "schema_version": 3,
+                "created_at": now,
+                "status": "running",
+                "manifest": manifest,
+                "stages": [],
+                "training_commands": [],
+                "checkpoints": [],
+                "resume_events": [],
+                "error": None,
+            }
+        else:
+            self.state = resume_state
+            self.state["schema_version"] = max(
+                3, int(self.state.get("schema_version", 1))
+            )
+            self.state["manifest"] = manifest
+            self.state.setdefault("stages", [])
+            self.state.setdefault("training_commands", [])
+            self.state.setdefault("checkpoints", [])
+            self.state.setdefault("resume_events", []).append(
+                {
+                    "resumed_at": now,
+                    "previous_status": self.state.get("status", "unknown"),
+                }
+            )
+            self.state["status"] = "running"
+            self.state["error"] = None
+            self.state.pop("finished_at", None)
         write_json_atomic(self.manifest_path, manifest)
         self.flush()
+
+    def evaluation_recorded(self, label: str) -> bool:
+        return any(row.get("label") == label for row in self.state["stages"])
+
+    def checkpoint_for_epoch(self, epoch: float) -> Path | None:
+        for row in reversed(self.state["checkpoints"]):
+            try:
+                same_epoch = math.isclose(float(row.get("epoch")), epoch)
+            except (TypeError, ValueError):
+                same_epoch = False
+            if not same_epoch:
+                continue
+            checkpoint = Path(str(row.get("checkpoint", ""))).expanduser()
+            if checkpoint.is_dir() and (checkpoint / "adapter_config.json").is_file():
+                return checkpoint.resolve()
+        return None
+
+    def checkpoint_recorded(self, epoch: float) -> bool:
+        for row in self.state["checkpoints"]:
+            try:
+                if math.isclose(float(row.get("epoch")), epoch):
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def record_command(
         self,
@@ -513,6 +577,74 @@ def _remove_transient_checkpoint(checkpoint: Path) -> None:
         shutil.rmtree(checkpoint)
 
 
+def _load_resume_state(output_dir: Path) -> dict[str, Any] | None:
+    history_path = output_dir / "history.json"
+    if not history_path.is_file():
+        return None
+    try:
+        state = json.loads(history_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"续训 history.json 不是合法 JSON: {history_path}") from exc
+    if not isinstance(state, dict):
+        raise ValueError(f"续训 history.json 必须是 JSON object: {history_path}")
+    return state
+
+
+def _validate_resume_manifest(
+    existing: dict[str, Any], current: dict[str, Any]
+) -> None:
+    """防止把不同数据/任务规划误接到同一个训练运行。"""
+
+    immutable_fields = (
+        "job",
+        "family",
+        "tasks",
+        "combinations",
+        "seed",
+        "every_epochs",
+        "checkpoint_every_epochs",
+        "include_candidate_skills",
+    )
+    mismatched = [
+        field
+        for field in immutable_fields
+        if existing.get(field) != current.get(field)
+    ]
+    if mismatched:
+        raise ValueError(
+            "续训配置与原运行不一致: "
+            + ", ".join(mismatched)
+            + "；请恢复原配置或使用 --no-resume 创建新运行"
+        )
+    try:
+        previous_total = float(existing.get("total_epochs", 0))
+        current_total = float(current.get("total_epochs", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("续训 manifest 的 total_epochs 无效") from exc
+    if current_total + 1e-9 < previous_total:
+        raise ValueError(
+            f"续训总 epoch 不能从 {previous_total:g} 降到 {current_total:g}"
+        )
+
+
+def _archive_interrupted_evaluation(output_dir: Path) -> Path | None:
+    """保留未写入 history 的残缺评测，然后给重试提供空目录。"""
+
+    if not output_dir.is_dir() or not any(output_dir.iterdir()):
+        return None
+    stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+    candidate = output_dir.with_name(f"{output_dir.name}.interrupted_{stamp}")
+    suffix = 1
+    while candidate.exists():
+        candidate = output_dir.with_name(
+            f"{output_dir.name}.interrupted_{stamp}_{suffix}"
+        )
+        suffix += 1
+    output_dir.rename(candidate)
+    logging.warning("保留中断评测目录并重新执行该阶段: %s", candidate)
+    return candidate
+
+
 class TrainingEvaluationWorkflow:
     """执行基线、分段训练、逐 checkpoint 与最终技能评测。"""
 
@@ -577,9 +709,20 @@ class TrainingEvaluationWorkflow:
             raise ValueError("训练评测任务列表不能为空")
         if options.combinations <= 0:
             raise ValueError("训练评测 combinations 必须是正整数")
-        if options.output_dir.exists() and any(options.output_dir.iterdir()):
+        output_has_files = options.output_dir.exists() and any(
+            options.output_dir.iterdir()
+        )
+        if output_has_files and not options.resume:
             raise FileExistsError(
                 "训练评测输出目录必须为空，避免混入旧 checkpoint/报告: "
+                f"{options.output_dir}"
+            )
+        resume_state = (
+            _load_resume_state(options.output_dir) if output_has_files else None
+        )
+        if output_has_files and resume_state is None:
+            raise FileExistsError(
+                "训练评测输出目录非空但缺少 history.json，无法安全判断已完成阶段: "
                 f"{options.output_dir}"
             )
         validate_staged_training_args(job)
@@ -589,14 +732,18 @@ class TrainingEvaluationWorkflow:
             options.checkpoint_every_epochs,
         )
         training_output = options.output_dir / "training"
-        prepared = prepare_training_job(
-            job,
-            configured_dataset_dir=self.config.offline.dataset_dir,
-            snapshot_dir=options.output_dir / "dataset_snapshot",
-        )
+        snapshot_dir = options.output_dir / "dataset_snapshot"
+        if resume_state is not None:
+            prepared = load_prepared_training_job(job, snapshot_dir=snapshot_dir)
+        else:
+            prepared = prepare_training_job(
+                job,
+                configured_dataset_dir=self.config.offline.dataset_dir,
+                snapshot_dir=snapshot_dir,
+            )
         job = prepared.job
         manifest = {
-            "schema_version": 2,
+            "schema_version": 3,
             "job": job.name,
             "family": options.family,
             "tasks": list(options.tasks),
@@ -630,96 +777,191 @@ class TrainingEvaluationWorkflow:
                 ),
             },
         }
-        recorder = TrainingEvaluationRecorder(options.output_dir, manifest)
+        if resume_state is not None:
+            existing_manifest = resume_state.get("manifest", {})
+            if not isinstance(existing_manifest, dict):
+                raise ValueError("续训 history.json 缺少合法 manifest")
+            _validate_resume_manifest(existing_manifest, manifest)
+            if float(manifest["total_epochs"]) > float(
+                existing_manifest.get("total_epochs", 0)
+            ) + 1e-9:
+                # 原来的“最终技能评测”现在只是一个中间 epoch 记录，腾出稳定标签给新终点。
+                for row in resume_state.get("stages", []):
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("label") == "final_skills":
+                        row["label"] = f"{row.get('stage', 'previous')}_skills"
+                    row["is_final_checkpoint"] = False
+            manifest["dataset_snapshot_manifest"] = existing_manifest.get(
+                "dataset_snapshot_manifest", manifest["dataset_snapshot_manifest"]
+            )
+            manifest["dataset"] = existing_manifest.get("dataset", manifest["dataset"])
+        recorder = TrainingEvaluationRecorder(
+            options.output_dir,
+            manifest,
+            resume_state=resume_state,
+        )
         checkpoint: Path | None = None
+        discovered_checkpoint: Path | None = None
+        try:
+            discovered_checkpoint = find_latest_adapter_checkpoint(training_output)
+        except FileNotFoundError:
+            pass
+        resumed_from_checkpoint = discovered_checkpoint if resume_state else None
+        if resume_state is not None:
+            logging.info(
+                "继续训练运行: output_dir=%s latest_checkpoint=%s completed_evaluations=%d",
+                options.output_dir,
+                resumed_from_checkpoint,
+                len(recorder.state["stages"]),
+            )
         transient_checkpoints: list[tuple[Path, dict[str, Any]]] = []
+        for row in recorder.state["checkpoints"]:
+            if row.get("retained", True) or not row.get("exists", True):
+                continue
+            candidate = Path(str(row.get("checkpoint", ""))).expanduser()
+            if candidate.is_dir():
+                transient_checkpoints.append((candidate.resolve(), row))
         return_code = 0
         try:
-            # 基座只部署一次，连续跑裸模型与“同模型+技能库”，避免重复加载权重。
-            with self.deployment.activate(None) as profile:
-                self._evaluate(
-                    recorder=recorder,
-                    profile=profile,
-                    options=options,
-                    label="baseline_standalone",
-                    use_skills=False,
-                    epoch=0.0,
-                    checkpoint=None,
-                )
-                self._evaluate(
-                    recorder=recorder,
-                    profile=profile,
-                    options=options,
-                    label="baseline_skills",
-                    use_skills=True,
-                    epoch=0.0,
-                    checkpoint=None,
-                )
-
-            for stage in plan:
-                target_epoch = stage.target_epoch
-                stage_output = training_output / epoch_label(target_epoch)
-                stage_job = staged_training_job(
-                    job,
-                    output_dir=stage_output,
-                    target_epoch=target_epoch,
-                    resume_from_checkpoint=checkpoint,
-                )
-                recorder.record_command(
-                    target_epoch=target_epoch,
-                    stage_output_dir=stage_output,
-                    evaluate=stage.evaluate,
-                    retain_checkpoint=stage.retain_checkpoint,
-                    resume=checkpoint,
-                    command=self.trainer.build_command(stage_job),
-                )
-                return_code = self.trainer.run(stage_job)
-                if return_code != 0:
-                    recorder.finish(
-                        "failed",
-                        error=(
-                            f"ms-swift 训练到 epoch {target_epoch:g} 失败，"
-                            f"return_code={return_code}"
-                        ),
-                    )
-                    break
-                checkpoint = find_latest_adapter_checkpoint(stage_output)
-                checkpoint_row = recorder.record_checkpoint(
-                    epoch=target_epoch,
-                    checkpoint=checkpoint,
-                    stage_output_dir=stage_output,
-                    retained=stage.retain_checkpoint,
-                )
-                if not stage.retain_checkpoint:
-                    transient_checkpoints.append((checkpoint, checkpoint_row))
-                if stage.evaluate:
-                    with self.deployment.activate(checkpoint) as profile:
+            missing_baselines = [
+                ("baseline_standalone", False, "standalone"),
+                ("baseline_skills", True, "skills"),
+            ]
+            missing_baselines = [
+                item
+                for item in missing_baselines
+                if not recorder.evaluation_recorded(item[0])
+            ]
+            if missing_baselines:
+                # 同一次部署补齐尚未完成的基线；已写入 history 的阶段不重复跑。
+                with self.deployment.activate(None) as profile:
+                    for label, use_skills, mode in missing_baselines:
+                        _archive_interrupted_evaluation(
+                            options.output_dir / "evaluations" / "baseline" / mode
+                        )
                         self._evaluate(
                             recorder=recorder,
                             profile=profile,
                             options=options,
-                            label=f"{epoch_label(target_epoch)}_standalone",
-                            use_skills=False,
-                            epoch=target_epoch,
-                            checkpoint=checkpoint,
-                            final_checkpoint=stage.final,
+                            label=label,
+                            use_skills=use_skills,
+                            epoch=0.0,
+                            checkpoint=None,
                         )
-                        # 中间 epoch 只测裸模型；最终 checkpoint 再补一次技能库总评。
-                        if stage.final:
-                            self._evaluate(
-                                recorder=recorder,
-                                profile=profile,
-                                options=options,
-                                label="final_skills",
-                                use_skills=True,
-                                epoch=target_epoch,
-                                checkpoint=checkpoint,
-                                final_checkpoint=True,
+
+            for stage in plan:
+                target_epoch = stage.target_epoch
+                stage_output = training_output / epoch_label(target_epoch)
+                recorded_checkpoint = recorder.checkpoint_for_epoch(target_epoch)
+                if recorder.checkpoint_recorded(target_epoch):
+                    # checkpoint 可能已按保留策略删除；后续阶段会使用仍存在的最新项。
+                    if recorded_checkpoint is not None:
+                        checkpoint = recorded_checkpoint
+                    logging.info("跳过已完成训练阶段: %s", epoch_label(target_epoch))
+                else:
+                    resume_checkpoint = checkpoint
+                    if discovered_checkpoint is not None:
+                        try:
+                            belongs_to_current_stage = (
+                                discovered_checkpoint.is_relative_to(stage_output)
                             )
+                        except AttributeError:  # pragma: no cover - Python < 3.9
+                            belongs_to_current_stage = stage_output.resolve() in (
+                                discovered_checkpoint.resolve().parents
+                            )
+                        if belongs_to_current_stage:
+                            resume_checkpoint = discovered_checkpoint
+                    stage_job = staged_training_job(
+                        job,
+                        output_dir=stage_output,
+                        target_epoch=target_epoch,
+                        resume_from_checkpoint=resume_checkpoint,
+                    )
+                    recorder.record_command(
+                        target_epoch=target_epoch,
+                        stage_output_dir=stage_output,
+                        evaluate=stage.evaluate,
+                        retain_checkpoint=stage.retain_checkpoint,
+                        resume=resume_checkpoint,
+                        command=self.trainer.build_command(stage_job),
+                    )
+                    return_code = self.trainer.run(stage_job)
+                    if return_code != 0:
+                        recorder.finish(
+                            "failed",
+                            error=(
+                                f"ms-swift 训练到 epoch {target_epoch:g} 失败，"
+                                f"return_code={return_code}"
+                            ),
+                        )
+                        break
+                    checkpoint = find_latest_adapter_checkpoint(stage_output)
+                    discovered_checkpoint = checkpoint
+                    checkpoint_row = recorder.record_checkpoint(
+                        epoch=target_epoch,
+                        checkpoint=checkpoint,
+                        stage_output_dir=stage_output,
+                        retained=stage.retain_checkpoint,
+                    )
+                    if not stage.retain_checkpoint:
+                        transient_checkpoints.append((checkpoint, checkpoint_row))
+                if stage.evaluate:
+                    standalone_label = f"{epoch_label(target_epoch)}_standalone"
+                    needs_standalone = not recorder.evaluation_recorded(
+                        standalone_label
+                    )
+                    needs_final_skills = (
+                        stage.final
+                        and not recorder.evaluation_recorded("final_skills")
+                    )
+                    if needs_standalone or needs_final_skills:
+                        if checkpoint is None:
+                            raise FileNotFoundError(
+                                f"epoch {target_epoch:g} 已记录但没有可用 checkpoint"
+                            )
+                        with self.deployment.activate(checkpoint) as profile:
+                            if needs_standalone:
+                                _archive_interrupted_evaluation(
+                                    options.output_dir
+                                    / "evaluations"
+                                    / epoch_label(target_epoch)
+                                    / "standalone"
+                                )
+                                self._evaluate(
+                                    recorder=recorder,
+                                    profile=profile,
+                                    options=options,
+                                    label=standalone_label,
+                                    use_skills=False,
+                                    epoch=target_epoch,
+                                    checkpoint=checkpoint,
+                                    final_checkpoint=stage.final,
+                                )
+                            if needs_final_skills:
+                                _archive_interrupted_evaluation(
+                                    options.output_dir
+                                    / "evaluations"
+                                    / epoch_label(target_epoch)
+                                    / "skills"
+                                )
+                                # 最终 checkpoint 再补一次技能库总评。
+                                self._evaluate(
+                                    recorder=recorder,
+                                    profile=profile,
+                                    options=options,
+                                    label="final_skills",
+                                    use_skills=True,
+                                    epoch=target_epoch,
+                                    checkpoint=checkpoint,
+                                    final_checkpoint=True,
+                                )
             if return_code == 0:
                 for transient, checkpoint_row in transient_checkpoints:
-                    _remove_transient_checkpoint(transient)
-                    recorder.mark_checkpoint_removed(checkpoint_row)
+                    if transient.is_dir():
+                        _remove_transient_checkpoint(transient)
+                    if checkpoint_row.get("exists", True):
+                        recorder.mark_checkpoint_removed(checkpoint_row)
                 recorder.finish("completed")
         except Exception as exc:
             recorder.finish(
@@ -730,6 +972,8 @@ class TrainingEvaluationWorkflow:
 
         return TrainingEvaluationResult(
             return_code=return_code,
+            resumed=resume_state is not None,
+            resumed_from_checkpoint=resumed_from_checkpoint,
             output_dir=options.output_dir,
             training_output_dir=training_output,
             final_checkpoint=checkpoint,

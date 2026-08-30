@@ -268,7 +268,16 @@ python -m src1 --config src1/config.local.toml train --without-evaluation
 `[training_evaluation].task_count`，推荐 20～50。先用 `--dry-run --with-evaluation`
 可以查看全部分段训练命令、部署命令和评测顺序而不启动 GPU/emulator。
 
-每次带评测训练使用独立目录，不覆盖旧 checkpoint：
+首次带评测训练使用独立目录；再次对同名 adapter 执行命令会自动复用最近一次运行目录
+和原 `dataset_snapshot`，从其中最新的完整 checkpoint 恢复。`history.json` 已记录的
+基线、epoch 训练和评测不会重复执行；若原计划已经完成且总 epoch 没有增加，这次调用
+会直接返回已有结果；提高 TOML 中的 `offline.epochs` 后则继续训练新增 epoch。若上次
+在某轮评测中被直接 `Killed`，残缺评测目录会改名为
+`*.interrupted_<time>` 后重跑该轮，已完成结果仍保留。显式传入同一个
+`--eval-output-dir` 也会触发相同行为。使用 `--no-resume` 可关闭自动续训；此时显式
+输出目录非空会直接报错，未指定目录则创建新的时间戳运行。
+
+目录结构如下：
 
 ```text
 runtime/checkpoints/<adapter>/training_runs/<time>/

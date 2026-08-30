@@ -21,6 +21,8 @@ from .offline.trainer import (
     MSSwiftLoraTrainer,
     default_training_job,
     filter_dataset_by_primitives,
+    find_latest_adapter_checkpoint,
+    load_prepared_training_job,
     prepare_training_job,
     staged_training_job,
 )
@@ -196,6 +198,14 @@ def command_train(args: argparse.Namespace) -> int:
         if args.with_evaluation is not None
         else config.training_evaluation.enabled
     )
+    resume_checkpoint = None
+    if args.resume and not with_evaluation:
+        try:
+            resume_checkpoint = find_latest_adapter_checkpoint(job.output_dir)
+        except FileNotFoundError:
+            pass
+        if resume_checkpoint is not None:
+            job.resume_from_checkpoint = resume_checkpoint
     command = trainer.build_command(job)
     if args.dry_run:
         if not with_evaluation:
@@ -238,13 +248,20 @@ def command_train(args: argparse.Namespace) -> int:
                     "command": trainer.build_command(stage_job),
                 }
             )
-        selected_tasks = _tasks(args.eval_tasks) or list(settings.tasks)
+        resumed_tasks = _resume_evaluation_tasks(run_dir) if args.resume else None
+        selected_tasks = (
+            _tasks(args.eval_tasks)
+            or resumed_tasks
+            or list(settings.tasks)
+        )
         _print(
             {
                 "dry_run": True,
                 "job": job.name,
                 "with_android_evaluation": True,
                 "evaluation_output_dir": run_dir,
+                "resume": args.resume,
+                "resuming_existing_run": (run_dir / "history.json").is_file(),
                 "dataset_source": job.train_dataset,
                 "dataset_snapshot_at_runtime": run_dir / "dataset_snapshot",
                 "resource_assignment": {
@@ -293,15 +310,28 @@ def command_train(args: argparse.Namespace) -> int:
         )
 
         settings = _training_evaluation_settings(config, args)
-        requested_tasks = _tasks(args.eval_tasks) or list(settings.tasks) or None
-        selected_tasks = sample_android_world_tasks(
-            config,
-            tasks=requested_tasks,
-            task_count=settings.task_count,
-            seed=settings.seed,
-            family=settings.family,
-        )
         run_dir = _training_evaluation_output_dir(job, args)
+        resumed_tasks = _resume_evaluation_tasks(run_dir) if args.resume else None
+        explicit_tasks = _tasks(args.eval_tasks)
+        if explicit_tasks is not None:
+            selected_tasks = sample_android_world_tasks(
+                config,
+                tasks=explicit_tasks,
+                task_count=settings.task_count,
+                seed=settings.seed,
+                family=settings.family,
+            )
+        elif resumed_tasks is not None:
+            selected_tasks = resumed_tasks
+        else:
+            requested_tasks = list(settings.tasks) or None
+            selected_tasks = sample_android_world_tasks(
+                config,
+                tasks=requested_tasks,
+                task_count=settings.task_count,
+                seed=settings.seed,
+                family=settings.family,
+            )
         profile = resolve_student_profile(config, settings.model_id)
         deployment = MSSwiftEvaluationDeployment(config, settings, profile)
         result = TrainingEvaluationWorkflow(
@@ -330,15 +360,26 @@ def command_train(args: argparse.Namespace) -> int:
                 evaluation_gpu_memory_utilization=(
                     settings.gpu_memory_utilization
                 ),
+                resume=args.resume,
             ),
         )
         _print({"job": job.name, "with_android_evaluation": True, **result.to_dict()})
         return result.return_code
-    prepared = prepare_training_job(
-        job,
-        configured_dataset_dir=config.offline.dataset_dir,
-        snapshot_dir=job.output_dir / "dataset_snapshot",
-    )
+    snapshot_dir = job.output_dir / "dataset_snapshot"
+    if resume_checkpoint is not None:
+        for parent in resume_checkpoint.parents:
+            candidate = parent / "dataset_snapshot"
+            if (candidate / "manifest.json").is_file():
+                snapshot_dir = candidate
+                break
+    if resume_checkpoint is not None and (snapshot_dir / "manifest.json").is_file():
+        prepared = load_prepared_training_job(job, snapshot_dir=snapshot_dir)
+    else:
+        prepared = prepare_training_job(
+            job,
+            configured_dataset_dir=config.offline.dataset_dir,
+            snapshot_dir=snapshot_dir,
+        )
     code = trainer.run(prepared.job)
     _print(
         {
@@ -346,6 +387,7 @@ def command_train(args: argparse.Namespace) -> int:
             "return_code": code,
             "output_dir": job.output_dir,
             "dataset_manifest": prepared.manifest_path,
+            "resumed_from_checkpoint": resume_checkpoint,
         }
     )
     return code
@@ -434,14 +476,52 @@ def _training_evaluation_settings(
 def _training_evaluation_output_dir(
     job: AdapterJob, args: argparse.Namespace
 ) -> Path:
-    """每次带评测训练使用独立目录，避免覆盖已有 checkpoint 与报告。"""
+    """解析训练运行目录；默认优先续接同 adapter 最近一次运行。"""
 
     if args.eval_output_dir:
         return Path(args.eval_output_dir).expanduser().resolve()
+    if args.resume:
+        runs_root = job.output_dir / "training_runs"
+        candidates: list[tuple[float, Path]] = []
+        if runs_root.is_dir():
+            for child in runs_root.iterdir():
+                history_path = child / "history.json"
+                if not child.is_dir() or not history_path.is_file():
+                    continue
+                try:
+                    state = json.loads(history_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                manifest = state.get("manifest", {})
+                if (
+                    not isinstance(manifest, dict)
+                    or manifest.get("job") != job.name
+                ):
+                    continue
+                candidates.append((history_path.stat().st_mtime, child))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1].resolve()
     stamp = time.strftime("%Y%m%dT%H%M%S")
     return (
         job.output_dir / "training_runs" / f"{stamp}_{uuid.uuid4().hex[:8]}"
     ).resolve()
+
+
+def _resume_evaluation_tasks(run_dir: Path) -> list[str] | None:
+    """续训沿用原运行固定的评测任务，避免前后 epoch 样本集合漂移。"""
+
+    history_path = run_dir / "history.json"
+    if not history_path.is_file():
+        return None
+    try:
+        state = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    manifest = state.get("manifest", {})
+    tasks = manifest.get("tasks") if isinstance(manifest, dict) else None
+    if not isinstance(tasks, list) or not all(isinstance(item, str) for item in tasks):
+        return None
+    return tasks
 
 
 def command_maintain(args: argparse.Namespace) -> int:
@@ -646,6 +726,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="传给 ms-swift 的单个额外参数；可重复，例如 --extra-arg=--bf16",
     )
     train.add_argument("--dry-run", action="store_true", help="只显示命令，不启动训练")
+    train.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "自动续接同名 adapter 最近一次训练（默认启用）；"
+            "使用 --no-resume 强制创建新运行或拒绝非空的显式输出目录"
+        ),
+    )
     evaluation_switch = train.add_mutually_exclusive_group()
     evaluation_switch.add_argument(
         "--with-evaluation",

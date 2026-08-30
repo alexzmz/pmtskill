@@ -10,7 +10,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from src1.pmtskill_v2.cli import build_parser
+from src1.pmtskill_v2.cli import _training_evaluation_output_dir, build_parser
 from src1.pmtskill_v2.core.config import (
     AndroidWorldConfig,
     MaintenanceConfig,
@@ -94,6 +94,14 @@ class _FakeTrainer:
         return 0
 
 
+class _FailSecondStageTrainer(_FakeTrainer):
+    def run(self, job: AdapterJob) -> int:
+        if len(self.jobs) == 1:
+            self.jobs.append(job)
+            return 7
+        return super().run(job)
+
+
 class _FakeDeployment:
     def __init__(self, profile: ModelProfile):
         self.profile = profile
@@ -138,6 +146,14 @@ class _FakeEvaluator:
         return EvaluationArtifacts(
             output_dir, summary_path, report_path, traces_path, summary
         )
+
+
+class _InterruptedEvaluator(_FakeEvaluator):
+    def run(self, **kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "partial.marker").write_text("partial", encoding="utf-8")
+        raise RuntimeError("synthetic interrupted evaluation")
 
 
 class TrainingEvaluationTest(unittest.TestCase):
@@ -399,6 +415,225 @@ class TrainingEvaluationTest(unittest.TestCase):
                 ["epoch_001", "epoch_002"],
             )
 
+    def test_workflow_resumes_latest_checkpoint_without_repeating_completed_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            job = AdapterJob("all", root / "train.jsonl", None, root / "unused")
+            job.train_dataset.write_text(
+                json.dumps({"messages": []}) + "\n", encoding="utf-8"
+            )
+            output_dir = root / "run"
+            first_trainer = _FailSecondStageTrainer()
+            first_evaluator = _FakeEvaluator()
+            first = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                first_trainer,
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=first_evaluator,
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=output_dir,
+                    tasks=("TaskA",),
+                    every_epochs=1,
+                ),
+            )
+            self.assertEqual(first.return_code, 7)
+            self.assertEqual(len(first_trainer.jobs), 2)
+            self.assertEqual(
+                [row["label"] for row in first.stages],
+                [
+                    "baseline_standalone",
+                    "baseline_skills",
+                    "epoch_001_standalone",
+                ],
+            )
+
+            resumed_trainer = _FakeTrainer()
+            resumed_evaluator = _FakeEvaluator()
+            resumed = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                resumed_trainer,
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=resumed_evaluator,
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=output_dir,
+                    tasks=("TaskA",),
+                    every_epochs=1,
+                ),
+            )
+
+            self.assertEqual(resumed.return_code, 0)
+            self.assertTrue(resumed.resumed)
+            self.assertEqual(
+                resumed.resumed_from_checkpoint.name,
+                "checkpoint-10",
+            )
+            self.assertEqual(len(resumed_trainer.jobs), 1)
+            self.assertEqual(resumed_trainer.jobs[0].output_dir.name, "epoch_002")
+            self.assertEqual(
+                resumed_trainer.jobs[0].resume_from_checkpoint.name,
+                "checkpoint-10",
+            )
+            self.assertEqual(len(resumed_evaluator.calls), 2)
+            self.assertEqual(
+                [row["label"] for row in resumed.stages],
+                [
+                    "baseline_standalone",
+                    "baseline_skills",
+                    "epoch_001_standalone",
+                    "epoch_002_standalone",
+                    "final_skills",
+                ],
+            )
+            history = json.loads(resumed.history_json.read_text(encoding="utf-8"))
+            self.assertEqual(history["status"], "completed")
+            self.assertEqual(len(history["resume_events"]), 1)
+            self.assertEqual(history["resume_events"][0]["previous_status"], "failed")
+
+    def test_default_output_dir_reuses_latest_run_for_same_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = AdapterJob("all", root / "train.jsonl", None, root / "adapter")
+            runs = job.output_dir / "training_runs"
+            completed = runs / "older"
+            incomplete = runs / "newer"
+            completed.mkdir(parents=True)
+            incomplete.mkdir(parents=True)
+            (completed / "history.json").write_text(
+                json.dumps({"status": "completed", "manifest": {"job": "all"}}),
+                encoding="utf-8",
+            )
+            (incomplete / "history.json").write_text(
+                json.dumps({"status": "running", "manifest": {"job": "all"}}),
+                encoding="utf-8",
+            )
+            args = build_parser().parse_args(["train"])
+
+            resolved = _training_evaluation_output_dir(job, args)
+
+            self.assertEqual(resolved, incomplete.resolve())
+
+            for child in incomplete.iterdir():
+                child.unlink()
+            incomplete.rmdir()
+            self.assertEqual(
+                _training_evaluation_output_dir(job, args), completed.resolve()
+            )
+
+    def test_resume_archives_partial_evaluation_before_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            job = AdapterJob("all", root / "train.jsonl", None, root / "unused")
+            job.train_dataset.write_text(
+                json.dumps({"messages": []}) + "\n", encoding="utf-8"
+            )
+            output_dir = root / "run"
+            workflow = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                _FakeTrainer(),
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=_InterruptedEvaluator(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "interrupted evaluation"):
+                workflow.run(
+                    job,
+                    TrainingEvaluationOptions(
+                        output_dir=output_dir,
+                        tasks=("TaskA",),
+                    ),
+                )
+
+            resumed = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                _FakeTrainer(),
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=_FakeEvaluator(),
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=output_dir,
+                    tasks=("TaskA",),
+                ),
+            )
+
+            self.assertEqual(resumed.return_code, 0)
+            archived = list(
+                (output_dir / "evaluations" / "baseline").glob(
+                    "standalone.interrupted_*"
+                )
+            )
+            self.assertEqual(len(archived), 1)
+            self.assertTrue((archived[0] / "partial.marker").is_file())
+
+    def test_completed_run_can_extend_total_epochs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            job = AdapterJob("all", root / "train.jsonl", None, root / "unused")
+            job.train_dataset.write_text(
+                json.dumps({"messages": []}) + "\n", encoding="utf-8"
+            )
+            output_dir = root / "run"
+            TrainingEvaluationWorkflow(
+                config,
+                object(),
+                _FakeTrainer(),
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=_FakeEvaluator(),
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=output_dir,
+                    tasks=("TaskA",),
+                ),
+            )
+            extended_config = replace(
+                config,
+                offline=replace(config.offline, epochs=3.0),
+            )
+            trainer = _FakeTrainer()
+            resumed = TrainingEvaluationWorkflow(
+                extended_config,
+                object(),
+                trainer,
+                deployment=_FakeDeployment(extended_config.models[0]),
+                evaluator=_FakeEvaluator(),
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=output_dir,
+                    tasks=("TaskA",),
+                ),
+            )
+
+            self.assertEqual(len(trainer.jobs), 1)
+            self.assertEqual(trainer.jobs[0].num_train_epochs, 3.0)
+            self.assertEqual(
+                trainer.jobs[0].resume_from_checkpoint.name,
+                "checkpoint-20",
+            )
+            self.assertEqual(
+                [row["label"] for row in resumed.stages],
+                [
+                    "baseline_standalone",
+                    "baseline_skills",
+                    "epoch_001_standalone",
+                    "epoch_002_standalone",
+                    "epoch_002_skills",
+                    "epoch_003_standalone",
+                    "final_skills",
+                ],
+            )
+
     def test_checkpoint_interval_zero_keeps_only_final_after_success(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -464,6 +699,8 @@ class TrainingEvaluationTest(unittest.TestCase):
         self.assertEqual(enabled.eval_cuda_visible_devices, "1")
         self.assertEqual(enabled.eval_max_model_len, 32768)
         self.assertEqual(enabled.checkpoint_every_epochs, 2)
+        self.assertTrue(enabled.resume)
+        self.assertFalse(build_parser().parse_args(["train", "--no-resume"]).resume)
         self.assertFalse(disabled.with_evaluation)
 
 

@@ -80,6 +80,8 @@ cp src1/config.example.toml src1/config.local.toml
 - `[models.capabilities]` 保存该模型在每个原语上的成功率画像；
 - `android_world.max_steps = 50` 表示每个 episode 最多执行 50 步；collector
   会在 AndroidWorld 的 episode runner 外层再次强制这一硬上限，任务完成时仍会提前停止；
+- `android_world.infrastructure_recovery_attempts = 1` 会在 a11y/ADB 失效时恢复
+  飞行模式、网络和 accessibility forwarder，必要时只重启 emulator guest，并重试当前任务；
 - API key 只通过 `api_key_env` 指定的环境变量读取，不写入 TOML。
 
 ### 3.1 每次 CLI 调用的日志
@@ -298,6 +300,12 @@ AndroidWorld 把任务初始化异常保存成 `episode_data = NaN` 等标量时
 记录为异常 episode 和空事件 trace，不会让整轮训练退出。临时 `swift deploy` 默认关闭
 请求级 verbose，避免把完整 prompt/base64 截图写入日志；持久化的 runtime/error/result
 文件还会按敏感字段名和常见密钥格式统一脱敏。
+
+评测会在每个 task 开始前检查 accessibility tree。若模型误触飞行模式、a11y forwarder
+失联或 ADB/emulator 短暂异常，框架先恢复网络和转发，软恢复失败后执行 `adb reboot`
+重启 Android guest，等待 `sys.boot_completed=1`，重新连接后重试当前 task。默认只尝试
+1 次；若仍不可用会立即结束本轮并保留已有 checkpoint，而不会把之后数百个跳过任务
+写成 `episodes=0, SR=0`。可用 `infrastructure_recovery_attempts = 0` 关闭此行为。
 
 `--checkpoint-every-epochs N` 控制永久保留间隔，默认 `1`（逐 epoch 保留）；设为
 `2` 时保留第 2、4、… epoch 和最终结果，设为 `0` 时仅保留最终 checkpoint。为完成

@@ -87,6 +87,11 @@ emulator_setup = false
 max_steps = 50
 stop_on_task_success = true
 wait_after_action_seconds = 1.0
+# a11y/ADB 失效后先恢复网络和转发；仍失败则重启 emulator guest 并重试当前 task。
+# 0 表示关闭自动恢复。恢复耗尽时立即停止评测，避免后续任务全部空跑。
+infrastructure_recovery_attempts = 1
+recovery_timeout_seconds = 180.0
+recovery_poll_seconds = 2.0
 
 [[models]]
 model_id = "teacher-deepseek-v4-flash"

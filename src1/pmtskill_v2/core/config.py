@@ -119,6 +119,11 @@ class AndroidWorldConfig:
     max_steps: int = 50
     stop_on_task_success: bool = True
     wait_after_action_seconds: float = 1.0
+    # a11y/ADB 等基础设施故障后的恢复与当前 task 重试次数；0 表示关闭。
+    infrastructure_recovery_attempts: int = 1
+    # 硬恢复只重启 Android emulator guest，不会重启宿主机。
+    recovery_timeout_seconds: float = 180.0
+    recovery_poll_seconds: float = 2.0
 
 
 @dataclasses.dataclass(slots=True)
@@ -289,6 +294,16 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
     routing = RoutingConfig(**_section(raw, "routing"))
     maintenance = MaintenanceConfig(**_section(raw, "maintenance"))
     android_world = AndroidWorldConfig(**_section(raw, "android_world"))
+    if android_world.max_steps <= 0:
+        raise ValueError("android_world.max_steps 必须是正整数")
+    if android_world.infrastructure_recovery_attempts < 0:
+        raise ValueError(
+            "android_world.infrastructure_recovery_attempts 必须是非负整数"
+        )
+    if android_world.recovery_timeout_seconds <= 0:
+        raise ValueError("android_world.recovery_timeout_seconds 必须为正数")
+    if android_world.recovery_poll_seconds <= 0:
+        raise ValueError("android_world.recovery_poll_seconds 必须为正数")
 
     model_items = raw.get("models", [])
     if not isinstance(model_items, list):

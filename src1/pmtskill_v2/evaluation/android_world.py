@@ -34,6 +34,10 @@ from .reporter import (
     successful_episode_value,
     write_evaluation_report,
 )
+from .recovery import (
+    ensure_valid_evaluation_episodes,
+    recover_infrastructure_failures,
+)
 
 
 def _extract_route_metadata(raw: Any) -> dict[str, Any]:
@@ -189,16 +193,23 @@ class AndroidWorldStandaloneEvaluator:
                     self.config.android_world.wait_after_action_seconds
                 ),
             )
-            episodes = suite_utils.run(
-                suite,
-                agent,
-                checkpointer=checkpointer_lib.IncrementalCheckpointer(
-                    str(checkpoint_dir)
-                ),
-                demo_mode=False,
-                return_full_episode_data=True,
-                max_n_steps_override=self.config.android_world.max_steps,
-                stop_on_task_success=self.config.android_world.stop_on_task_success,
+            with recover_infrastructure_failures(
+                suite_utils, environment, self.config.android_world
+            ):
+                episodes = suite_utils.run(
+                    suite,
+                    agent,
+                    checkpointer=checkpointer_lib.IncrementalCheckpointer(
+                        str(checkpoint_dir)
+                    ),
+                    demo_mode=False,
+                    return_full_episode_data=True,
+                    max_n_steps_override=self.config.android_world.max_steps,
+                    stop_on_task_success=self.config.android_world.stop_on_task_success,
+                )
+            ensure_valid_evaluation_episodes(
+                episodes,
+                expected_episodes=sum(len(instances) for instances in suite.values()),
             )
         finally:
             environment.close()
@@ -329,14 +340,21 @@ class AndroidWorldOnlineEvaluator:
             )
             suite.suite_family = family
             agent = DynamicRoutingM3A(environment)
-            episodes = suite_utils.run(
-                suite,
-                agent,
-                checkpointer=checkpointer_lib.IncrementalCheckpointer(str(checkpoint_dir)),
-                demo_mode=False,
-                return_full_episode_data=True,
-                max_n_steps_override=self.config.android_world.max_steps,
-                stop_on_task_success=self.config.android_world.stop_on_task_success,
+            with recover_infrastructure_failures(
+                suite_utils, environment, self.config.android_world
+            ):
+                episodes = suite_utils.run(
+                    suite,
+                    agent,
+                    checkpointer=checkpointer_lib.IncrementalCheckpointer(str(checkpoint_dir)),
+                    demo_mode=False,
+                    return_full_episode_data=True,
+                    max_n_steps_override=self.config.android_world.max_steps,
+                    stop_on_task_success=self.config.android_world.stop_on_task_success,
+                )
+            ensure_valid_evaluation_episodes(
+                episodes,
+                expected_episodes=sum(len(instances) for instances in suite.values()),
             )
         finally:
             environment.close()

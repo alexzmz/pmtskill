@@ -307,6 +307,11 @@ AndroidWorld 把任务初始化异常保存成 `episode_data = NaN` 等标量时
 1 次；若仍不可用会立即结束本轮并保留已有 checkpoint，而不会把之后数百个跳过任务
 写成 `episodes=0, SR=0`。可用 `infrastructure_recovery_attempts = 0` 关闭此行为。
 
+训练评测的 M3A 每一步原本会同时保存原图、标框前后截图、UI tree 和完整 prompt；长
+suite 会让这些对象一直留在 Python 内存中，最终可能被 Linux OOM killer 直接
+`Killed`，且来不及写 traceback。评测模式现在只保留动作、reason、summary 和路由
+元数据，逐步释放截图/UI tree；`collect` 仍保留完整截图轨迹，因此不会影响数据集构建。
+
 `--checkpoint-every-epochs N` 控制永久保留间隔，默认 `1`（逐 epoch 保留）；设为
 `2` 时保留第 2、4、… epoch 和最终结果，设为 `0` 时仅保留最终 checkpoint。为完成
 中间评测/续训而创建的临时 checkpoint 会在整个流程成功后删除；若流程失败则保留，

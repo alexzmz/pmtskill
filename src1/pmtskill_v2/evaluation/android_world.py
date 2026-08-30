@@ -25,6 +25,7 @@ from ..online.planner import (
 from ..online.router import DynamicProgrammingRouter
 from ..skills.importer import relevant_raw_skills
 from ..skills.store import SkillStore
+from .compaction import compact_m3a_step_result
 from .reporter import (
     EvaluationArtifacts,
     episode_data_is_usable,
@@ -170,6 +171,13 @@ class AndroidWorldStandaloneEvaluator:
         )
         checkpoint_dir = target / "checkpoints"
         model = OpenAICompatibleVLClient(profile)
+
+        class MemoryBoundedM3A(m3a.M3A):
+            """评测不跨 step 保留截图，避免长 suite 被宿主 OOM killer 杀死。"""
+
+            def step(self, goal: str):
+                return compact_m3a_step_result(super().step(goal))
+
         environment = env_launcher.load_and_setup_env(
             console_port=self.config.android_world.console_port,
             emulator_setup=self.config.android_world.emulator_setup,
@@ -185,7 +193,7 @@ class AndroidWorldStandaloneEvaluator:
                 env=environment,
             )
             suite.suite_family = family
-            agent = m3a.M3A(
+            agent = MemoryBoundedM3A(
                 environment,
                 model,
                 name=f"standalone:{profile.model_id}",
@@ -233,6 +241,7 @@ class AndroidWorldStandaloneEvaluator:
                 "seed": seed,
                 "max_steps": self.config.android_world.max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
+                "episode_storage": "compact_without_screenshots",
             },
         )
 
@@ -316,7 +325,7 @@ class AndroidWorldOnlineEvaluator:
                     )
                     routed_wrapper.set_plan(self.latest_plan)
                     self.current_goal = goal
-                return super().step(goal)
+                return compact_m3a_step_result(super().step(goal))
 
         self_outer = self
         run_stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -379,5 +388,6 @@ class AndroidWorldOnlineEvaluator:
                 "record_traces": record_traces,
                 "max_steps": self.config.android_world.max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
+                "episode_storage": "compact_without_screenshots",
             },
         )

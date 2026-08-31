@@ -27,10 +27,12 @@ class PathConfig:
     ms_swift_root: Path
     state_dir: Path
     log_dir: Path
+    # 可独立指向一份固定技能库；None 时保持旧行为，使用 state_dir 下的数据库。
+    skill_library_db: Path | None = None
 
     @property
     def database(self) -> Path:
-        return self.state_dir / "skill_library.sqlite3"
+        return self.skill_library_db or (self.state_dir / "skill_library.sqlite3")
 
 
 @dataclasses.dataclass(slots=True)
@@ -199,6 +201,10 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         ),
         state_dir=state_dir,
         log_dir=_resolve_path(base, path_raw.get("log_dir", state_dir / "logs")),
+        skill_library_db=_resolve_path(
+            base,
+            path_raw.get("skill_library_db", state_dir / "skill_library.sqlite3"),
+        ),
     )
 
     offline_raw = _section(raw, "offline")

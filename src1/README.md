@@ -433,28 +433,107 @@ python -m src1 --config src1/config.local.toml plan \
 真实技能统计会逐渐覆盖配置先验。polished skill 失败后，执行器会禁用当前技能，
 展开其 fallback 原语 topology 并重新路由。
 
-## 6. AndroidWorld 在线评测
+## 6. 三种 AndroidWorld 评测接口
+
+三种接口都接收 adapter 的**顶层训练目录**，并按同一规则解析真实权重：
+
+```text
+<adapter>/training_runs/<最新时间戳>/training/<最后 epoch>/best
+```
+
+框架要求 `best` 指向的 checkpoint 包含 `adapter_config.json`、`optimizer.pt` 和
+`scheduler.pt`。后两项用于确认这是完整训练 checkpoint；推理时 ms-swift 实际加载的是
+同目录中的 LoRA 权重，optimizer/scheduler 只用于训练续接，不能当作推理权重加载。
+若旧运行没有 `best`，框架会回退到最后 epoch 内最新的完整 `checkpoint-*`。对于手工
+导出的纯 adapter，可传 `--no-require-training-state` 取消训练状态校验。
+
+技能库可在 TOML 固定配置，后两种接口默认读取它：
+
+```toml
+[paths]
+skill_library_db = "./runtime/skill_library.sqlite3"
+```
+
+### 6.1 裸模型：单 adapter + 原生 M3A
+
+不读取技能库，不注入技能，也不执行动态路由：
 
 ```bash
-python -m src1 --config src1/config.local.toml evaluate \
+python -m src1 --config src1/config.local.toml evaluate-standalone \
+  --adapter-path ./runtime/checkpoints/android_world_all \
+  --model-id android-world-all \
   --tasks ContactsAddContact SimpleCalendarAddOneEvent \
   --combinations 5 --seed 42
 ```
 
-默认用本地关键词规划，拓扑转换开销很低。若希望让某个在线模型做第一阶段任务
-分解，可增加：
+### 6.2 简单技能：单 adapter + 单技能关键词检索
+
+每个 episode 只按任务文字检索一次最相关技能，固定使用同一个 adapter；没有原语拓扑
+规划、DP 路由或模型切换，适合作为技能注入消融基线：
 
 ```bash
---planner-model student-base
+python -m src1 --config src1/config.local.toml evaluate-simple-skills \
+  --adapter-path ./runtime/checkpoints/android_world_all \
+  --model-id android-world-all \
+  --skill-database ./runtime/skill_library.sqlite3 \
+  --task-count 30 --combinations 1 --seed 42
 ```
 
-候选 polished skill 默认不参与正式评测。灰度验证时显式增加
-`--include-candidates`。每次评测目录包含：
+默认只使用 Android 相关 raw skills 和 active polished skills；加
+`--include-candidates` 后允许 candidate polished skills。
+
+### 6.3 PMT-Skill：多 adapter + 动态模型/技能路由
+
+多个 LoRA 通过 ms-swift 的命名 adapter 映射加载到同一份 base model 服务，路由器在
+每个执行单元选择 `model_id + skill_id`：
+
+```bash
+python -m src1 --config src1/config.local.toml evaluate-pmtskill \
+  --adapter-paths \
+    ./runtime/checkpoints/ui_grounding \
+    ./runtime/checkpoints/planning \
+  --adapter-model-ids ui-grounding planning \
+  --skill-database ./runtime/skill_library.sqlite3 \
+  --task-count 30 --combinations 1 --seed 42 \
+  --planner-model planning
+```
+
+`evaluate` 仍保留为 `evaluate-pmtskill` 的兼容别名。`--adapter-model-ids` 与路径一一
+对应；省略时使用各 adapter 顶层目录名。同名模型画像会从技能库或 `[[models]]` 继承，
+因此建议 ID 与已维护能力画像一致。`--planner-model` 可以引用本次部署的任一 adapter；
+不传则使用低延迟关键词规划。
+
+在线路由的重要参数均可从 CLI 覆盖：
+
+```bash
+--routing-success-weight 1.0 \
+--routing-latency-weight 0.0001 \
+--routing-switch-weight 0.003 \
+--routing-polished-bonus 0.05 \
+--routing-degradation-weight 0.02 \
+--routing-minimum-capability 0.05 \
+--routing-maximum-candidates 32
+```
+
+三种接口还共同支持 `--base-model-path`、`--deploy-host`、`--deploy-port`、
+`--cuda-visible-devices`、`--infer-backend`、`--max-model-len`、
+`--gpu-memory-utilization`、`--max-new-tokens`、`--deploy-extra-arg` 和 `--dry-run`。
+多 adapter 路由当前要求 `vllm`。未传 `--tasks` 时，`--task-count N` 会按 seed 固定
+抽样；二者都不传则运行整个 family。
+
+为避免基准测试反向污染技能统计，后两种接口默认不把 trace 写回 SQLite；确实要交给
+backend 维护时显式增加 `--record-traces`。候选 polished skill 默认不参与正式评测，
+灰度验证时增加 `--include-candidates`。
+
+每次评测目录包含：
 
 - `summary.json`：完整机器可读指标；
-- `report.md`：Micro/Macro SR、每任务 SR、平均步数、模型切换、技能使用、失败分类；
+- `report.md`：评测模式、实际 adapter checkpoint、Micro/Macro SR、每任务 SR、平均步数、模型切换、技能使用、失败分类；
 - `traces.jsonl`：backend 可直接消费的轻量轨迹；
 - `checkpoints/*.pkl.gz`：AndroidWorld 原始 episode。
+
+此外每次 CLI 都会在 `[paths].log_dir` 下生成独立目录，其中 `runtime.log` 保存部署输出、
+warning/error/traceback，`result.json` 和 `result.md` 保存最终指标及完整 adapter 解析结果。
 
 ## 7. 技能库自主维护
 

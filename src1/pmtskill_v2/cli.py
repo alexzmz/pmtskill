@@ -62,7 +62,9 @@ def _run_label(args: argparse.Namespace) -> str:
     goal = getattr(args, "goal", None)
     if goal:
         return str(goal)[:56]
-    if getattr(args, "command", None) in {"collect", "evaluate"}:
+    if getattr(args, "command", "").startswith("evaluate") or getattr(
+        args, "command", None
+    ) == "collect":
         return "all-tasks"
     return ""
 
@@ -120,6 +122,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "ms_swift_cli": (
             config.paths.ms_swift_root / "swift" / "cli" / "main.py"
         ).is_file(),
+        "skill_library": config.paths.database.is_file(),
         "student_model_path": Path(config.offline.student_model_path)
         .expanduser()
         .exists(),
@@ -673,29 +676,440 @@ def command_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_evaluate(args: argparse.Namespace) -> int:
-    # 延迟导入，确保没有 Android emulator 时也能使用其余 CLI。
-    from .evaluation.android_world import AndroidWorldOnlineEvaluator
+def _evaluation_settings(
+    config: ProjectConfig, args: argparse.Namespace
+):
+    """用 CLI 参数覆盖公共部署配置，三种评测保持完全相同的服务设置。"""
 
-    config, store = _open(args.config)
-    artifacts = AndroidWorldOnlineEvaluator(config, store).run(
-        tasks=_tasks(args.tasks),
-        n_task_combinations=args.combinations,
+    current = config.training_evaluation
+    resolved = dataclasses.replace(
+        current,
+        deploy_host=args.deploy_host or current.deploy_host,
+        deploy_port=(
+            args.deploy_port if args.deploy_port is not None else current.deploy_port
+        ),
+        infer_backend=args.infer_backend or current.infer_backend,
+        max_model_len=(
+            args.max_model_len
+            if args.max_model_len is not None
+            else current.max_model_len
+        ),
+        gpu_memory_utilization=(
+            args.gpu_memory_utilization
+            if args.gpu_memory_utilization is not None
+            else current.gpu_memory_utilization
+        ),
+        cuda_visible_devices=(
+            args.cuda_visible_devices
+            if args.cuda_visible_devices is not None
+            else current.cuda_visible_devices
+        ),
+        max_new_tokens=(
+            args.max_new_tokens
+            if args.max_new_tokens is not None
+            else current.max_new_tokens
+        ),
+        deploy_extra_args=(
+            tuple(current.deploy_extra_args) + tuple(args.deploy_extra_arg or ())
+        ),
+    )
+    if not 1 <= resolved.deploy_port <= 65535:
+        raise ValueError("--deploy-port 必须在 [1, 65535]")
+    if resolved.max_model_len <= 0:
+        raise ValueError("--max-model-len 必须是正整数")
+    if not 0 < resolved.gpu_memory_utilization <= 1:
+        raise ValueError("--gpu-memory-utilization 必须在 (0, 1]")
+    if resolved.max_new_tokens <= 0:
+        raise ValueError("--max-new-tokens 必须是正整数")
+    return resolved
+
+
+def _evaluation_tasks(config: ProjectConfig, args: argparse.Namespace):
+    """显式任务原样使用；指定 task-count 时按 seed 固定抽样，否则评测全部。"""
+
+    if args.combinations <= 0:
+        raise ValueError("--combinations 必须是正整数")
+    if args.task_count is not None and args.task_count <= 0:
+        raise ValueError("--task-count 必须是正整数")
+    selected = _tasks(args.tasks)
+    if selected or args.task_count is None:
+        return selected
+    from .evaluation.android_world import sample_android_world_tasks
+
+    return sample_android_world_tasks(
+        config,
+        tasks=None,
+        task_count=args.task_count,
         seed=args.seed,
         family=args.family,
-        planner_model_id=args.planner_model,
-        include_candidate_skills=args.include_candidates,
-        output_dir=args.output_dir,
     )
+
+
+def _open_evaluation_skill_store(
+    config: ProjectConfig, database: str | None
+) -> SkillStore:
+    """只打开用户指定的既有技能库，避免路径写错时静默创建空库。"""
+
+    path = (
+        Path(database).expanduser().resolve()
+        if database
+        else config.paths.database.resolve()
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"技能库不存在: {path}；请设置 [paths].skill_library_db 或 --skill-database"
+        )
+    store = SkillStore(path)
+    store.initialize()
+    return store
+
+
+def _evaluation_profile_template(
+    config: ProjectConfig,
+    store: SkillStore | None,
+    model_id: str,
+):
+    """尽量继承同名能力画像；新 adapter 则继承训练评测模板的能力先验。"""
+
+    profiles = store.list_model_profiles(enabled_only=False) if store else []
+    profiles.extend(config.models)
+    exact = next((item for item in profiles if item.model_id == model_id), None)
+    if exact is not None:
+        return exact
+    fallback_id = config.training_evaluation.model_id
+    fallback = next(
+        (item for item in profiles if fallback_id and item.model_id == fallback_id),
+        next((item for item in profiles if item.enabled), None),
+    )
+    if fallback is None:
+        raise ValueError("没有可用于 adapter 的模型能力画像")
+    return dataclasses.replace(fallback, model_id=model_id)
+
+
+def _adapter_deployment(
+    config: ProjectConfig,
+    store: SkillStore | None,
+    args: argparse.Namespace,
+    adapter_paths: Sequence[str],
+    model_ids: Sequence[str] | None,
+):
+    """解析 adapter 路径并构造命名 LoRA 部署器。"""
+
+    from .evaluation.adapters import (
+        AdapterDeploymentBinding,
+        MSSwiftAdapterDeployment,
+        adapter_model_id,
+        resolve_adapter_checkpoint,
+    )
+
+    if args.combinations <= 0:
+        raise ValueError("--combinations 必须是正整数")
+    if args.task_count is not None and args.task_count <= 0:
+        raise ValueError("--task-count 必须是正整数")
+    resolved = [
+        resolve_adapter_checkpoint(
+            path,
+            require_training_state=args.require_training_state,
+        )
+        for path in adapter_paths
+    ]
+    ids = list(model_ids or ())
+    if ids and len(ids) != len(resolved):
+        raise ValueError("--adapter-model-ids 数量必须与 --adapter-paths 相同")
+    if not ids:
+        ids = [adapter_model_id(item.adapter_root) for item in resolved]
+    if len(ids) != len(set(ids)):
+        raise ValueError(
+            "自动生成的 adapter model_id 重复，请用 --adapter-model-ids 显式指定"
+        )
+    bindings = tuple(
+        AdapterDeploymentBinding(
+            model_id=model_id,
+            checkpoint=checkpoint,
+            template_profile=_evaluation_profile_template(
+                config, store, model_id
+            ),
+        )
+        for model_id, checkpoint in zip(ids, resolved)
+    )
+    deployment = MSSwiftAdapterDeployment(
+        config,
+        _evaluation_settings(config, args),
+        bindings,
+        base_model_path=args.base_model_path,
+    )
+    return deployment, bindings
+
+
+def _evaluation_result(
+    *,
+    mode: str,
+    artifacts,
+    bindings,
+    skill_database: Path | None,
+) -> dict[str, Any]:
+    return {
+        "evaluation_mode": mode,
+        "summary": artifacts.summary,
+        "summary_json": artifacts.summary_json,
+        "report_markdown": artifacts.report_markdown,
+        "traces_jsonl": artifacts.traces_jsonl,
+        "checkpoint_dir": artifacts.output_dir / "checkpoints",
+        "adapters": [
+            {
+                "model_id": binding.model_id,
+                **binding.checkpoint.to_dict(),
+            }
+            for binding in bindings
+        ],
+        "skill_database": str(skill_database) if skill_database else None,
+    }
+
+
+def _dry_evaluation_result(mode: str, deployment, bindings, args) -> int:
     _print(
         {
-            "summary": artifacts.summary,
-            "summary_json": artifacts.summary_json,
-            "report_markdown": artifacts.report_markdown,
-            "traces_jsonl": artifacts.traces_jsonl,
+            "dry_run": True,
+            "evaluation_mode": mode,
+            "deployment_command": deployment.build_adapter_command(),
+            "profiles": [profile.to_dict() for profile in deployment.profiles()],
+            "adapters": [
+                {
+                    "model_id": binding.model_id,
+                    **binding.checkpoint.to_dict(),
+                }
+                for binding in bindings
+            ],
+            "tasks": _tasks(args.tasks) or (
+                f"sample:{args.task_count}" if args.task_count is not None else "all"
+            ),
+            "combinations": args.combinations,
+            "seed": args.seed,
+            "family": args.family,
+            "output_dir": args.output_dir,
         }
     )
     return 0
+
+
+def command_evaluate_standalone(args: argparse.Namespace) -> int:
+    """接口一：单 adapter 裸模型 + 原生 M3A，不读取或注入技能。"""
+
+    from .evaluation.android_world import AndroidWorldStandaloneEvaluator
+
+    config = load_config(args.config)
+    config.ensure_runtime_dirs()
+    deployment, bindings = _adapter_deployment(
+        config,
+        None,
+        args,
+        [args.adapter_path],
+        [args.model_id] if args.model_id else None,
+    )
+    if args.dry_run:
+        return _dry_evaluation_result("standalone", deployment, bindings, args)
+    tasks = _evaluation_tasks(config, args)
+    with deployment.activate_adapters() as profiles:
+        artifacts = AndroidWorldStandaloneEvaluator(config).run(
+            profile=profiles[0],
+            tasks=tasks,
+            n_task_combinations=args.combinations,
+            seed=args.seed,
+            family=args.family,
+            output_dir=args.output_dir,
+        )
+    _print(
+        _evaluation_result(
+            mode="standalone",
+            artifacts=artifacts,
+            bindings=bindings,
+            skill_database=None,
+        )
+    )
+    return 0
+
+
+def command_evaluate_simple_skills(args: argparse.Namespace) -> int:
+    """接口二：单 adapter + 确定性关键词检索出的一个技能。"""
+
+    from .evaluation.android_world import AndroidWorldSimpleSkillEvaluator
+
+    config = load_config(args.config)
+    config.ensure_runtime_dirs()
+    store = _open_evaluation_skill_store(config, args.skill_database)
+    deployment, bindings = _adapter_deployment(
+        config,
+        store,
+        args,
+        [args.adapter_path],
+        [args.model_id] if args.model_id else None,
+    )
+    if args.dry_run:
+        return _dry_evaluation_result("simple_skills", deployment, bindings, args)
+    tasks = _evaluation_tasks(config, args)
+    with deployment.activate_adapters() as profiles:
+        artifacts = AndroidWorldSimpleSkillEvaluator(config, store).run(
+            profile=profiles[0],
+            tasks=tasks,
+            n_task_combinations=args.combinations,
+            seed=args.seed,
+            family=args.family,
+            include_candidate_skills=args.include_candidates,
+            output_dir=args.output_dir,
+            record_traces=args.record_traces,
+        )
+    _print(
+        _evaluation_result(
+            mode="simple_skills",
+            artifacts=artifacts,
+            bindings=bindings,
+            skill_database=store.database.resolve(),
+        )
+    )
+    return 0
+
+
+def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
+    """接口三：多 adapter 模型池 + PMT-Skill 规划、技能和动态路由。"""
+
+    from .evaluation.android_world import AndroidWorldOnlineEvaluator
+
+    config = load_config(args.config)
+    config.ensure_runtime_dirs()
+    store = _open_evaluation_skill_store(config, args.skill_database)
+    route_overrides = {
+        "success_weight": args.routing_success_weight,
+        "latency_weight": args.routing_latency_weight,
+        "switch_weight": args.routing_switch_weight,
+        "polished_bonus": args.routing_polished_bonus,
+        "degradation_weight": args.routing_degradation_weight,
+        "minimum_capability": args.routing_minimum_capability,
+        "maximum_candidates_per_position": args.routing_maximum_candidates,
+    }
+    for name in (
+        "routing_success_weight",
+        "routing_latency_weight",
+        "routing_switch_weight",
+        "routing_polished_bonus",
+        "routing_degradation_weight",
+    ):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            raise ValueError(f"--{name.replace('_', '-')} 必须是非负数")
+    if (
+        args.routing_minimum_capability is not None
+        and not 0 <= args.routing_minimum_capability <= 1
+    ):
+        raise ValueError("--routing-minimum-capability 必须在 [0, 1]")
+    if (
+        args.routing_maximum_candidates is not None
+        and args.routing_maximum_candidates <= 0
+    ):
+        raise ValueError("--routing-maximum-candidates 必须是正整数")
+    config.routing = dataclasses.replace(
+        config.routing,
+        **{key: value for key, value in route_overrides.items() if value is not None},
+    )
+    deployment, bindings = _adapter_deployment(
+        config,
+        store,
+        args,
+        args.adapter_paths,
+        args.adapter_model_ids,
+    )
+    if args.dry_run:
+        return _dry_evaluation_result("pmtskill_online", deployment, bindings, args)
+    tasks = _evaluation_tasks(config, args)
+    with deployment.activate_adapters() as profiles:
+        artifacts = AndroidWorldOnlineEvaluator(config, store).run(
+            tasks=tasks,
+            n_task_combinations=args.combinations,
+            seed=args.seed,
+            family=args.family,
+            planner_model_id=args.planner_model,
+            include_candidate_skills=args.include_candidates,
+            output_dir=args.output_dir,
+            model_profiles=profiles,
+            record_traces=args.record_traces,
+        )
+    _print(
+        _evaluation_result(
+            mode="pmtskill_online",
+            artifacts=artifacts,
+            bindings=bindings,
+            skill_database=store.database.resolve(),
+        )
+    )
+    return 0
+
+
+def _add_common_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
+    """三种评测共享的任务选择、部署资源和输出参数。"""
+
+    parser.add_argument("--tasks", nargs="*", help="任务名；默认全部")
+    parser.add_argument(
+        "--task-count",
+        type=int,
+        help="不传 --tasks 时按 seed 抽样的任务数；不传表示全部",
+    )
+    parser.add_argument("--combinations", type=int, default=1, help="每任务参数组合数")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--family", default="android_world")
+    parser.add_argument("--output-dir", help="summary/report/traces/checkpoints 输出目录")
+    parser.add_argument("--base-model-path", help="覆盖 adapter_config 中记录的基座模型")
+    parser.add_argument(
+        "--require-training-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "要求选中的 best checkpoint 同时包含 optimizer.pt 和 scheduler.pt（默认）；"
+            "评测导出的纯 adapter 可用 --no-require-training-state"
+        ),
+    )
+    parser.add_argument("--deploy-host", help="临时 ms-swift 服务监听地址")
+    parser.add_argument("--deploy-port", type=int, help="临时 ms-swift 服务端口")
+    parser.add_argument(
+        "--cuda-visible-devices",
+        help="评测服务使用的物理 GPU，例如 1 或 1,2",
+    )
+    parser.add_argument(
+        "--infer-backend",
+        choices=["vllm", "transformers", "sglang", "lmdeploy"],
+        help="临时模型服务推理后端；多 adapter 路由要求 vllm",
+    )
+    parser.add_argument("--max-model-len", type=int, help="vLLM 最大上下文长度")
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, help="vLLM 显存使用比例 (0,1]"
+    )
+    parser.add_argument("--max-new-tokens", type=int, help="单次模型调用最大输出 token")
+    parser.add_argument(
+        "--deploy-extra-arg",
+        action="append",
+        help="传给 swift deploy 的额外单个参数；可重复",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只解析 checkpoint 并输出部署命令，不启动 GPU/emulator",
+    )
+
+
+def _add_skill_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--skill-database",
+        help="覆盖 [paths].skill_library_db，必须指向已有 skill_library.sqlite3",
+    )
+    parser.add_argument(
+        "--include-candidates",
+        action="store_true",
+        help="除 active 外也允许 candidate polished skills",
+    )
+    parser.add_argument(
+        "--record-traces",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="是否把本轮轻量轨迹写回技能库；默认关闭，避免基准测试污染路由统计",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -919,19 +1333,63 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--include-candidates", action="store_true")
     plan.set_defaults(handler=command_plan)
 
+    standalone = subparsers.add_parser(
+        "evaluate-standalone",
+        help="单 adapter 裸模型 + 原生 M3A AndroidWorld 评测",
+    )
+    standalone.add_argument(
+        "--adapter-path",
+        required=True,
+        help="adapter 顶层目录；自动选择最新 training_run/最后 epoch/best",
+    )
+    standalone.add_argument("--model-id", help="报告中的 adapter ID；默认取目录名")
+    _add_common_evaluation_arguments(standalone)
+    standalone.set_defaults(handler=command_evaluate_standalone)
+
+    simple = subparsers.add_parser(
+        "evaluate-simple-skills",
+        help="单 adapter + 简单关键词技能调用 AndroidWorld 评测",
+    )
+    simple.add_argument(
+        "--adapter-path",
+        required=True,
+        help="adapter 顶层目录；自动选择最新 training_run/最后 epoch/best",
+    )
+    simple.add_argument("--model-id", help="报告中的 adapter ID；默认取目录名")
+    _add_common_evaluation_arguments(simple)
+    _add_skill_evaluation_arguments(simple)
+    simple.set_defaults(handler=command_evaluate_simple_skills)
+
     evaluate = subparsers.add_parser(
-        "evaluate", help="运行动态模型/技能 AndroidWorld 评测"
+        "evaluate-pmtskill",
+        aliases=["evaluate"],
+        help="多 adapter + PMT-Skill 动态模型/技能路由 AndroidWorld 评测",
     )
-    evaluate.add_argument("--tasks", nargs="*", help="任务名；默认全部")
-    evaluate.add_argument("--combinations", type=int, default=1)
-    evaluate.add_argument("--seed", type=int, default=42)
-    evaluate.add_argument("--family", default="android_world")
-    evaluate.add_argument("--planner-model", help="可选；不填则使用低延迟关键词规划")
     evaluate.add_argument(
-        "--include-candidates", action="store_true", help="灰度试用候选技能"
+        "--adapter-paths",
+        nargs="+",
+        required=True,
+        help="一个或多个 adapter 顶层目录",
     )
-    evaluate.add_argument("--output-dir")
-    evaluate.set_defaults(handler=command_evaluate)
+    evaluate.add_argument(
+        "--adapter-model-ids",
+        nargs="*",
+        help="与 adapter-paths 一一对应的路由 ID；默认使用各目录名",
+    )
+    _add_common_evaluation_arguments(evaluate)
+    _add_skill_evaluation_arguments(evaluate)
+    evaluate.add_argument(
+        "--planner-model",
+        help="第一阶段任务分解模型 ID；可引用本次部署的任一 adapter，默认关键词规划",
+    )
+    evaluate.add_argument("--routing-success-weight", type=float)
+    evaluate.add_argument("--routing-latency-weight", type=float)
+    evaluate.add_argument("--routing-switch-weight", type=float)
+    evaluate.add_argument("--routing-polished-bonus", type=float)
+    evaluate.add_argument("--routing-degradation-weight", type=float)
+    evaluate.add_argument("--routing-minimum-capability", type=float)
+    evaluate.add_argument("--routing-maximum-candidates", type=int)
+    evaluate.set_defaults(handler=command_evaluate_pmtskill)
     return parser
 
 

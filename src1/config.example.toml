@@ -6,6 +6,8 @@ android_world_root = "../libs/android_world"
 skvm_skills_root = "/home/zmz/Workspace/gui/libs/skvm/skvm-data/skills"
 ms_swift_root = "../libs/ms-swift"
 state_dir = "./runtime"
+# 后两种 AndroidWorld 评测固定读取这份技能库；CLI 仍可用 --skill-database 覆盖。
+skill_library_db = "./runtime/skill_library.sqlite3"
 # 每次 CLI 调用都会在该目录下创建“时间_命令_任务”子目录。
 log_dir = "./runtime/logs"
 

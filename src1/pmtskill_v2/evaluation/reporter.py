@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import json
 import math
 import statistics
 from collections.abc import Mapping
@@ -176,6 +177,7 @@ def summarize_episodes(
 
 
 def _markdown(summary: dict[str, Any]) -> str:
+    metadata = summary.get("metadata", {})
     lines = [
         "# PMT-Skill AndroidWorld 评测报告",
         "",
@@ -191,11 +193,56 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"| 平均运行时间 | {summary['average_run_time_seconds']:.2f}s |",
         f"| 平均模型/adapter 切换 | {summary['average_model_switches']:.2f} |",
         "",
-        "## 每任务结果",
+        "## 评测配置",
         "",
-        "| 任务 | 成功/总数 | SR |",
-        "|---|---:|---:|",
+        f"- 模式：`{metadata.get('evaluation_mode', 'unknown')}`",
+        f"- 技能库：`{metadata.get('skill_database') or '未使用'}`",
+        f"- 任务：`{json.dumps(metadata.get('tasks', 'all'), ensure_ascii=False)}`",
+        f"- 组合数 / seed：`{metadata.get('n_task_combinations', 1)}` / "
+        f"`{metadata.get('seed', 42)}`",
     ]
+    checkpoints = metadata.get("evaluation_checkpoints")
+    if isinstance(checkpoints, Mapping):
+        lines.extend(("", "### Adapter checkpoint", ""))
+        for model_id, checkpoint in checkpoints.items():
+            lines.append(f"- `{model_id}`：`{checkpoint}`")
+    elif metadata.get("evaluation_checkpoint"):
+        lines.append(f"- Adapter checkpoint：`{metadata['evaluation_checkpoint']}`")
+    resolutions = metadata.get("adapter_resolutions")
+    if not isinstance(resolutions, Mapping):
+        single = metadata.get("adapter_resolution")
+        resolutions = (
+            {str(metadata.get("model_id", "adapter")): single}
+            if isinstance(single, Mapping) and single.get("adapter_selection")
+            else {}
+        )
+    resolutions = {
+        str(model_id): detail
+        for model_id, detail in resolutions.items()
+        if isinstance(detail, Mapping) and detail.get("adapter_selection")
+    }
+    if resolutions:
+        lines.extend(("", "### Adapter 解析详情", ""))
+        for model_id, detail in resolutions.items():
+            lines.extend(
+                (
+                    f"- `{model_id}` 选择规则：`{detail.get('adapter_selection')}`",
+                    f"  - run：`{detail.get('adapter_run_dir')}`",
+                    f"  - epoch：`{detail.get('adapter_epoch_dir')}`",
+                    f"  - LoRA rank：`{detail.get('lora_rank')}`",
+                    f"  - optimizer：`{detail.get('optimizer_state')}`",
+                    f"  - scheduler：`{detail.get('scheduler_state')}`",
+                )
+            )
+    lines.extend(
+        [
+            "",
+            "## 每任务结果",
+            "",
+            "| 任务 | 成功/总数 | SR |",
+            "|---|---:|---:|",
+        ]
+    )
     for task, row in summary["per_task"].items():
         lines.append(
             f"| {task} | {row['successes']}/{row['episodes']} | {row['success_rate']:.2%} |"

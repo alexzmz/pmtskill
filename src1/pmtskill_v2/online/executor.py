@@ -17,6 +17,7 @@ from ..core.models import (
 )
 from ..inference.model_pool import ModelPool
 from ..skills.store import SkillStore
+from .planner import KeywordSkillPlanner
 from .router import DynamicProgrammingRouter
 
 
@@ -239,6 +240,63 @@ class RoutedVLWrapper:
         if not is_summary:
             self._last_action_step = route_step
             self.action_call_index += 1
+        return output, safe, raw
+
+    def predict(self, text_prompt: str):
+        return self.predict_mm(text_prompt, [])
+
+
+class SimpleSkillVLWrapper:
+    """给单个模型检索并注入一个技能，不执行 PMT-Skill 动态路由。
+
+    这个 wrapper 专门构造“同一 adapter + 简单技能调用”的消融基线：每个 episode
+    只按任务文本检索一次技能，后续所有动作都使用同一个模型和同一个技能。它不会
+    计算原语拓扑、模型切换代价或 polished skill 的组合路线。
+    """
+
+    def __init__(self, client: Any, skills: Sequence[SkillRecord]):
+        self.client = client
+        self.skills = tuple(skills)
+        self._by_id = {skill.skill_id: skill for skill in self.skills}
+        self._planner = KeywordSkillPlanner(maximum_skills=1)
+        self.current_goal: str | None = None
+        self.current_skill: SkillRecord | None = None
+
+    def set_goal(self, goal: str) -> None:
+        """为新 episode 做一次确定性关键词检索；无匹配时保持裸模型回退。"""
+
+        if goal == self.current_goal:
+            return
+        selected = self._planner.decompose(goal, self.skills).raw_skill_ids
+        self.current_goal = goal
+        self.current_skill = self._by_id.get(selected[0]) if selected else None
+
+    def reset(self) -> None:
+        self.current_goal = None
+        self.current_skill = None
+
+    def predict_mm(
+        self, text_prompt: str, images: list[Any]
+    ) -> tuple[str, bool | None, dict[str, Any] | None]:
+        is_summary = "summerize the latest step" in text_prompt.lower()
+        prompt = text_prompt
+        skill = self.current_skill
+        if skill is not None and not is_summary:
+            prompt += (
+                "\n\n简单技能提示（不使用 PMT-Skill 动态路由）：\n"
+                f"- 技能名称：{skill.name}\n"
+                f"- 技能说明：{skill.body[:3000] or skill.description}\n"
+                "请仍严格遵循 AndroidWorld 要求的 Reason/Action 输出格式。"
+            )
+        output, safe, raw = self.client.predict_mm(prompt, images)
+        if raw is not None:
+            raw = dict(raw)
+            route = raw.setdefault("_pmtskill", {})
+            route["skill_id"] = skill.skill_id if skill is not None else None
+            route["primitive_ids"] = (
+                list(skill.topology.primitive_sequence()) if skill is not None else []
+            )
+            route["routing_mode"] = "simple_keyword_skill"
         return output, safe, raw
 
     def predict(self, text_prompt: str):

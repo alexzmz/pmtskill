@@ -184,11 +184,14 @@ class MSSwiftEvaluationDeployment:
                 process.wait(timeout=10)
 
     @contextlib.contextmanager
-    def activate(self, checkpoint: Path | None) -> Iterator[ModelProfile]:
-        """启动指定权重，服务就绪后产出 profile，离开上下文时可靠回收。"""
+    def _activate_command(self, command: list[str]) -> Iterator[None]:
+        """启动一条 deploy 命令并等待服务就绪，退出上下文时可靠回收。
+
+        单 checkpoint 训练评测和多 adapter 在线评测共用这一段进程生命周期，
+        避免两套实现的端口检查、日志转发或异常清理行为逐渐不一致。
+        """
 
         self._assert_port_available()
-        command = self.build_command(checkpoint)
         environment = self.build_environment()
         process = subprocess.Popen(
             command,
@@ -217,8 +220,15 @@ class MSSwiftEvaluationDeployment:
         stderr_thread.start()
         try:
             self._wait_until_ready(process)
-            yield self.profile(checkpoint)
+            yield
         finally:
             self._stop(process)
             stdout_thread.join(timeout=5)
             stderr_thread.join(timeout=5)
+
+    @contextlib.contextmanager
+    def activate(self, checkpoint: Path | None) -> Iterator[ModelProfile]:
+        """启动指定权重，服务就绪后产出 profile，离开上下文时可靠回收。"""
+
+        with self._activate_command(self.build_command(checkpoint)):
+            yield self.profile(checkpoint)

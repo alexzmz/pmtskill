@@ -129,7 +129,7 @@ class _FakeEvaluator:
         epoch = 0.0
         if profile.adapter:
             epoch = int(Path(profile.adapter).name.split("-")[-1]) / 10
-        sr = 0.20 + epoch * 0.10 + (0.05 if use_skills else 0.0)
+        sr = self.score(epoch, use_skills)
         summary = {
             "episodes_evaluated": 2,
             "successes": int(round(sr * 2)),
@@ -146,6 +146,22 @@ class _FakeEvaluator:
         return EvaluationArtifacts(
             output_dir, summary_path, report_path, traces_path, summary
         )
+
+    def score(self, epoch: float, use_skills: bool) -> float:
+        return 0.20 + epoch * 0.10 + (0.05 if use_skills else 0.0)
+
+
+class _PlateauEvaluator(_FakeEvaluator):
+    """baseline 后三个 epoch 都没有超过 1 个百分点的显著提升。"""
+
+    def score(self, epoch: float, use_skills: bool) -> float:
+        standalone = {
+            0.0: 0.20,
+            1.0: 0.205,
+            2.0: 0.210,
+            3.0: 0.209,
+        }.get(epoch, 0.80)
+        return standalone + (0.05 if use_skills else 0.0)
 
 
 class _InterruptedEvaluator(_FakeEvaluator):
@@ -414,6 +430,151 @@ class TrainingEvaluationTest(unittest.TestCase):
                 [row["stage"] for row in checkpoints["checkpoints"]],
                 ["epoch_001", "epoch_002"],
             )
+
+    def test_sr_early_stopping_uses_three_epoch_patience_and_one_point_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = _config(root)
+            config = replace(
+                base,
+                offline=replace(base.offline, epochs=6.0),
+            )
+            trainer = _FakeTrainer()
+            deployment = _FakeDeployment(config.models[0])
+            evaluator = _PlateauEvaluator()
+            job = AdapterJob("all", root / "train.jsonl", None, root / "unused")
+            job.train_dataset.write_text(
+                json.dumps({"messages": []}) + "\n", encoding="utf-8"
+            )
+            output_dir = root / "run"
+
+            result = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                trainer,
+                deployment=deployment,
+                evaluator=evaluator,
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=output_dir,
+                    tasks=("TaskA",),
+                    full_evaluation=True,
+                    early_stopping_enabled=True,
+                    early_stopping_patience=3,
+                    early_stopping_min_delta=0.01,
+                    # 即使完整评测配置为每 2 epoch，早退仍强制逐 epoch probe。
+                    every_epochs=2,
+                    checkpoint_every_epochs=0,
+                ),
+            )
+
+            self.assertEqual(result.return_code, 0)
+            self.assertTrue(result.early_stopped)
+            self.assertEqual(result.stop_epoch, 3.0)
+            self.assertEqual(len(trainer.jobs), 3)
+            self.assertEqual(
+                [job.num_train_epochs for job in trainer.jobs], [1.0, 2.0, 3.0]
+            )
+            self.assertEqual(result.final_checkpoint.name, "checkpoint-30")
+            self.assertTrue(result.final_checkpoint.is_dir())
+            self.assertEqual(
+                [row["label"] for row in result.stages],
+                [
+                    "baseline_standalone",
+                    "baseline_skills",
+                    "epoch_001_standalone",
+                    "epoch_002_standalone",
+                    "epoch_003_standalone",
+                    "final_skills",
+                ],
+            )
+            history = json.loads(result.history_json.read_text(encoding="utf-8"))
+            self.assertEqual(history["status"], "early_stopped")
+            self.assertTrue(history["early_stopping"]["stopped"])
+            self.assertEqual(history["early_stopping"]["stale_epochs"], 3)
+            self.assertEqual(len(history["early_stopping"]["observations"]), 4)
+            self.assertEqual(
+                history["manifest"]["effective_evaluation_every_epochs"], 1
+            )
+            self.assertTrue(
+                next(
+                    row
+                    for row in history["stages"]
+                    if row["label"] == "epoch_003_standalone"
+                )["is_final_checkpoint"]
+            )
+
+            # 自动续接一个已经早退的运行时不得重新训练或重复评测。
+            resumed_trainer = _FakeTrainer()
+            resumed_evaluator = _PlateauEvaluator()
+            resumed = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                resumed_trainer,
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=resumed_evaluator,
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=output_dir,
+                    tasks=("TaskA",),
+                    full_evaluation=True,
+                    early_stopping_enabled=True,
+                    early_stopping_patience=3,
+                    early_stopping_min_delta=0.01,
+                    every_epochs=2,
+                    checkpoint_every_epochs=0,
+                ),
+            )
+            self.assertTrue(resumed.early_stopped)
+            self.assertEqual(resumed_trainer.jobs, [])
+            self.assertEqual(resumed_evaluator.calls, [])
+
+    def test_without_full_evaluation_still_runs_standalone_early_stop_probes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = _config(root)
+            config = replace(base, offline=replace(base.offline, epochs=6.0))
+            trainer = _FakeTrainer()
+            evaluator = _PlateauEvaluator()
+            job = AdapterJob("all", root / "train.jsonl", None, root / "unused")
+            job.train_dataset.write_text(
+                json.dumps({"messages": []}) + "\n", encoding="utf-8"
+            )
+
+            result = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                trainer,
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=evaluator,
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=root / "probe-only",
+                    tasks=("TaskA",),
+                    full_evaluation=False,
+                    early_stopping_enabled=True,
+                ),
+            )
+
+            self.assertTrue(result.early_stopped)
+            self.assertEqual(result.stop_epoch, 3.0)
+            self.assertEqual(len(trainer.jobs), 3)
+            self.assertTrue(all(not use_skills for use_skills, _ in evaluator.calls))
+            self.assertEqual(
+                [row["label"] for row in result.stages],
+                [
+                    "baseline_standalone",
+                    "epoch_001_standalone",
+                    "epoch_002_standalone",
+                    "epoch_003_standalone",
+                ],
+            )
+            markdown = result.comparison_markdown.read_text(encoding="utf-8")
+            self.assertIn("仅早退探测", markdown)
+            self.assertNotIn("模型+技能库", markdown)
 
     def test_workflow_resumes_latest_checkpoint_without_repeating_completed_work(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -692,6 +853,17 @@ class TrainingEvaluationTest(unittest.TestCase):
             ]
         )
         disabled = parser.parse_args(["train", "--without-evaluation"])
+        no_early_stop = parser.parse_args(
+            [
+                "train",
+                "--without-evaluation",
+                "--no-early-stopping",
+                "--early-stopping-patience",
+                "4",
+                "--early-stopping-min-delta",
+                "0.02",
+            ]
+        )
         self.assertIsNone(plain.with_evaluation)
         self.assertTrue(enabled.with_evaluation)
         self.assertEqual(enabled.eval_task_count, 24)
@@ -702,6 +874,10 @@ class TrainingEvaluationTest(unittest.TestCase):
         self.assertTrue(enabled.resume)
         self.assertFalse(build_parser().parse_args(["train", "--no-resume"]).resume)
         self.assertFalse(disabled.with_evaluation)
+        self.assertIsNone(plain.early_stopping)
+        self.assertFalse(no_early_stop.early_stopping)
+        self.assertEqual(no_early_stop.early_stopping_patience, 4)
+        self.assertEqual(no_early_stop.early_stopping_min_delta, 0.02)
 
 
 if __name__ == "__main__":

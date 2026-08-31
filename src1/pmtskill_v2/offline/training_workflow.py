@@ -10,7 +10,7 @@ import math
 import shutil
 import traceback
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -103,6 +103,85 @@ def build_epoch_plan(
     ]
 
 
+@dataclass(slots=True)
+class SuccessRateEarlyStopping:
+    """基于固定 AndroidWorld 子集 standalone Micro SR 的早退状态机。
+
+    baseline 作为第一个观测值。只有当前 SR 严格高于历史有效最佳值
+    ``min_delta`` 以上才清零计数；因此恰好提升 0.01 在阈值为 0.01 时仍视为
+    “没有超过 1 个百分点”。状态完全可序列化，续训时可由 history 中的评测行重建。
+    """
+
+    patience: int = 3
+    min_delta: float = 0.01
+    best_sr: float | None = None
+    best_epoch: float | None = None
+    stale_epochs: int = 0
+    observations: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.patience <= 0:
+            raise ValueError("early_stopping_patience 必须是正整数")
+        if not 0 <= self.min_delta <= 1:
+            raise ValueError("early_stopping_min_delta 必须在 [0, 1]")
+
+    @property
+    def should_stop(self) -> bool:
+        return self.stale_epochs >= self.patience
+
+    def observe(
+        self,
+        *,
+        epoch: float,
+        micro_sr: float,
+        checkpoint: str | None,
+    ) -> dict[str, Any]:
+        """记录一个可比评测点并返回本次早退判定。"""
+
+        score = float(micro_sr)
+        if not math.isfinite(score) or not 0 <= score <= 1:
+            raise ValueError(f"AndroidWorld Micro SR 无效: {micro_sr!r}")
+        previous_best = self.best_sr
+        improved = previous_best is None or score > (
+            previous_best + self.min_delta + 1e-12
+        )
+        if improved:
+            self.best_sr = score
+            self.best_epoch = float(epoch)
+            self.stale_epochs = 0
+        else:
+            self.stale_epochs += 1
+        observation = {
+            "epoch": float(epoch),
+            "micro_sr": score,
+            "checkpoint": checkpoint,
+            "previous_best_sr": previous_best,
+            "significant_improvement": improved,
+            "best_sr": self.best_sr,
+            "best_epoch": self.best_epoch,
+            "stale_epochs": self.stale_epochs,
+            "should_stop": self.should_stop,
+        }
+        self.observations.append(observation)
+        return observation
+
+    def to_dict(
+        self, *, enabled: bool, stopped: bool, stop_epoch: float | None
+    ) -> dict[str, Any]:
+        return {
+            "enabled": enabled,
+            "metric": "standalone_micro_sr",
+            "patience": self.patience,
+            "min_delta": self.min_delta,
+            "best_sr": self.best_sr,
+            "best_epoch": self.best_epoch,
+            "stale_epochs": self.stale_epochs,
+            "stopped": stopped,
+            "stop_epoch": stop_epoch,
+            "observations": list(self.observations),
+        }
+
+
 def resolve_student_profile(
     config: ProjectConfig, model_id: str | None
 ) -> ModelProfile:
@@ -137,6 +216,11 @@ class TrainingEvaluationOptions:
     every_epochs: int = 1
     checkpoint_every_epochs: int = 1
     include_candidate_skills: bool = False
+    # False 表示仅运行早退必需的 standalone probes，不评测技能库。
+    full_evaluation: bool = True
+    early_stopping_enabled: bool = True
+    early_stopping_patience: int = 3
+    early_stopping_min_delta: float = 0.01
     training_cuda_visible_devices: str | None = None
     evaluation_cuda_visible_devices: str | None = None
     evaluation_max_model_len: int | None = None
@@ -149,6 +233,9 @@ class TrainingEvaluationResult:
     """CLI 可直接序列化的训练评测结果。"""
 
     return_code: int
+    early_stopped: bool
+    stop_epoch: float | None
+    best_sr: float | None
     resumed: bool
     resumed_from_checkpoint: Path | None
     output_dir: Path
@@ -164,6 +251,9 @@ class TrainingEvaluationResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "return_code": self.return_code,
+            "early_stopped": self.early_stopped,
+            "stop_epoch": self.stop_epoch,
+            "best_sr": self.best_sr,
             "resumed": self.resumed,
             "resumed_from_checkpoint": (
                 str(self.resumed_from_checkpoint)
@@ -277,25 +367,27 @@ class TrainingEvaluationRecorder:
         now = dt.datetime.now().astimezone().isoformat()
         if resume_state is None:
             self.state = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "created_at": now,
                 "status": "running",
                 "manifest": manifest,
                 "stages": [],
                 "training_commands": [],
                 "checkpoints": [],
+                "early_stopping": None,
                 "resume_events": [],
                 "error": None,
             }
         else:
             self.state = resume_state
             self.state["schema_version"] = max(
-                3, int(self.state.get("schema_version", 1))
+                4, int(self.state.get("schema_version", 1))
             )
             self.state["manifest"] = manifest
             self.state.setdefault("stages", [])
             self.state.setdefault("training_commands", [])
             self.state.setdefault("checkpoints", [])
+            self.state.setdefault("early_stopping", None)
             self.state.setdefault("resume_events", []).append(
                 {
                     "resumed_at": now,
@@ -380,6 +472,25 @@ class TrainingEvaluationRecorder:
     def mark_checkpoint_removed(self, row: dict[str, Any]) -> None:
         row["exists"] = False
         row["removed_after_completion"] = True
+        self.flush()
+
+    def mark_checkpoint_retained(self, row: dict[str, Any]) -> None:
+        """早退点即新的训练终点，必须保留其 adapter checkpoint。"""
+
+        row["retained"] = True
+        row["exists"] = True
+        self.flush()
+
+    def mark_evaluation_final(self, row: dict[str, Any]) -> None:
+        """把计划外早退 epoch 标记为本次运行的最终 checkpoint。"""
+
+        row["is_final_checkpoint"] = True
+        self.flush()
+
+    def record_early_stopping(self, state: dict[str, Any]) -> None:
+        """持久化完整早退判定，使中断和续训仍可审计。"""
+
+        self.state["early_stopping"] = state
         self.flush()
 
     def record_evaluation(
@@ -487,14 +598,34 @@ class TrainingEvaluationRecorder:
             "# LoRA 训练 × AndroidWorld SR 对比",
             "",
             f"- 状态：**{self.state['status']}**",
+            f"- 运行模式：**{'完整评测' if manifest.get('full_evaluation') else '仅早退探测'}**",
             f"- 固定任务数：**{len(manifest['tasks'])}**",
             f"- 每任务组合数：**{manifest['combinations']}**",
             f"- 随机种子：**{manifest['seed']}**",
             "- 所有行使用同一任务列表与 seed，训练评测轨迹不会写回技能库。",
-            "",
-            "| 阶段 | 模式 | Epoch | 成功/有效 | Micro SR | Macro SR | 相对裸基座 |",
-            "|---|---|---:|---:|---:|---:|---:|",
         ]
+        early = self.state.get("early_stopping")
+        if isinstance(early, dict) and early.get("enabled"):
+            lines.extend(
+                (
+                    f"- 早退：patience={early.get('patience')}，"
+                    f"min_delta={float(early.get('min_delta', 0)):.2%}，"
+                    f"连续未显著提升={early.get('stale_epochs', 0)}",
+                    f"- 是否触发早退：**{'是' if early.get('stopped') else '否'}**"
+                    + (
+                        f"（epoch {float(early['stop_epoch']):g}）"
+                        if early.get("stop_epoch") is not None
+                        else ""
+                    ),
+                )
+            )
+        lines.extend(
+            (
+                "",
+                "| 阶段 | 模式 | Epoch | 成功/有效 | Micro SR | Macro SR | 相对裸基座 |",
+            "|---|---|---:|---:|---:|---:|---:|",
+            )
+        )
         for row in self.state["stages"]:
             gain = row.get("gain_over_baseline")
             gain_text = "—" if gain is None else f"{float(gain):+.2%}"
@@ -602,8 +733,13 @@ def _validate_resume_manifest(
         "combinations",
         "seed",
         "every_epochs",
+        "effective_evaluation_every_epochs",
         "checkpoint_every_epochs",
         "include_candidate_skills",
+        "full_evaluation",
+        "early_stopping_enabled",
+        "early_stopping_patience",
+        "early_stopping_min_delta",
     )
     mismatched = [
         field
@@ -709,6 +845,10 @@ class TrainingEvaluationWorkflow:
             raise ValueError("训练评测任务列表不能为空")
         if options.combinations <= 0:
             raise ValueError("训练评测 combinations 必须是正整数")
+        if options.early_stopping_patience <= 0:
+            raise ValueError("early_stopping_patience 必须是正整数")
+        if not 0 <= options.early_stopping_min_delta <= 1:
+            raise ValueError("early_stopping_min_delta 必须在 [0, 1]")
         output_has_files = options.output_dir.exists() and any(
             options.output_dir.iterdir()
         )
@@ -720,15 +860,28 @@ class TrainingEvaluationWorkflow:
         resume_state = (
             _load_resume_state(options.output_dir) if output_has_files else None
         )
+        previous_status = (
+            str(resume_state.get("status", "")) if resume_state is not None else ""
+        )
+        previous_early = (
+            resume_state.get("early_stopping")
+            if isinstance(resume_state, dict)
+            else None
+        )
         if output_has_files and resume_state is None:
             raise FileExistsError(
                 "训练评测输出目录非空但缺少 history.json，无法安全判断已完成阶段: "
                 f"{options.output_dir}"
             )
         validate_staged_training_args(job)
+        # SR 早退必须逐 epoch 获得可比观测；完整报告的用户配置可以更稀疏，
+        # 但启用早退后 standalone probe 会自动收紧到每个 epoch 一次。
+        effective_every_epochs = (
+            1 if options.early_stopping_enabled else options.every_epochs
+        )
         plan = build_epoch_plan(
             self.config.offline.epochs,
-            options.every_epochs,
+            effective_every_epochs,
             options.checkpoint_every_epochs,
         )
         training_output = options.output_dir / "training"
@@ -743,7 +896,7 @@ class TrainingEvaluationWorkflow:
             )
         job = prepared.job
         manifest = {
-            "schema_version": 3,
+            "schema_version": 4,
             "job": job.name,
             "family": options.family,
             "tasks": list(options.tasks),
@@ -753,12 +906,17 @@ class TrainingEvaluationWorkflow:
             * options.combinations,
             "seed": options.seed,
             "every_epochs": options.every_epochs,
+            "effective_evaluation_every_epochs": effective_every_epochs,
             "checkpoint_every_epochs": options.checkpoint_every_epochs,
             "total_epochs": self.config.offline.epochs,
             "epoch_plan": [asdict(stage) for stage in plan],
             "dataset_snapshot_manifest": str(prepared.manifest_path),
             "dataset": prepared.manifest,
             "include_candidate_skills": options.include_candidate_skills,
+            "full_evaluation": options.full_evaluation,
+            "early_stopping_enabled": options.early_stopping_enabled,
+            "early_stopping_patience": options.early_stopping_patience,
+            "early_stopping_min_delta": options.early_stopping_min_delta,
             "output_layout": {
                 "training": "training/epoch_XXX/",
                 "evaluations": "evaluations/epoch_XXX/{standalone,skills}/",
@@ -782,9 +940,11 @@ class TrainingEvaluationWorkflow:
             if not isinstance(existing_manifest, dict):
                 raise ValueError("续训 history.json 缺少合法 manifest")
             _validate_resume_manifest(existing_manifest, manifest)
-            if float(manifest["total_epochs"]) > float(
-                existing_manifest.get("total_epochs", 0)
-            ) + 1e-9:
+            if (
+                previous_status != "early_stopped"
+                and float(manifest["total_epochs"])
+                > float(existing_manifest.get("total_epochs", 0)) + 1e-9
+            ):
                 # 原来的“最终技能评测”现在只是一个中间 epoch 记录，腾出稳定标签给新终点。
                 for row in resume_state.get("stages", []):
                     if not isinstance(row, dict):
@@ -801,12 +961,62 @@ class TrainingEvaluationWorkflow:
             manifest,
             resume_state=resume_state,
         )
+        monitor = SuccessRateEarlyStopping(
+            patience=options.early_stopping_patience,
+            min_delta=options.early_stopping_min_delta,
+        )
+        # history 中只有 standalone 行参与早退；技能库 SR 不能与裸模型曲线混用。
+        for row in recorder.state["stages"]:
+            if not isinstance(row, dict) or row.get("mode") != "standalone":
+                continue
+            label = str(row.get("label", ""))
+            if label != "baseline_standalone" and float(row.get("epoch", 0)) <= 0:
+                continue
+            monitor.observe(
+                epoch=float(row.get("epoch", 0)),
+                micro_sr=float(row.get("micro_sr", 0)),
+                checkpoint=(
+                    str(row["checkpoint"]) if row.get("checkpoint") else None
+                ),
+            )
+
+        early_stopped = bool(
+            options.early_stopping_enabled
+            and (
+                previous_status == "early_stopped"
+                or (
+                    monitor.should_stop
+                    and monitor.observations
+                    and float(monitor.observations[-1]["epoch"])
+                    < self.config.offline.epochs - 1e-9
+                )
+            )
+        )
+        stop_epoch: float | None = None
+        if early_stopped:
+            if (
+                isinstance(previous_early, dict)
+                and previous_early.get("stop_epoch") is not None
+            ):
+                stop_epoch = float(previous_early["stop_epoch"])
+            elif monitor.observations:
+                stop_epoch = float(monitor.observations[-1]["epoch"])
+        recorder.record_early_stopping(
+            monitor.to_dict(
+                enabled=options.early_stopping_enabled,
+                stopped=early_stopped,
+                stop_epoch=stop_epoch,
+            )
+        )
+
         checkpoint: Path | None = None
         discovered_checkpoint: Path | None = None
         try:
             discovered_checkpoint = find_latest_adapter_checkpoint(training_output)
         except FileNotFoundError:
             pass
+        if discovered_checkpoint is not None:
+            checkpoint = discovered_checkpoint
         resumed_from_checkpoint = discovered_checkpoint if resume_state else None
         if resume_state is not None:
             logging.info(
@@ -826,21 +1036,22 @@ class TrainingEvaluationWorkflow:
         try:
             missing_baselines = [
                 ("baseline_standalone", False, "standalone"),
-                ("baseline_skills", True, "skills"),
             ]
+            if options.full_evaluation:
+                missing_baselines.append(("baseline_skills", True, "skills"))
             missing_baselines = [
                 item
                 for item in missing_baselines
                 if not recorder.evaluation_recorded(item[0])
             ]
-            if missing_baselines:
+            if missing_baselines and not early_stopped:
                 # 同一次部署补齐尚未完成的基线；已写入 history 的阶段不重复跑。
                 with self.deployment.activate(None) as profile:
                     for label, use_skills, mode in missing_baselines:
                         _archive_interrupted_evaluation(
                             options.output_dir / "evaluations" / "baseline" / mode
                         )
-                        self._evaluate(
+                        row = self._evaluate(
                             recorder=recorder,
                             profile=profile,
                             options=options,
@@ -849,11 +1060,27 @@ class TrainingEvaluationWorkflow:
                             epoch=0.0,
                             checkpoint=None,
                         )
+                        if options.early_stopping_enabled and not use_skills:
+                            monitor.observe(
+                                epoch=0.0,
+                                micro_sr=float(row["micro_sr"]),
+                                checkpoint=None,
+                            )
+                            recorder.record_early_stopping(
+                                monitor.to_dict(
+                                    enabled=True,
+                                    stopped=False,
+                                    stop_epoch=None,
+                                )
+                            )
 
             for stage in plan:
+                if early_stopped:
+                    break
                 target_epoch = stage.target_epoch
                 stage_output = training_output / epoch_label(target_epoch)
                 recorded_checkpoint = recorder.checkpoint_for_epoch(target_epoch)
+                checkpoint_row: dict[str, Any] | None = None
                 if recorder.checkpoint_recorded(target_epoch):
                     # checkpoint 可能已按保留策略删除；后续阶段会使用仍存在的最新项。
                     if recorded_checkpoint is not None:
@@ -912,7 +1139,8 @@ class TrainingEvaluationWorkflow:
                         standalone_label
                     )
                     needs_final_skills = (
-                        stage.final
+                        options.full_evaluation
+                        and stage.final
                         and not recorder.evaluation_recorded("final_skills")
                     )
                     if needs_standalone or needs_final_skills:
@@ -921,6 +1149,7 @@ class TrainingEvaluationWorkflow:
                                 f"epoch {target_epoch:g} 已记录但没有可用 checkpoint"
                             )
                         with self.deployment.activate(checkpoint) as profile:
+                            standalone_row: dict[str, Any] | None = None
                             if needs_standalone:
                                 _archive_interrupted_evaluation(
                                     options.output_dir
@@ -928,7 +1157,7 @@ class TrainingEvaluationWorkflow:
                                     / epoch_label(target_epoch)
                                     / "standalone"
                                 )
-                                self._evaluate(
+                                standalone_row = self._evaluate(
                                     recorder=recorder,
                                     profile=profile,
                                     options=options,
@@ -938,6 +1167,53 @@ class TrainingEvaluationWorkflow:
                                     checkpoint=checkpoint,
                                     final_checkpoint=stage.final,
                                 )
+                                if options.early_stopping_enabled:
+                                    monitor.observe(
+                                        epoch=target_epoch,
+                                        micro_sr=float(standalone_row["micro_sr"]),
+                                        checkpoint=str(checkpoint),
+                                    )
+                                    # 到计划终点自然结束，不把它误报成“提前”停止。
+                                    early_stopped = bool(
+                                        monitor.should_stop and not stage.final
+                                    )
+                                    if early_stopped:
+                                        stop_epoch = target_epoch
+                                        recorder.mark_evaluation_final(standalone_row)
+                                        if checkpoint_row is None:
+                                            checkpoint_row = next(
+                                                (
+                                                    row
+                                                    for row in reversed(
+                                                        recorder.state["checkpoints"]
+                                                    )
+                                                    if math.isclose(
+                                                        float(row.get("epoch", -1)),
+                                                        target_epoch,
+                                                        abs_tol=1e-9,
+                                                    )
+                                                ),
+                                                None,
+                                            )
+                                        if checkpoint_row is not None:
+                                            recorder.mark_checkpoint_retained(
+                                                checkpoint_row
+                                            )
+                                    recorder.record_early_stopping(
+                                        monitor.to_dict(
+                                            enabled=True,
+                                            stopped=early_stopped,
+                                            stop_epoch=stop_epoch,
+                                        )
+                                    )
+                                    if (
+                                        early_stopped
+                                        and options.full_evaluation
+                                        and not recorder.evaluation_recorded(
+                                            "final_skills"
+                                        )
+                                    ):
+                                        needs_final_skills = True
                             if needs_final_skills:
                                 _archive_interrupted_evaluation(
                                     options.output_dir
@@ -956,13 +1232,62 @@ class TrainingEvaluationWorkflow:
                                     checkpoint=checkpoint,
                                     final_checkpoint=True,
                                 )
+            # 进程若在“评测已写入、早退状态尚未收尾”之间中断，续训会从 history
+            # 重建 monitor；这里补齐最终技能评测而不继续训练。
+            if (
+                return_code == 0
+                and early_stopped
+                and options.full_evaluation
+                and checkpoint is not None
+                and not recorder.evaluation_recorded("final_skills")
+            ):
+                final_epoch = stop_epoch or float(
+                    monitor.observations[-1]["epoch"]
+                )
+                final_row = next(
+                    (
+                        row
+                        for row in reversed(recorder.state["stages"])
+                        if row.get("mode") == "standalone"
+                        and math.isclose(
+                            float(row.get("epoch", -1)), final_epoch, abs_tol=1e-9
+                        )
+                    ),
+                    None,
+                )
+                if final_row is not None:
+                    recorder.mark_evaluation_final(final_row)
+                with self.deployment.activate(checkpoint) as profile:
+                    _archive_interrupted_evaluation(
+                        options.output_dir
+                        / "evaluations"
+                        / epoch_label(final_epoch)
+                        / "skills"
+                    )
+                    self._evaluate(
+                        recorder=recorder,
+                        profile=profile,
+                        options=options,
+                        label="final_skills",
+                        use_skills=True,
+                        epoch=final_epoch,
+                        checkpoint=checkpoint,
+                        final_checkpoint=True,
+                    )
             if return_code == 0:
                 for transient, checkpoint_row in transient_checkpoints:
+                    if (
+                        early_stopped
+                        and checkpoint is not None
+                        and transient.resolve() == checkpoint.resolve()
+                    ):
+                        recorder.mark_checkpoint_retained(checkpoint_row)
+                        continue
                     if transient.is_dir():
                         _remove_transient_checkpoint(transient)
                     if checkpoint_row.get("exists", True):
                         recorder.mark_checkpoint_removed(checkpoint_row)
-                recorder.finish("completed")
+                recorder.finish("early_stopped" if early_stopped else "completed")
         except Exception as exc:
             recorder.finish(
                 "failed",
@@ -972,6 +1297,9 @@ class TrainingEvaluationWorkflow:
 
         return TrainingEvaluationResult(
             return_code=return_code,
+            early_stopped=early_stopped,
+            stop_epoch=stop_epoch,
+            best_sr=monitor.best_sr,
             resumed=resume_state is not None,
             resumed_from_checkpoint=resumed_from_checkpoint,
             output_dir=options.output_dir,

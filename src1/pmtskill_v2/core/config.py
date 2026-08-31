@@ -56,8 +56,9 @@ class OfflineConfig:
 class TrainingEvaluationConfig:
     """训练前、中、后的 AndroidWorld 小样本评测配置。
 
-    该功能默认关闭，确保普通 ``train`` 仍然只是一次 ms-swift 训练。启用后会
-    临时部署学生基座或当前 LoRA checkpoint，并在同一组任务上比较 SR。
+    ``enabled`` 控制是否生成完整的模型/技能库评测报告。SR 早退独立配置且默认
+    开启，因此普通 ``train`` 也会在固定小样本上做最低限度的 baseline/逐 epoch
+    standalone probe；显式关闭早退后才退化为一次不访问 emulator 的纯 SFT。
     """
 
     enabled: bool = False
@@ -68,6 +69,11 @@ class TrainingEvaluationConfig:
     combinations: int = 1
     seed: int = 42
     every_epochs: int = 1
+    # 连续 patience 个完整 epoch 的 standalone Micro SR 没有比历史最佳值高出
+    # min_delta（0.01 = 1 个百分点）时停止继续训练。
+    early_stopping_enabled: bool = True
+    early_stopping_patience: int = 3
+    early_stopping_min_delta: float = 0.01
     # 0 仅保留最终 checkpoint；N>0 每 N 个 epoch 永久保留一次。
     checkpoint_every_epochs: int = 1
     include_candidate_skills: bool = False
@@ -236,6 +242,15 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         combinations=int(training_evaluation_raw.get("combinations", 1)),
         seed=int(training_evaluation_raw.get("seed", 42)),
         every_epochs=int(training_evaluation_raw.get("every_epochs", 1)),
+        early_stopping_enabled=bool(
+            training_evaluation_raw.get("early_stopping_enabled", True)
+        ),
+        early_stopping_patience=int(
+            training_evaluation_raw.get("early_stopping_patience", 3)
+        ),
+        early_stopping_min_delta=float(
+            training_evaluation_raw.get("early_stopping_min_delta", 0.01)
+        ),
         checkpoint_every_epochs=int(
             training_evaluation_raw.get("checkpoint_every_epochs", 1)
         ),
@@ -273,6 +288,14 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         raise ValueError("training_evaluation.combinations 必须是正整数")
     if training_evaluation.every_epochs <= 0:
         raise ValueError("training_evaluation.every_epochs 必须是正整数")
+    if training_evaluation.early_stopping_patience <= 0:
+        raise ValueError(
+            "training_evaluation.early_stopping_patience 必须是正整数"
+        )
+    if not 0 <= training_evaluation.early_stopping_min_delta <= 1:
+        raise ValueError(
+            "training_evaluation.early_stopping_min_delta 必须在 [0, 1]"
+        )
     if training_evaluation.checkpoint_every_epochs < 0:
         raise ValueError(
             "training_evaluation.checkpoint_every_epochs 必须是非负整数"

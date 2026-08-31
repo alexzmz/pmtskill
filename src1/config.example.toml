@@ -31,7 +31,7 @@ lora_alpha = 32
 deploy_host = "127.0.0.1"
 deploy_port = 8002
 infer_backend = "vllm"
-# 默认保持 train 为纯训练；CLI 传 --with-evaluation 时临时启用完整评测闭环。
+# 控制是否生成完整的基座/技能库/最终对比报告；SR 早退由下方参数独立控制。
 enabled = false
 # 用这个画像继承模型能力先验；临时服务地址和 served_model 会由框架自动覆盖。
 model_id = "student-qwen3-vl"
@@ -42,7 +42,13 @@ task_count = 30
 combinations = 1
 seed = 42
 # 1 表示每完成一个 epoch 测一次裸模型 SR；改成 2 就每两个 epoch 测一次。
+# 启用早退时为了得到逐 epoch SR，该值会被有效地收紧为 1。
 every_epochs = 1
+# 默认所有 train（包括 --without-evaluation）都进行轻量 SR 早退探测。
+# baseline 作为初始最佳值；连续 3 个 epoch 未提升超过 0.01（1 个百分点）即停止。
+early_stopping_enabled = true
+early_stopping_patience = 3
+early_stopping_min_delta = 0.01
 # 永久保留 checkpoint 的间隔；默认逐 epoch 保留，0 表示只保留最终 checkpoint。
 checkpoint_every_epochs = 1
 include_candidate_skills = false

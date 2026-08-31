@@ -198,8 +198,11 @@ def command_train(args: argparse.Namespace) -> int:
         if args.with_evaluation is not None
         else config.training_evaluation.enabled
     )
+    settings = _training_evaluation_settings(config, args)
+    # 完整评测可关闭，但默认 SR 早退仍需要 baseline/逐 epoch standalone probe。
+    use_staged_workflow = with_evaluation or settings.early_stopping_enabled
     resume_checkpoint = None
-    if args.resume and not with_evaluation:
+    if args.resume and not use_staged_workflow:
         try:
             resume_checkpoint = find_latest_adapter_checkpoint(job.output_dir)
         except FileNotFoundError:
@@ -208,8 +211,15 @@ def command_train(args: argparse.Namespace) -> int:
             job.resume_from_checkpoint = resume_checkpoint
     command = trainer.build_command(job)
     if args.dry_run:
-        if not with_evaluation:
-            _print({"dry_run": True, "job": job.name, "command": command})
+        if not use_staged_workflow:
+            _print(
+                {
+                    "dry_run": True,
+                    "job": job.name,
+                    "command": command,
+                    "early_stopping": {"enabled": False},
+                }
+            )
             return 0
         from .evaluation.deployment import MSSwiftEvaluationDeployment
         from .offline.training_workflow import (
@@ -218,13 +228,12 @@ def command_train(args: argparse.Namespace) -> int:
             resolve_student_profile,
         )
 
-        settings = _training_evaluation_settings(config, args)
         run_dir = _training_evaluation_output_dir(job, args)
         profile = resolve_student_profile(config, settings.model_id)
         deployment = MSSwiftEvaluationDeployment(config, settings, profile)
         plan = build_epoch_plan(
             config.offline.epochs,
-            settings.every_epochs,
+            1 if settings.early_stopping_enabled else settings.every_epochs,
             settings.checkpoint_every_epochs,
         )
         stage_commands = []
@@ -258,7 +267,16 @@ def command_train(args: argparse.Namespace) -> int:
             {
                 "dry_run": True,
                 "job": job.name,
-                "with_android_evaluation": True,
+                "with_android_evaluation": with_evaluation,
+                "evaluation_mode": (
+                    "full" if with_evaluation else "early_stopping_probe_only"
+                ),
+                "early_stopping": {
+                    "enabled": settings.early_stopping_enabled,
+                    "metric": "standalone_micro_sr",
+                    "patience": settings.early_stopping_patience,
+                    "min_delta": settings.early_stopping_min_delta,
+                },
                 "evaluation_output_dir": run_dir,
                 "resume": args.resume,
                 "resuming_existing_run": (run_dir / "history.json").is_file(),
@@ -288,19 +306,19 @@ def command_train(args: argparse.Namespace) -> int:
                 "training_stages": stage_commands,
                 "evaluation_sequence": [
                     "baseline_standalone",
-                    "baseline_skills",
+                    *(["baseline_skills"] if with_evaluation else []),
                     *[
                         f"{epoch_label(stage.target_epoch)}_standalone"
                         for stage in plan
                         if stage.evaluate
                     ],
-                    "final_skills",
+                    *(["final_skills"] if with_evaluation else []),
                 ],
             }
         )
         return 0
-    if with_evaluation:
-        # 延迟导入：关闭该开关时，train 不加载 AndroidWorld 评测模块。
+    if use_staged_workflow:
+        # 完整评测关闭时仍延迟加载早退 probe 所需的 AndroidWorld 模块。
         from .evaluation.android_world import sample_android_world_tasks
         from .evaluation.deployment import MSSwiftEvaluationDeployment
         from .offline.training_workflow import (
@@ -309,7 +327,6 @@ def command_train(args: argparse.Namespace) -> int:
             resolve_student_profile,
         )
 
-        settings = _training_evaluation_settings(config, args)
         run_dir = _training_evaluation_output_dir(job, args)
         resumed_tasks = _resume_evaluation_tasks(run_dir) if args.resume else None
         explicit_tasks = _tasks(args.eval_tasks)
@@ -350,6 +367,10 @@ def command_train(args: argparse.Namespace) -> int:
                 every_epochs=settings.every_epochs,
                 checkpoint_every_epochs=settings.checkpoint_every_epochs,
                 include_candidate_skills=settings.include_candidate_skills,
+                full_evaluation=with_evaluation,
+                early_stopping_enabled=settings.early_stopping_enabled,
+                early_stopping_patience=settings.early_stopping_patience,
+                early_stopping_min_delta=settings.early_stopping_min_delta,
                 training_cuda_visible_devices=(
                     config.offline.cuda_visible_devices
                 ),
@@ -363,7 +384,16 @@ def command_train(args: argparse.Namespace) -> int:
                 resume=args.resume,
             ),
         )
-        _print({"job": job.name, "with_android_evaluation": True, **result.to_dict()})
+        _print(
+            {
+                "job": job.name,
+                "with_android_evaluation": with_evaluation,
+                "evaluation_mode": (
+                    "full" if with_evaluation else "early_stopping_probe_only"
+                ),
+                **result.to_dict(),
+            }
+        )
         return result.return_code
     snapshot_dir = job.output_dir / "dataset_snapshot"
     if resume_checkpoint is not None:
@@ -418,6 +448,21 @@ def _training_evaluation_settings(
             if args.eval_every_epochs is not None
             else current.every_epochs
         ),
+        early_stopping_enabled=(
+            args.early_stopping
+            if args.early_stopping is not None
+            else current.early_stopping_enabled
+        ),
+        early_stopping_patience=(
+            args.early_stopping_patience
+            if args.early_stopping_patience is not None
+            else current.early_stopping_patience
+        ),
+        early_stopping_min_delta=(
+            args.early_stopping_min_delta
+            if args.early_stopping_min_delta is not None
+            else current.early_stopping_min_delta
+        ),
         checkpoint_every_epochs=(
             args.checkpoint_every_epochs
             if args.checkpoint_every_epochs is not None
@@ -456,6 +501,10 @@ def _training_evaluation_settings(
         raise ValueError("--eval-combinations 必须是正整数")
     if resolved.every_epochs <= 0:
         raise ValueError("--eval-every-epochs 必须是正整数")
+    if resolved.early_stopping_patience <= 0:
+        raise ValueError("--early-stopping-patience 必须是正整数")
+    if not 0 <= resolved.early_stopping_min_delta <= 1:
+        raise ValueError("--early-stopping-min-delta 必须在 [0, 1]")
     if resolved.checkpoint_every_epochs < 0:
         raise ValueError("--checkpoint-every-epochs 必须是非负整数")
     if not 1 <= resolved.deploy_port <= 65535:
@@ -746,7 +795,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--without-evaluation",
         dest="with_evaluation",
         action="store_false",
-        help="即使 TOML 默认启用，也只训练、不运行 AndroidWorld",
+        help=(
+            "关闭完整模型/技能库报告；默认仍运行早退所需的轻量 AndroidWorld "
+            "standalone probe，配合 --no-early-stopping 才是纯 SFT"
+        ),
     )
     train.set_defaults(with_evaluation=None)
     train.add_argument(
@@ -769,6 +821,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-every-epochs",
         type=int,
         help="每完成多少个 epoch 做一次裸模型 SR；默认每 1 个",
+    )
+    train.add_argument(
+        "--early-stopping",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "按固定 AndroidWorld 子集的 standalone Micro SR 早退（默认读取 TOML，"
+            "默认启用）；--no-early-stopping 可关闭"
+        ),
+    )
+    train.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        help="连续多少个 epoch 未显著提升后停止，默认 3",
+    )
+    train.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        help="显著提升的绝对 SR 阈值；0.01 表示 1 个百分点",
     )
     train.add_argument(
         "--checkpoint-every-epochs",

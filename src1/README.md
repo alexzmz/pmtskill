@@ -223,9 +223,22 @@ python -m src1 --config src1/config.local.toml train \
 `--extra-arg=--bf16 --extra-arg=true`。训练完成后把 adapter 作为新的 `[[models]]`
 登记，并给出初始能力画像。
 
-### 4.5 可选：训练前、逐 epoch 与训练后 AndroidWorld 评测
+### 4.5 SR 早退与可选的完整 AndroidWorld 评测
 
-普通 `train` 仍然只训练，不会占用 emulator 做 SR 测试。需要完整闭环时显式增加：
+`train` 默认启用基于 AndroidWorld **裸模型 Micro SR** 的早退。框架先在固定抽样任务上
+测试学生基座，之后每完成一个 epoch 部署当前 LoRA checkpoint，在完全相同的任务、seed
+和组合数上再次测试。若连续 3 个 epoch 都没有比历史有效最佳值**高出超过 0.01**
+（1 个百分点），训练立即停止并保留当前 checkpoint。基座 SR 是初始最佳值；恰好提高
+0.01 仍不算“超过 1 个百分点”。这些阈值可以在 TOML 中修改：
+
+```toml
+[training_evaluation]
+early_stopping_enabled = true
+early_stopping_patience = 3
+early_stopping_min_delta = 0.01
+```
+
+默认的轻量路径只运行早退所需的裸模型评测，不运行技能库对比。需要完整闭环时显式增加：
 
 ```bash
 python -m src1 --config src1/config.local.toml train \
@@ -237,7 +250,7 @@ python -m src1 --config src1/config.local.toml train \
   --eval-seed 42
 ```
 
-这条命令严格复用同一批任务、同一 seed 和同一组合数，顺序为：
+完整评测同样使用上述早退，并严格复用同一批任务、同一 seed 和同一组合数，顺序为：
 
 1. 学生基座裸模型（原生 M3A，不使用技能库）；
 2. 同一个学生基座 + 当前技能库；
@@ -258,17 +271,34 @@ checkpoint symlink 参数；同时显式设置 `load_args=false`、`load_data_ar
 `dataset_dir`；缺失或损坏的图片会在预检报告中记录，只剔除完全没有可读图片的样本。
 之后所有训练阶段只使用这份固定索引，不会回退到默认 `./runtime/dataset`。
 
-若希望明确只训练（包括 TOML 中设置了 `enabled = true` 的情况），使用：
+`--without-evaluation` 只关闭基座/最终 checkpoint 的技能库对比报告，默认仍保留 SR
+早退探测：
 
 ```bash
 python -m src1 --config src1/config.local.toml train --without-evaluation
+```
+
+若希望完全不访问 AndroidWorld/emulator、只运行一次纯 SFT（包括 TOML 中设置了
+`enabled = true` 的情况），必须同时关闭两项：
+
+```bash
+python -m src1 --config src1/config.local.toml train \
+  --without-evaluation --no-early-stopping
+```
+
+也可临时覆盖阈值：
+
+```bash
+python -m src1 --config src1/config.local.toml train \
+  --early-stopping-patience 3 \
+  --early-stopping-min-delta 0.01
 ```
 
 可用 `--eval-tasks TaskA TaskB` 代替随机抽样；不传时读取
 `[training_evaluation].task_count`，推荐 20～50。先用 `--dry-run --with-evaluation`
 可以查看全部分段训练命令、部署命令和评测顺序而不启动 GPU/emulator。
 
-首次带评测训练使用独立目录；再次对同名 adapter 执行命令会自动复用最近一次运行目录
+首次带评测或早退探测的训练使用独立目录；再次对同名 adapter 执行命令会自动复用最近一次运行目录
 和原 `dataset_snapshot`，从其中最新的完整 checkpoint 恢复。`history.json` 已记录的
 基线、epoch 训练和评测不会重复执行；若原计划已经完成且总 epoch 没有增加，这次调用
 会直接返回已有结果；提高 TOML 中的 `offline.epochs` 后则继续训练新增 epoch。若上次
@@ -283,7 +313,7 @@ python -m src1 --config src1/config.local.toml train --without-evaluation
 runtime/checkpoints/<adapter>/training_runs/<time>/
 ├── sample_manifest.json              # 固定任务、seed、计划 episode 数
 ├── training_stage_commands.json      # 各累计 epoch 的命令与恢复来源
-├── history.json                      # 完整机器可读 SR 历史和最佳 checkpoint
+├── history.json                      # SR 历史、早退判定、停止 epoch 和最佳 checkpoint
 ├── history.csv                       # 方便表格/画图的 SR 曲线
 ├── comparison.md                     # 基座、逐 epoch、最终技能增益总览
 ├── checkpoints.json                  # epoch→checkpoint、是否永久保留
@@ -302,7 +332,9 @@ runtime/checkpoints/<adapter>/training_runs/<time>/
         └── skills/                   # 最终 checkpoint + 技能库
 ```
 
-周期评测阶段只测裸模型；最终阶段再测一次技能库，减少 emulator 时间。训练评测产生
+启用早退时，即使 `every_epochs` 大于 1，裸模型探测也会自动收紧为每个 epoch 一次，
+否则无法正确计算连续未提升次数。完整评测的周期阶段只测裸模型，最终阶段再测一次技能库；
+轻量路径则始终不测技能库。训练评测产生
 的 trace 不会写回技能数据库，避免测试集结果污染在线路由统计。
 
 AndroidWorld 把任务初始化异常保存成 `episode_data = NaN` 等标量时，评测后处理会将其

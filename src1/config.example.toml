@@ -28,10 +28,23 @@ lora_alpha = 32
 # ms-swift SFT 使用的物理 GPU；多卡可写成 "2,3"。不设置则继承当前 shell。
 # cuda_visible_devices = "2"
 
+[android_world]
+console_port = 5554
+adb_path = "adb"
+emulator_setup = false
+# 每个 episode 最多 50 步；collector 还会在运行时强制执行这一硬上限。
+max_steps = 50
+stop_on_task_success = true
+wait_after_action_seconds = 1.0
+# a11y/ADB 失效后先恢复网络和转发；仍失败则重启 emulator guest 并重试当前 task。
+# 0 表示关闭自动恢复。恢复耗尽时立即停止评测，避免后续任务全部空跑。
+infrastructure_recovery_attempts = 1
+recovery_timeout_seconds = 180.0
+recovery_poll_seconds = 2.0
+
 [training_evaluation]
-# 训练进程退出后，框架在该端口临时执行 swift deploy，评测完立即回收。
-deploy_host = "127.0.0.1"
 deploy_port = 8002
+deploy_host = "127.0.0.1"
 infer_backend = "vllm"
 # 控制是否生成完整的基座/技能库/最终对比报告；SR 早退由下方参数独立控制。
 enabled = false
@@ -86,20 +99,6 @@ baseline_margin = 0.02
 # 取消注释后，backend 每轮会用该模型编译一批 SKVM raw skills。
 # raw_skill_compiler_model_id = "teacher-glm-vl"
 raw_skill_compile_batch_size = 8
-
-[android_world]
-adb_path = "adb"
-console_port = 5554
-emulator_setup = false
-# 每个 episode 最多 50 步；collector 还会在运行时强制执行这一硬上限。
-max_steps = 50
-stop_on_task_success = true
-wait_after_action_seconds = 1.0
-# a11y/ADB 失效后先恢复网络和转发；仍失败则重启 emulator guest 并重试当前 task。
-# 0 表示关闭自动恢复。恢复耗尽时立即停止评测，避免后续任务全部空跑。
-infrastructure_recovery_attempts = 1
-recovery_timeout_seconds = 180.0
-recovery_poll_seconds = 2.0
 
 [[models]]
 model_id = "teacher-deepseek-v4-flash"

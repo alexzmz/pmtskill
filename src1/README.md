@@ -225,7 +225,7 @@ python -m src1 --config src1/config.local.toml train \
 
 ### 4.5 SR 早退与可选的完整 AndroidWorld 评测
 
-`train` 默认启用基于 AndroidWorld **裸模型 Micro SR** 的早退。框架先在固定抽样任务上
+`train` 默认启用基于 AndroidWorld **裸模型 Micro SR** 的早退。框架先在固定任务集上
 测试学生基座，之后每完成一个 epoch 部署当前 LoRA checkpoint，在完全相同的任务、seed
 和组合数上再次测试。若连续 3 个 epoch 都没有比历史有效最佳值**高出超过 0.01**
 （1 个百分点），训练立即停止并保留当前 checkpoint。基座 SR 是初始最佳值；恰好提高
@@ -244,7 +244,7 @@ early_stopping_min_delta = 0.01
 python -m src1 --config src1/config.local.toml train \
   --adapter-name android_world_all \
   --with-evaluation \
-  --eval-task-count 30 \
+  --eval-max-steps 30 \
   --eval-every-epochs 1 \
   --checkpoint-every-epochs 1 \
   --eval-seed 42
@@ -294,9 +294,12 @@ python -m src1 --config src1/config.local.toml train \
   --early-stopping-min-delta 0.01
 ```
 
-可用 `--eval-tasks TaskA TaskB` 代替随机抽样；不传时读取
-`[training_evaluation].task_count`，推荐 20～50。先用 `--dry-run --with-evaluation`
-可以查看全部分段训练命令、部署命令和评测顺序而不启动 GPU/emulator。
+默认评测 AndroidWorld family 的全部任务，每个 episode 最多 30 步。可用
+`--eval-tasks TaskA TaskB` 显式选择任务，或用 `--eval-task-count 30` 按 seed 固定
+抽样；`--eval-max-steps N` 可覆盖步数上限。对应 TOML 参数是可选的
+`training_evaluation.task_count` 和默认值为 30 的 `training_evaluation.max_steps`。
+先用 `--dry-run --with-evaluation` 可以查看全部分段训练命令、部署命令和评测顺序而不
+启动 GPU/emulator。
 
 首次带评测或早退探测的训练使用独立目录；再次对同名 adapter 执行命令会自动复用最近一次运行目录
 和原 `dataset_snapshot`，从其中最新的完整 checkpoint 恢复。`history.json` 已记录的
@@ -372,6 +375,7 @@ cuda_visible_devices = "2"
 [training_evaluation]
 # 物理 GPU 1 专用于基座/checkpoint 的临时评测服务。
 cuda_visible_devices = "1"
+max_steps = 30
 max_model_len = 32768
 gpu_memory_utilization = 0.90
 ```
@@ -463,7 +467,7 @@ python -m src1 --config src1/config.local.toml evaluate-standalone \
   --adapter-path ./runtime/checkpoints/android_world_all \
   --model-id android-world-all \
   --tasks ContactsAddContact SimpleCalendarAddOneEvent \
-  --combinations 5 --seed 42
+  --combinations 5 --seed 42 --max-steps 30
 ```
 
 ### 6.2 简单技能：单 adapter + 单技能关键词检索
@@ -476,7 +480,7 @@ python -m src1 --config src1/config.local.toml evaluate-simple-skills \
   --adapter-path ./runtime/checkpoints/android_world_all \
   --model-id android-world-all \
   --skill-database ./runtime/skill_library.sqlite3 \
-  --task-count 30 --combinations 1 --seed 42
+  --combinations 1 --seed 42 --max-steps 30
 ```
 
 默认只使用 Android 相关 raw skills 和 active polished skills；加
@@ -494,7 +498,7 @@ python -m src1 --config src1/config.local.toml evaluate-pmtskill \
     ./runtime/checkpoints/planning \
   --adapter-model-ids ui-grounding planning \
   --skill-database ./runtime/skill_library.sqlite3 \
-  --task-count 30 --combinations 1 --seed 42 \
+  --combinations 1 --seed 42 --max-steps 30 \
   --planner-model planning
 ```
 
@@ -517,9 +521,10 @@ python -m src1 --config src1/config.local.toml evaluate-pmtskill \
 
 三种接口还共同支持 `--base-model-path`、`--deploy-host`、`--deploy-port`、
 `--cuda-visible-devices`、`--infer-backend`、`--max-model-len`、
-`--gpu-memory-utilization`、`--max-new-tokens`、`--deploy-extra-arg` 和 `--dry-run`。
+`--gpu-memory-utilization`、`--max-new-tokens`、`--max-steps`、
+`--deploy-extra-arg` 和 `--dry-run`。`--max-steps` 默认 30，并会写入评测报告元数据。
 多 adapter 路由当前要求 `vllm`。未传 `--tasks` 时，`--task-count N` 会按 seed 固定
-抽样；二者都不传则运行整个 family。
+抽样；二者都不传则运行整个 family 的全部任务。
 
 为避免基准测试反向污染技能统计，后两种接口默认不把 trace 写回 SQLite；确实要交给
 backend 维护时显式增加 `--record-traces`。候选 polished skill 默认不参与正式评测，

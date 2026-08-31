@@ -47,6 +47,15 @@ from .recovery import (
 )
 
 
+DEFAULT_EVALUATION_MAX_STEPS = 30
+
+
+def _evaluation_max_steps(value: int) -> int:
+    if value <= 0:
+        raise ValueError("评测 max_steps 必须是正整数")
+    return value
+
+
 def _extract_route_metadata(raw: Any) -> dict[str, Any]:
     if isinstance(raw, Mapping):
         value = raw.get("_pmtskill", {})
@@ -123,19 +132,19 @@ def sample_android_world_tasks(
     config: ProjectConfig,
     *,
     tasks: Sequence[str] | None,
-    task_count: int,
+    task_count: int | None,
     seed: int,
     family: str = "android_world",
 ) -> list[str]:
     """解析一组固定评测任务，供所有训练阶段公平复用。
 
-    显式传入任务时保留用户顺序且仅去重；未传入时从 family 的完整注册表中
-    按 seed 抽样。这里只读取任务注册表，不会连接 emulator。
+    显式传入任务时保留用户顺序且仅去重；未传入且 task_count 为 ``None`` 时
+    返回 family 全部任务，否则按 seed 抽样。这里只读取任务注册表，不连接 emulator。
     """
 
     if tasks:
         return list(dict.fromkeys(str(item) for item in tasks))
-    if task_count <= 0:
+    if task_count is not None and task_count <= 0:
         raise ValueError("评测 task_count 必须是正整数")
     bootstrap_android_world(config.paths.android_world_root)
     from android_world import registry
@@ -143,6 +152,8 @@ def sample_android_world_tasks(
     available = sorted(registry.TaskRegistry().get_registry(family=family))
     if not available:
         raise ValueError(f"AndroidWorld family 没有可评测任务: {family}")
+    if task_count is None:
+        return available
     count = min(task_count, len(available))
     return sorted(random.Random(seed).sample(available, count))
 
@@ -161,8 +172,10 @@ class AndroidWorldStandaloneEvaluator:
         n_task_combinations: int = 1,
         seed: int = 42,
         family: str = "android_world",
+        max_steps: int = DEFAULT_EVALUATION_MAX_STEPS,
         output_dir: str | Path | None = None,
     ) -> EvaluationArtifacts:
+        max_steps = _evaluation_max_steps(max_steps)
         bootstrap_android_world(self.config.paths.android_world_root)
         from android_world import checkpointer as checkpointer_lib
         from android_world import registry, suite_utils
@@ -218,7 +231,7 @@ class AndroidWorldStandaloneEvaluator:
                     ),
                     demo_mode=False,
                     return_full_episode_data=True,
-                    max_n_steps_override=self.config.android_world.max_steps,
+                    max_n_steps_override=max_steps,
                     stop_on_task_success=self.config.android_world.stop_on_task_success,
                 )
             ensure_valid_evaluation_episodes(
@@ -246,7 +259,7 @@ class AndroidWorldStandaloneEvaluator:
                 "tasks": list(tasks) if tasks else "all",
                 "n_task_combinations": n_task_combinations,
                 "seed": seed,
-                "max_steps": self.config.android_world.max_steps,
+                "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
                 "episode_storage": "compact_without_screenshots",
             },
@@ -286,10 +299,12 @@ class AndroidWorldSimpleSkillEvaluator:
         n_task_combinations: int = 1,
         seed: int = 42,
         family: str = "android_world",
+        max_steps: int = DEFAULT_EVALUATION_MAX_STEPS,
         include_candidate_skills: bool = False,
         output_dir: str | Path | None = None,
         record_traces: bool = False,
     ) -> EvaluationArtifacts:
+        max_steps = _evaluation_max_steps(max_steps)
         bootstrap_android_world(self.config.paths.android_world_root)
         from android_world import checkpointer as checkpointer_lib
         from android_world import registry, suite_utils
@@ -356,7 +371,7 @@ class AndroidWorldSimpleSkillEvaluator:
                     ),
                     demo_mode=False,
                     return_full_episode_data=True,
-                    max_n_steps_override=self.config.android_world.max_steps,
+                    max_n_steps_override=max_steps,
                     stop_on_task_success=self.config.android_world.stop_on_task_success,
                 )
             ensure_valid_evaluation_episodes(
@@ -390,7 +405,7 @@ class AndroidWorldSimpleSkillEvaluator:
                 "tasks": list(tasks) if tasks else "all",
                 "n_task_combinations": n_task_combinations,
                 "seed": seed,
-                "max_steps": self.config.android_world.max_steps,
+                "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
                 "episode_storage": "compact_without_screenshots",
             },
@@ -427,12 +442,14 @@ class AndroidWorldOnlineEvaluator:
         n_task_combinations: int = 1,
         seed: int = 42,
         family: str = "android_world",
+        max_steps: int = DEFAULT_EVALUATION_MAX_STEPS,
         planner_model_id: str | None = None,
         include_candidate_skills: bool = False,
         output_dir: str | Path | None = None,
         model_profiles: Sequence[ModelProfile] | None = None,
         record_traces: bool = True,
     ) -> EvaluationArtifacts:
+        max_steps = _evaluation_max_steps(max_steps)
         bootstrap_android_world(self.config.paths.android_world_root)
         from android_world import checkpointer as checkpointer_lib
         from android_world import registry, suite_utils
@@ -520,7 +537,7 @@ class AndroidWorldOnlineEvaluator:
                     checkpointer=checkpointer_lib.IncrementalCheckpointer(str(checkpoint_dir)),
                     demo_mode=False,
                     return_full_episode_data=True,
-                    max_n_steps_override=self.config.android_world.max_steps,
+                    max_n_steps_override=max_steps,
                     stop_on_task_success=self.config.android_world.stop_on_task_success,
                 )
             ensure_valid_evaluation_episodes(
@@ -556,7 +573,7 @@ class AndroidWorldOnlineEvaluator:
                 },
                 "skill_database": str(self.store.database.resolve()),
                 "record_traces": record_traces,
-                "max_steps": self.config.android_world.max_steps,
+                "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
                 "episode_storage": "compact_without_screenshots",
             },

@@ -56,7 +56,7 @@ class OfflineConfig:
 
 @dataclasses.dataclass(slots=True)
 class TrainingEvaluationConfig:
-    """训练前、中、后的 AndroidWorld 小样本评测配置。
+    """训练前、中、后的 AndroidWorld 评测配置。
 
     ``enabled`` 控制是否生成完整的模型/技能库评测报告。SR 早退独立配置且默认
     开启，因此普通 ``train`` 也会在固定小样本上做最低限度的 baseline/逐 epoch
@@ -67,9 +67,11 @@ class TrainingEvaluationConfig:
     model_id: str | None = None
     family: str = "android_world"
     tasks: tuple[str, ...] = ()
-    task_count: int = 30
+    # None 表示评测 family 中的全部任务；正整数才表示固定抽样。
+    task_count: int | None = None
     combinations: int = 1
     seed: int = 42
+    max_steps: int = 30
     every_epochs: int = 1
     # 连续 patience 个完整 epoch 的 standalone Micro SR 没有比历史最佳值高出
     # min_delta（0.01 = 1 个百分点）时停止继续训练。
@@ -244,9 +246,14 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         ),
         family=str(training_evaluation_raw.get("family", "android_world")),
         tasks=tuple(str(item) for item in training_evaluation_raw.get("tasks", ())),
-        task_count=int(training_evaluation_raw.get("task_count", 30)),
+        task_count=(
+            int(training_evaluation_raw["task_count"])
+            if training_evaluation_raw.get("task_count") is not None
+            else None
+        ),
         combinations=int(training_evaluation_raw.get("combinations", 1)),
         seed=int(training_evaluation_raw.get("seed", 42)),
+        max_steps=int(training_evaluation_raw.get("max_steps", 30)),
         every_epochs=int(training_evaluation_raw.get("every_epochs", 1)),
         early_stopping_enabled=bool(
             training_evaluation_raw.get("early_stopping_enabled", True)
@@ -288,10 +295,15 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
             str(item) for item in training_evaluation_raw.get("deploy_extra_args", ())
         ),
     )
-    if training_evaluation.task_count <= 0:
+    if (
+        training_evaluation.task_count is not None
+        and training_evaluation.task_count <= 0
+    ):
         raise ValueError("training_evaluation.task_count 必须是正整数")
     if training_evaluation.combinations <= 0:
         raise ValueError("training_evaluation.combinations 必须是正整数")
+    if training_evaluation.max_steps <= 0:
+        raise ValueError("training_evaluation.max_steps 必须是正整数")
     if training_evaluation.every_epochs <= 0:
         raise ValueError("training_evaluation.every_epochs 必须是正整数")
     if training_evaluation.early_stopping_patience <= 0:

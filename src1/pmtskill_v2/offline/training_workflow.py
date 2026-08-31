@@ -213,6 +213,7 @@ class TrainingEvaluationOptions:
     family: str = "android_world"
     combinations: int = 1
     seed: int = 42
+    max_steps: int = 30
     every_epochs: int = 1
     checkpoint_every_epochs: int = 1
     include_candidate_skills: bool = False
@@ -294,6 +295,7 @@ class StageEvaluator(Protocol):
         combinations: int,
         seed: int,
         family: str,
+        max_steps: int,
         include_candidate_skills: bool,
         output_dir: Path,
     ) -> EvaluationArtifacts: ...
@@ -315,6 +317,7 @@ class AndroidWorldTrainingStageEvaluator:
         combinations: int,
         seed: int,
         family: str,
+        max_steps: int,
         include_candidate_skills: bool,
         output_dir: Path,
     ) -> EvaluationArtifacts:
@@ -330,6 +333,7 @@ class AndroidWorldTrainingStageEvaluator:
                 n_task_combinations=combinations,
                 seed=seed,
                 family=family,
+                max_steps=max_steps,
                 include_candidate_skills=include_candidate_skills,
                 output_dir=output_dir,
                 model_profiles=(profile,),
@@ -342,6 +346,7 @@ class AndroidWorldTrainingStageEvaluator:
             n_task_combinations=combinations,
             seed=seed,
             family=family,
+            max_steps=max_steps,
             output_dir=output_dir,
         )
 
@@ -602,6 +607,7 @@ class TrainingEvaluationRecorder:
             f"- 固定任务数：**{len(manifest['tasks'])}**",
             f"- 每任务组合数：**{manifest['combinations']}**",
             f"- 随机种子：**{manifest['seed']}**",
+            f"- 每个评测 episode 步数上限：**{manifest.get('evaluation_max_steps', 30)}**",
             "- 所有行使用同一任务列表与 seed，训练评测轨迹不会写回技能库。",
         ]
         early = self.state.get("early_stopping")
@@ -746,6 +752,12 @@ def _validate_resume_manifest(
         for field in immutable_fields
         if existing.get(field) != current.get(field)
     ]
+    if (
+        "evaluation_max_steps" in existing
+        and existing.get("evaluation_max_steps")
+        != current.get("evaluation_max_steps")
+    ):
+        mismatched.append("evaluation_max_steps")
     if mismatched:
         raise ValueError(
             "续训配置与原运行不一致: "
@@ -826,6 +838,7 @@ class TrainingEvaluationWorkflow:
             combinations=options.combinations,
             seed=options.seed,
             family=options.family,
+            max_steps=options.max_steps,
             include_candidate_skills=options.include_candidate_skills,
             output_dir=options.output_dir / "evaluations" / stage / mode,
         )
@@ -845,6 +858,8 @@ class TrainingEvaluationWorkflow:
             raise ValueError("训练评测任务列表不能为空")
         if options.combinations <= 0:
             raise ValueError("训练评测 combinations 必须是正整数")
+        if options.max_steps <= 0:
+            raise ValueError("训练评测 max_steps 必须是正整数")
         if options.early_stopping_patience <= 0:
             raise ValueError("early_stopping_patience 必须是正整数")
         if not 0 <= options.early_stopping_min_delta <= 1:
@@ -905,6 +920,7 @@ class TrainingEvaluationWorkflow:
             "planned_episodes_per_stage": len(options.tasks)
             * options.combinations,
             "seed": options.seed,
+            "evaluation_max_steps": options.max_steps,
             "every_epochs": options.every_epochs,
             "effective_evaluation_every_epochs": effective_every_epochs,
             "checkpoint_every_epochs": options.checkpoint_every_epochs,

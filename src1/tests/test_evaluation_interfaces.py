@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from src1.pmtskill_v2.cli import build_parser
 from src1.pmtskill_v2.core.config import load_config
@@ -17,6 +21,12 @@ from src1.pmtskill_v2.evaluation.adapters import (
     AdapterDeploymentBinding,
     MSSwiftAdapterDeployment,
     resolve_adapter_checkpoint,
+)
+from src1.pmtskill_v2.evaluation.android_world import (
+    AndroidWorldOnlineEvaluator,
+    AndroidWorldSimpleSkillEvaluator,
+    AndroidWorldStandaloneEvaluator,
+    sample_android_world_tasks,
 )
 from src1.pmtskill_v2.online.executor import SimpleSkillVLWrapper
 
@@ -44,6 +54,13 @@ class _FakeVLClient:
 
 
 class EvaluationInterfacesTest(unittest.TestCase):
+    def test_example_config_defaults_training_evaluation_to_all_tasks(self):
+        config = load_config(Path(__file__).parents[1] / "config.example.toml")
+
+        self.assertEqual(config.training_evaluation.tasks, ())
+        self.assertIsNone(config.training_evaluation.task_count)
+        self.assertEqual(config.training_evaluation.max_steps, 30)
+
     def test_resolver_selects_latest_run_last_epoch_best_and_training_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "wifi-adapter"
@@ -178,6 +195,59 @@ class EvaluationInterfacesTest(unittest.TestCase):
         self.assertEqual(online.routing_switch_weight, 0.2)
         self.assertTrue(online.record_traces)
         self.assertEqual(legacy_alias.handler.__name__, "command_evaluate_pmtskill")
+        self.assertIsNone(standalone.tasks)
+        self.assertIsNone(standalone.task_count)
+        self.assertEqual(standalone.max_steps, 30)
+        self.assertEqual(simple.max_steps, 30)
+        self.assertEqual(online.max_steps, 30)
+        self.assertEqual(legacy_alias.max_steps, 30)
+
+        limited = parser.parse_args(
+            [
+                "evaluate-standalone",
+                "--adapter-path",
+                "adapter-a",
+                "--task-count",
+                "12",
+                "--max-steps",
+                "17",
+            ]
+        )
+        self.assertEqual(limited.task_count, 12)
+        self.assertEqual(limited.max_steps, 17)
+
+    def test_all_evaluator_apis_default_to_thirty_steps(self):
+        for evaluator in (
+            AndroidWorldStandaloneEvaluator,
+            AndroidWorldSimpleSkillEvaluator,
+            AndroidWorldOnlineEvaluator,
+        ):
+            parameter = inspect.signature(evaluator.run).parameters["max_steps"]
+            self.assertEqual(parameter.default, 30)
+
+    def test_task_sampler_returns_all_tasks_when_count_is_omitted(self):
+        fake_registry = types.SimpleNamespace(
+            TaskRegistry=lambda: types.SimpleNamespace(
+                get_registry=lambda family: {
+                    "TaskC": object(),
+                    "TaskA": object(),
+                    "TaskB": object(),
+                }
+            )
+        )
+        fake_android_world = types.ModuleType("android_world")
+        fake_android_world.registry = fake_registry
+        with mock.patch(
+            "src1.pmtskill_v2.evaluation.android_world.bootstrap_android_world"
+        ), mock.patch.dict(sys.modules, {"android_world": fake_android_world}):
+            tasks = sample_android_world_tasks(
+                mock.Mock(),
+                tasks=None,
+                task_count=None,
+                seed=42,
+            )
+
+        self.assertEqual(tasks, ["TaskA", "TaskB", "TaskC"])
 
 
 if __name__ == "__main__":

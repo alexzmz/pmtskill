@@ -200,6 +200,7 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"- 任务：`{json.dumps(metadata.get('tasks', 'all'), ensure_ascii=False)}`",
         f"- 组合数 / seed：`{metadata.get('n_task_combinations', 1)}` / "
         f"`{metadata.get('seed', 42)}`",
+        f"- 每个 episode 步数上限：`{metadata.get('max_steps', 30)}`",
     ]
     checkpoints = metadata.get("evaluation_checkpoints")
     if isinstance(checkpoints, Mapping):

@@ -51,11 +51,14 @@ enabled = false
 # 用这个画像继承模型能力先验；临时服务地址和 served_model 会由框架自动覆盖。
 model_id = "student-qwen3-vl"
 family = "android_world"
-# 留空表示从 family 中按 seed 固定抽样；也可写成 ["TaskA", "TaskB"]。
+# 留空表示评测 family 中的全部任务；也可写成 ["TaskA", "TaskB"]。
 tasks = []
-task_count = 30
+# 只有需要固定抽样时才设置，例如 task_count = 30；省略即全部任务。
+# task_count = 30
 combinations = 1
 seed = 42
+# 每个评测 episode 的硬步数上限。
+max_steps = 30
 # 1 表示每完成一个 epoch 测一次裸模型 SR；改成 2 就每两个 epoch 测一次。
 # 启用早退时为了得到逐 epoch SR，该值会被有效地收紧为 1。
 every_epochs = 1

@@ -10,7 +10,11 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from src1.pmtskill_v2.cli import _training_evaluation_output_dir, build_parser
+from src1.pmtskill_v2.cli import (
+    _training_evaluation_output_dir,
+    _training_evaluation_settings,
+    build_parser,
+)
 from src1.pmtskill_v2.core.config import (
     AndroidWorldConfig,
     MaintenanceConfig,
@@ -119,6 +123,7 @@ class _FakeDeployment:
 class _FakeEvaluator:
     def __init__(self):
         self.calls: list[tuple[bool, str | None]] = []
+        self.max_steps: list[int] = []
 
     def run(self, **kwargs):
         profile = kwargs["profile"]
@@ -126,6 +131,7 @@ class _FakeEvaluator:
         output_dir = Path(kwargs["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         self.calls.append((use_skills, profile.adapter))
+        self.max_steps.append(kwargs["max_steps"])
         epoch = 0.0
         if profile.adapter:
             epoch = int(Path(profile.adapter).name.split("-")[-1]) / 10
@@ -382,6 +388,7 @@ class TrainingEvaluationTest(unittest.TestCase):
             )
 
             self.assertEqual(result.return_code, 0)
+            self.assertEqual(set(evaluator.max_steps), {30})
             self.assertEqual(len(trainer.jobs), 2)
             self.assertIsNone(trainer.jobs[0].resume_from_checkpoint)
             self.assertEqual(
@@ -848,6 +855,8 @@ class TrainingEvaluationTest(unittest.TestCase):
                 "1",
                 "--eval-max-model-len",
                 "32768",
+                "--eval-max-steps",
+                "19",
                 "--checkpoint-every-epochs",
                 "2",
             ]
@@ -865,11 +874,17 @@ class TrainingEvaluationTest(unittest.TestCase):
             ]
         )
         self.assertIsNone(plain.with_evaluation)
+        self.assertIsNone(plain.eval_task_count)
+        self.assertIsNone(plain.eval_max_steps)
+        defaults = _training_evaluation_settings(_config(Path(".")), plain)
+        self.assertIsNone(defaults.task_count)
+        self.assertEqual(defaults.max_steps, 30)
         self.assertTrue(enabled.with_evaluation)
         self.assertEqual(enabled.eval_task_count, 24)
         self.assertEqual(enabled.train_cuda_visible_devices, "2")
         self.assertEqual(enabled.eval_cuda_visible_devices, "1")
         self.assertEqual(enabled.eval_max_model_len, 32768)
+        self.assertEqual(enabled.eval_max_steps, 19)
         self.assertEqual(enabled.checkpoint_every_epochs, 2)
         self.assertTrue(enabled.resume)
         self.assertFalse(build_parser().parse_args(["train", "--no-resume"]).resume)

@@ -292,16 +292,21 @@ def command_train(args: argparse.Namespace) -> int:
                     "evaluation_cuda_visible_devices": (
                         settings.cuda_visible_devices
                     ),
+                    "evaluation_max_steps": settings.max_steps,
                     "evaluation_max_model_len": settings.max_model_len,
                     "evaluation_gpu_memory_utilization": (
                         settings.gpu_memory_utilization
                     ),
                 },
-                "tasks": selected_tasks or {
-                    "sample_count": settings.task_count,
-                    "seed": settings.seed,
-                    "family": settings.family,
-                },
+                "tasks": selected_tasks or (
+                    "all"
+                    if settings.task_count is None
+                    else {
+                        "sample_count": settings.task_count,
+                        "seed": settings.seed,
+                        "family": settings.family,
+                    }
+                ),
                 "baseline_deploy_command": deployment.build_command(None),
                 "checkpoint_deploy_command_template": deployment.build_command(
                     Path("CHECKPOINT_FROM_PREVIOUS_STAGE")
@@ -367,6 +372,7 @@ def command_train(args: argparse.Namespace) -> int:
                 family=settings.family,
                 combinations=settings.combinations,
                 seed=settings.seed,
+                max_steps=settings.max_steps,
                 every_epochs=settings.every_epochs,
                 checkpoint_every_epochs=settings.checkpoint_every_epochs,
                 include_candidate_skills=settings.include_candidate_skills,
@@ -394,6 +400,7 @@ def command_train(args: argparse.Namespace) -> int:
                 "evaluation_mode": (
                     "full" if with_evaluation else "early_stopping_probe_only"
                 ),
+                "evaluation_max_steps": settings.max_steps,
                 **result.to_dict(),
             }
         )
@@ -446,6 +453,11 @@ def _training_evaluation_settings(
             else current.combinations
         ),
         seed=args.eval_seed if args.eval_seed is not None else current.seed,
+        max_steps=(
+            args.eval_max_steps
+            if args.eval_max_steps is not None
+            else current.max_steps
+        ),
         every_epochs=(
             args.eval_every_epochs
             if args.eval_every_epochs is not None
@@ -498,12 +510,14 @@ def _training_evaluation_settings(
             else current.cuda_visible_devices
         ),
     )
-    if resolved.task_count <= 0:
+    if resolved.task_count is not None and resolved.task_count <= 0:
         raise ValueError("--eval-task-count 必须是正整数")
     if resolved.combinations <= 0:
         raise ValueError("--eval-combinations 必须是正整数")
     if resolved.every_epochs <= 0:
         raise ValueError("--eval-every-epochs 必须是正整数")
+    if resolved.max_steps <= 0:
+        raise ValueError("--eval-max-steps 必须是正整数")
     if resolved.early_stopping_patience <= 0:
         raise ValueError("--early-stopping-patience 必须是正整数")
     if not 0 <= resolved.early_stopping_min_delta <= 1:
@@ -681,6 +695,8 @@ def _evaluation_settings(
 ):
     """用 CLI 参数覆盖公共部署配置，三种评测保持完全相同的服务设置。"""
 
+    if args.max_steps <= 0:
+        raise ValueError("--max-steps 必须是正整数")
     current = config.training_evaluation
     resolved = dataclasses.replace(
         current,
@@ -886,6 +902,7 @@ def _dry_evaluation_result(mode: str, deployment, bindings, args) -> int:
             "combinations": args.combinations,
             "seed": args.seed,
             "family": args.family,
+            "max_steps": args.max_steps,
             "output_dir": args.output_dir,
         }
     )
@@ -916,6 +933,7 @@ def command_evaluate_standalone(args: argparse.Namespace) -> int:
             n_task_combinations=args.combinations,
             seed=args.seed,
             family=args.family,
+            max_steps=args.max_steps,
             output_dir=args.output_dir,
         )
     _print(
@@ -954,6 +972,7 @@ def command_evaluate_simple_skills(args: argparse.Namespace) -> int:
             n_task_combinations=args.combinations,
             seed=args.seed,
             family=args.family,
+            max_steps=args.max_steps,
             include_candidate_skills=args.include_candidates,
             output_dir=args.output_dir,
             record_traces=args.record_traces,
@@ -1026,6 +1045,7 @@ def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
             n_task_combinations=args.combinations,
             seed=args.seed,
             family=args.family,
+            max_steps=args.max_steps,
             planner_model_id=args.planner_model,
             include_candidate_skills=args.include_candidates,
             output_dir=args.output_dir,
@@ -1055,6 +1075,12 @@ def _add_common_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--combinations", type=int, default=1, help="每任务参数组合数")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--family", default="android_world")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=30,
+        help="每个 episode 的步数上限；默认 30",
+    )
     parser.add_argument("--output-dir", help="summary/report/traces/checkpoints 输出目录")
     parser.add_argument("--base-model-path", help="覆盖 adapter_config 中记录的基座模型")
     parser.add_argument(
@@ -1222,15 +1248,20 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--eval-tasks",
         nargs="*",
-        help="固定评测任务；不传则按 seed 从 AndroidWorld 抽样",
+        help="固定评测任务；不传且未设置数量时默认全部任务",
     )
     train.add_argument(
         "--eval-task-count",
         type=int,
-        help="未显式指定任务时的抽样数，推荐 20～50",
+        help="未显式指定任务时的抽样数；不传且 TOML 未设置时评测全部任务",
     )
     train.add_argument("--eval-combinations", type=int, help="每个任务的参数组合数")
     train.add_argument("--eval-seed", type=int, help="任务抽样和实例参数随机种子")
+    train.add_argument(
+        "--eval-max-steps",
+        type=int,
+        help="训练期每个评测 episode 的步数上限；默认 30",
+    )
     train.add_argument(
         "--eval-every-epochs",
         type=int,

@@ -9,8 +9,10 @@ from unittest import mock
 from src1.pmtskill_v2.core.config import AndroidWorldConfig
 from src1.pmtskill_v2.evaluation.recovery import (
     AndroidWorldInfrastructureError,
+    dismiss_permission_controller_dialogs,
     ensure_valid_evaluation_episodes,
     is_infrastructure_failure,
+    is_permission_controller_interruption,
     recover_android_world_environment,
     recover_infrastructure_failures,
 )
@@ -30,6 +32,162 @@ class _Controller:
 
 
 class AndroidWorldRecoveryTest(unittest.TestCase):
+    def test_permission_dialog_clicks_allow_by_resource_id(self):
+        state = {"visible": True}
+        bounds = types.SimpleNamespace(
+            x_min=133, x_max=947, y_min=1231, y_max=1378
+        )
+
+        class PermissionController(_Controller):
+            def get_ui_elements(self) -> list[object]:
+                self.probes += 1
+                if not state["visible"]:
+                    return []
+                return [
+                    types.SimpleNamespace(
+                        package_name="com.google.android.permissioncontroller",
+                        resource_name="permission_message",
+                        resource_id=None,
+                        text="Allow SMS Messenger to access your contacts?",
+                        content_description=None,
+                        bbox_pixels=None,
+                        bbox=None,
+                    ),
+                    types.SimpleNamespace(
+                        package_name="com.google.android.permissioncontroller",
+                        resource_name="permission_allow_button",
+                        resource_id=None,
+                        text="Allow",
+                        content_description=None,
+                        bbox_pixels=bounds,
+                        bbox=None,
+                    ),
+                ]
+
+        controller = PermissionController()
+        environment = types.SimpleNamespace(controller=controller)
+        config = AndroidWorldConfig(permission_controller_settle_seconds=0)
+
+        def adb_result(_config, *arguments, **kwargs):
+            del _config, kwargs
+            if arguments[:3] == ("shell", "input", "tap"):
+                state["visible"] = False
+            return ""
+
+        with mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery._adb_command",
+            side_effect=adb_result,
+        ) as adb:
+            dismissed = dismiss_permission_controller_dialogs(
+                environment, config
+            )
+
+        self.assertEqual(dismissed, 1)
+        self.assertIn(
+            ("shell", "input", "tap", "540", "1304"),
+            [call.args[1:] for call in adb.call_args_list],
+        )
+
+    def test_permission_interrupted_episode_is_discarded_and_restarted_at_zero(self):
+        state = {"visible": False}
+        bounds = types.SimpleNamespace(
+            x_min=133, x_max=947, y_min=1231, y_max=1378
+        )
+
+        class PermissionController(_Controller):
+            def get_ui_elements(self) -> list[object]:
+                self.probes += 1
+                if not state["visible"]:
+                    return []
+                return [
+                    types.SimpleNamespace(
+                        package_name="com.google.android.permissioncontroller",
+                        resource_name="permission_allow_button",
+                        resource_id=None,
+                        text="Allow",
+                        content_description=None,
+                        bbox_pixels=bounds,
+                        bbox=None,
+                    )
+                ]
+
+        class Agent:
+            def __init__(self, env):
+                self.env = env
+                self.calls = 0
+
+            def step(self, goal):
+                del goal
+                self.calls += 1
+                if self.calls == 1:
+                    state["visible"] = True
+                return types.SimpleNamespace(done=False, data={})
+
+        controller = PermissionController()
+        environment = types.SimpleNamespace(controller=controller)
+        agent = Agent(environment)
+        task = types.SimpleNamespace(
+            name="SmsTask",
+            tear_down=mock.Mock(),
+        )
+
+        def run_episode(*, goal, agent):
+            agent.step(goal)
+            return {
+                "exception_info": None,
+                "is_successful": 1.0,
+                "episode_length": 1,
+                "aux_data": {},
+            }
+
+        episode_runner = types.SimpleNamespace(run_episode=run_episode)
+        suite_utils = types.SimpleNamespace(episode_runner=episode_runner)
+
+        def invoke_episode(_task):
+            return suite_utils.episode_runner.run_episode(
+                goal="send a message", agent=agent
+            )
+
+        def run_task(_task, runner, _environment, _demo_mode):
+            try:
+                return runner(_task)
+            except Exception as exc:  # 模拟 AndroidWorld _run_task 的异常封装。
+                return {"exception_info": str(exc)}
+
+        suite_utils._run_task = run_task
+        config = AndroidWorldConfig(
+            permission_controller_recovery_attempts=2,
+            permission_controller_settle_seconds=0,
+        )
+
+        def adb_result(_config, *arguments, **kwargs):
+            del _config, kwargs
+            if arguments[:3] == ("shell", "input", "tap"):
+                state["visible"] = False
+            return ""
+
+        with mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery._adb_command",
+            side_effect=adb_result,
+        ):
+            with recover_infrastructure_failures(
+                suite_utils, environment, config
+            ):
+                result = suite_utils._run_task(
+                    task, invoke_episode, environment, False
+                )
+
+        self.assertEqual(agent.calls, 2)
+        self.assertEqual(result["episode_length"], 1)
+        self.assertEqual(result["aux_data"]["permission_controller_restarts"], 1)
+        self.assertEqual(
+            result["aux_data"]["permission_controller_dialogs_dismissed"], 1
+        )
+        task.tear_down.assert_called_once_with(environment)
+        self.assertFalse(
+            is_permission_controller_interruption(result)
+        )
+
     def test_only_device_failures_are_classified_as_infrastructure(self):
         self.assertTrue(
             is_infrastructure_failure(

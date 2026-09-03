@@ -87,6 +87,8 @@ def summarize_collection(
     detailed_rows = list(full_episodes)
     per_task_values: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     termination_reasons: collections.Counter[str] = collections.Counter()
+    permission_restarts = 0
+    permission_dialogs_dismissed = 0
     valid_rows: list[dict[str, Any]] = []
     for episode in rows:
         task = str(episode.get("task_template") or episode.get("task_name") or "unknown")
@@ -99,6 +101,14 @@ def summarize_collection(
             reason = aux_data.get("collector_termination_reason")
             if reason:
                 termination_reasons[str(reason)] += 1
+            permission_restarts += int(
+                _finite_float(aux_data.get("permission_controller_restarts"))
+            )
+            permission_dialogs_dismissed += int(
+                _finite_float(
+                    aux_data.get("permission_controller_dialogs_dismissed")
+                )
+            )
         if exception:
             termination_reasons["exception"] += 1
 
@@ -149,6 +159,8 @@ def summarize_collection(
             _finite_float(item.get("episode_length")) >= episode_step_limit
             for item in valid_rows
         ),
+        "permission_controller_restarts": permission_restarts,
+        "permission_controller_dialogs_dismissed": permission_dialogs_dismissed,
         "termination_reasons": dict(termination_reasons.most_common()),
         "primitive_credit_assignment": "primitive call + final episode success",
         "per_task": per_task,

@@ -131,6 +131,12 @@ class AndroidWorldConfig:
     wait_after_action_seconds: float = 1.0
     # a11y/ADB 等基础设施故障后的恢复与当前 task 重试次数；0 表示关闭。
     infrastructure_recovery_attempts: int = 1
+    # Android 运行时权限弹窗由系统 permission controller 承载，它不会造成
+    # a11y/ADB 异常，却会遮住被测 App。检测到后自动点击安全的 Allow 按钮，
+    # 丢弃当前未完成 episode 并从头重跑；0 表示关闭该专项恢复。
+    permission_controller_recovery_attempts: int = 3
+    # 点击权限按钮后留给系统关闭/切换下一层权限弹窗的等待时间。
+    permission_controller_settle_seconds: float = 0.5
     # 硬恢复只重启 Android emulator guest，不会重启宿主机。
     recovery_timeout_seconds: float = 180.0
     recovery_poll_seconds: float = 2.0
@@ -340,6 +346,14 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
     if android_world.infrastructure_recovery_attempts < 0:
         raise ValueError(
             "android_world.infrastructure_recovery_attempts 必须是非负整数"
+        )
+    if android_world.permission_controller_recovery_attempts < 0:
+        raise ValueError(
+            "android_world.permission_controller_recovery_attempts 必须是非负整数"
+        )
+    if android_world.permission_controller_settle_seconds < 0:
+        raise ValueError(
+            "android_world.permission_controller_settle_seconds 不能为负数"
         )
     if android_world.recovery_timeout_seconds <= 0:
         raise ValueError("android_world.recovery_timeout_seconds 必须为正数")

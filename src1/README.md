@@ -82,6 +82,8 @@ cp src1/config.example.toml src1/config.local.toml
   会在 AndroidWorld 的 episode runner 外层再次强制这一硬上限，任务完成时仍会提前停止；
 - `android_world.infrastructure_recovery_attempts = 1` 会在 a11y/ADB 失效时恢复
   飞行模式、网络和 accessibility forwarder，必要时只重启 emulator guest，并重试当前任务；
+- `android_world.permission_controller_recovery_attempts = 3` 会识别 Android 系统权限
+  弹窗，自动点击明确的 `Allow`，丢弃被遮挡的临时 episode 并从第 0 step 重跑当前任务；
 - API key 只通过 `api_key_env` 指定的环境变量读取，不写入 TOML。
 
 ### 3.1 每次 CLI 调用的日志
@@ -350,6 +352,11 @@ AndroidWorld 把任务初始化异常保存成 `episode_data = NaN` 等标量时
 重启 Android guest，等待 `sys.boot_completed=1`，重新连接后重试当前 task。默认只尝试
 1 次；若仍不可用会立即结束本轮并保留已有 checkpoint，而不会把之后数百个跳过任务
 写成 `episodes=0, SR=0`。可用 `infrastructure_recovery_attempts = 0` 关闭此行为。
+
+运行时还会在 M3A 每个 step 前后检查 `com.android.permissioncontroller` 和
+`com.google.android.permissioncontroller`。命中后只点击资源 ID/文案明确为 Allow 的
+按钮，不会误点 Don't allow；受干扰的尝试不会保存到 checkpoint，也不会占用最终 episode
+的 step budget。恢复次数与关闭的弹窗数会写入 `aux_data`、`summary.json` 和 `report.md`。
 
 训练评测的 M3A 每一步原本会同时保存原图、标框前后截图、UI tree 和完整 prompt；长
 suite 会让这些对象一直留在 Python 内存中，最终可能被 Linux OOM killer 直接

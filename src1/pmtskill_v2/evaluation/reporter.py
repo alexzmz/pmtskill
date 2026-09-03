@@ -102,6 +102,8 @@ def summarize_episodes(
     )
     by_task: dict[str, list[bool]] = collections.defaultdict(list)
     failure_reasons: collections.Counter[str] = collections.Counter()
+    permission_restarts = 0
+    permission_dialogs_dismissed = 0
     step_counts: list[int] = []
     run_times: list[float] = []
     for episode in episode_list:
@@ -112,6 +114,16 @@ def summarize_episodes(
         successful = successful_episode_value(
             _episode_field(episode, "is_successful", default=False)
         )
+        aux_data = _episode_field(episode, "aux_data", default={})
+        if isinstance(aux_data, Mapping):
+            permission_restarts += int(
+                finite_float_value(aux_data.get("permission_controller_restarts", 0))
+            )
+            permission_dialogs_dismissed += int(
+                finite_float_value(
+                    aux_data.get("permission_controller_dialogs_dismissed", 0)
+                )
+            )
         by_task[task].append(successful)
         step_counts.append(
             int(finite_float_value(_episode_field(episode, "episode_length", default=0)))
@@ -169,6 +181,8 @@ def summarize_episodes(
         "average_steps": statistics.fmean(step_counts) if step_counts else 0.0,
         "average_run_time_seconds": statistics.fmean(run_times) if run_times else 0.0,
         "average_model_switches": statistics.fmean(switch_counts) if switch_counts else 0.0,
+        "permission_controller_restarts": permission_restarts,
+        "permission_controller_dialogs_dismissed": permission_dialogs_dismissed,
         "model_usage": dict(model_usage.most_common()),
         "skill_usage": dict(skill_usage.most_common()),
         "failure_reasons": dict(failure_reasons.most_common()),
@@ -192,6 +206,8 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"| 平均步数 | {summary['average_steps']:.2f} |",
         f"| 平均运行时间 | {summary['average_run_time_seconds']:.2f}s |",
         f"| 平均模型/adapter 切换 | {summary['average_model_switches']:.2f} |",
+        f"| 权限弹窗触发的任务重跑 | {summary['permission_controller_restarts']} |",
+        f"| 自动关闭的权限弹窗 | {summary['permission_controller_dialogs_dismissed']} |",
         "",
         "## 评测配置",
         "",

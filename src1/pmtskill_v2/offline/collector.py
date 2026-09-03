@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from ..core.config import ProjectConfig
+from ..evaluation.recovery import recover_infrastructure_failures
 from ..inference.vlm import OpenAICompatibleVLClient
 from .reporting import summarize_collection
 
@@ -197,8 +198,11 @@ def collect_teacher_trajectories(
             run_options["stop_on_task_success"] = (
                 config.android_world.stop_on_task_success
             )
-        with enforce_episode_step_limit(suite_utils, episode_step_limit):
-            results = suite_utils.run(suite, agent, **run_options)
+        with recover_infrastructure_failures(
+            suite_utils, environment, config.android_world
+        ):
+            with enforce_episode_step_limit(suite_utils, episode_step_limit):
+                results = suite_utils.run(suite, agent, **run_options)
     finally:
         environment.close()
 

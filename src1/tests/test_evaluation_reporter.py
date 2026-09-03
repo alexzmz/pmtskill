@@ -96,6 +96,27 @@ class EvaluationReporterTest(unittest.TestCase):
         self.assertEqual(summary["episodes_evaluated"], 1)
         self.assertEqual(summary["failure_reasons"], {"invalid_episode_data": 1})
 
+    def test_permission_model_delegations_are_reported(self):
+        episode = {
+            "task_template": "PermissionTask",
+            "is_successful": 1.0,
+            "episode_length": 2,
+            "run_time": 1.0,
+            "exception_info": None,
+            "episode_data": {},
+            "aux_data": {
+                "permission_controller_restarts": 0,
+                "permission_controller_dialogs_dismissed": 1,
+                "permission_controller_model_delegations": 2,
+            },
+        }
+
+        summary = summarize_episodes([episode], [])
+
+        self.assertEqual(summary["permission_controller_restarts"], 0)
+        self.assertEqual(summary["permission_controller_dialogs_dismissed"], 1)
+        self.assertEqual(summary["permission_controller_model_delegations"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

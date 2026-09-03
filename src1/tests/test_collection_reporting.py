@@ -12,7 +12,17 @@ class CollectionReportingTest(unittest.TestCase):
         episodes = [
             {"task_template": "TaskA", "is_successful": 1.0, "episode_length": 3, "run_time": 2.0, "exception_info": None, "aux_data": None},
             {"task_template": "TaskA", "is_successful": 0.0, "episode_length": 50, "run_time": 4.0, "exception_info": None, "aux_data": {"collector_termination_reason": "max_steps"}},
-            {"task_template": "TaskB", "is_successful": 1.0, "episode_length": 2, "run_time": 1.0, "exception_info": None, "aux_data": None},
+            {
+                "task_template": "TaskB",
+                "is_successful": 1.0,
+                "episode_length": 2,
+                "run_time": 1.0,
+                "exception_info": None,
+                "aux_data": {
+                    "permission_controller_dialogs_dismissed": 1,
+                    "permission_controller_model_delegations": 2,
+                },
+            },
             {"task_template": "TaskB", "is_successful": 0.0, "episode_length": 0, "run_time": 0.1, "exception_info": "emulator error", "aux_data": None},
         ]
         full_episodes = [
@@ -36,6 +46,8 @@ class CollectionReportingTest(unittest.TestCase):
         self.assertEqual(summary["per_primitive"]["action.click"]["trials"], 2)
         self.assertEqual(summary["per_primitive"]["action.click"]["successes"], 1)
         self.assertEqual(summary["per_primitive"]["action.open_app"]["successes"], 1)
+        self.assertEqual(summary["permission_controller_dialogs_dismissed"], 1)
+        self.assertEqual(summary["permission_controller_model_delegations"], 2)
 
 
 if __name__ == "__main__":

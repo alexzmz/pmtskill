@@ -104,6 +104,7 @@ def summarize_episodes(
     failure_reasons: collections.Counter[str] = collections.Counter()
     permission_restarts = 0
     permission_dialogs_dismissed = 0
+    permission_model_delegations = 0
     step_counts: list[int] = []
     run_times: list[float] = []
     for episode in episode_list:
@@ -122,6 +123,11 @@ def summarize_episodes(
             permission_dialogs_dismissed += int(
                 finite_float_value(
                     aux_data.get("permission_controller_dialogs_dismissed", 0)
+                )
+            )
+            permission_model_delegations += int(
+                finite_float_value(
+                    aux_data.get("permission_controller_model_delegations", 0)
                 )
             )
         by_task[task].append(successful)
@@ -183,6 +189,7 @@ def summarize_episodes(
         "average_model_switches": statistics.fmean(switch_counts) if switch_counts else 0.0,
         "permission_controller_restarts": permission_restarts,
         "permission_controller_dialogs_dismissed": permission_dialogs_dismissed,
+        "permission_controller_model_delegations": permission_model_delegations,
         "model_usage": dict(model_usage.most_common()),
         "skill_usage": dict(skill_usage.most_common()),
         "failure_reasons": dict(failure_reasons.most_common()),
@@ -208,6 +215,7 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"| 平均模型/adapter 切换 | {summary['average_model_switches']:.2f} |",
         f"| 权限弹窗触发的任务重跑 | {summary['permission_controller_restarts']} |",
         f"| 自动关闭的权限弹窗 | {summary['permission_controller_dialogs_dismissed']} |",
+        f"| 交给模型判断的权限界面 | {summary['permission_controller_model_delegations']} |",
         "",
         "## 评测配置",
         "",

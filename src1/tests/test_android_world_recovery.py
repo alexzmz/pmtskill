@@ -88,7 +88,130 @@ class AndroidWorldRecoveryTest(unittest.TestCase):
             [call.args[1:] for call in adb.call_args_list],
         )
 
-    def test_permission_interrupted_episode_is_discarded_and_restarted_at_zero(self):
+    def test_permission_dialog_falls_back_to_uiautomator_dump(self):
+        state = {"visible": True}
+
+        class IncompletePermissionController(_Controller):
+            def get_ui_elements(self) -> list[object]:
+                self.probes += 1
+                if not state["visible"]:
+                    return []
+                # 复现真实问题：a11y forwarder 只返回说明文字，漏掉按钮。
+                return [
+                    types.SimpleNamespace(
+                        package_name="com.google.android.permissioncontroller",
+                        resource_name="permission_message",
+                        resource_id=None,
+                        text="Allow SMS Messenger to access your contacts?",
+                        content_description=None,
+                        class_name="android.widget.TextView",
+                        is_clickable=False,
+                        is_enabled=True,
+                        bbox_pixels=None,
+                        bbox=None,
+                    )
+                ]
+
+        xml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node text="Allow SMS Messenger to access your contacts?"
+    resource-id="com.android.permissioncontroller:id/permission_message"
+    class="android.widget.TextView"
+    package="com.google.android.permissioncontroller"
+    clickable="false" enabled="true" bounds="[133,1030][947,1163]" />
+  <node text="Allow"
+    resource-id="com.android.permissioncontroller:id/permission_allow_button"
+    class="android.widget.Button"
+    package="com.google.android.permissioncontroller"
+    clickable="true" enabled="true" bounds="[133,1231][947,1378]" />
+  <node text="Don’t allow"
+    resource-id="com.android.permissioncontroller:id/permission_deny_button"
+    class="android.widget.Button"
+    package="com.google.android.permissioncontroller"
+    clickable="true" enabled="true" bounds="[133,1388][947,1535]" />
+</hierarchy>"""
+        environment = types.SimpleNamespace(
+            controller=IncompletePermissionController()
+        )
+        config = AndroidWorldConfig(permission_controller_settle_seconds=0)
+
+        def adb_result(_config, *arguments, **kwargs):
+            del _config, kwargs
+            if arguments[:3] == ("shell", "cat", "/sdcard/pmtskill_window.xml"):
+                return xml
+            if arguments[:3] == ("shell", "input", "tap"):
+                state["visible"] = False
+            return ""
+
+        with self.assertLogs(level="WARNING") as logs:
+            with mock.patch(
+                "src1.pmtskill_v2.evaluation.recovery._adb_command",
+                side_effect=adb_result,
+            ) as adb:
+                dismissed = dismiss_permission_controller_dialogs(
+                    environment, config
+                )
+
+        self.assertEqual(dismissed, 1)
+        self.assertIn("可交互控件", "\n".join(logs.output))
+        self.assertIn("permission_allow_button", "\n".join(logs.output))
+        self.assertIn(
+            ("shell", "input", "tap", "540", "1304"),
+            [call.args[1:] for call in adb.call_args_list],
+        )
+
+    def test_unknown_permission_choices_are_logged_and_not_fatal(self):
+        bounds = types.SimpleNamespace(
+            x_min=100, x_max=400, y_min=1000, y_max=1150
+        )
+        controller = _Controller()
+        controller.get_ui_elements = mock.Mock(
+            return_value=[
+                types.SimpleNamespace(
+                    package_name="com.google.android.permissioncontroller",
+                    resource_name="permission_cancel_button",
+                    resource_id=None,
+                    text="Cancel",
+                    content_description=None,
+                    class_name="android.widget.Button",
+                    is_clickable=True,
+                    is_enabled=True,
+                    bbox_pixels=bounds,
+                    bbox=None,
+                ),
+                types.SimpleNamespace(
+                    package_name="com.google.android.permissioncontroller",
+                    resource_name="permission_settings_button",
+                    resource_id=None,
+                    text="Settings",
+                    content_description=None,
+                    class_name="android.widget.Button",
+                    is_clickable=True,
+                    is_enabled=True,
+                    bbox_pixels=bounds,
+                    bbox=None,
+                ),
+            ]
+        )
+        environment = types.SimpleNamespace(controller=controller)
+        config = AndroidWorldConfig(permission_controller_settle_seconds=0)
+
+        with self.assertLogs(level="WARNING") as logs:
+            with mock.patch(
+                "src1.pmtskill_v2.evaluation.recovery._adb_command",
+                return_value="",
+            ):
+                dismissed = dismiss_permission_controller_dialogs(
+                    environment, config
+                )
+
+        output = "\n".join(logs.output)
+        self.assertEqual(dismissed, 0)
+        self.assertIn("Cancel", output)
+        self.assertIn("Settings", output)
+        self.assertIn("交给模型判断", output)
+
+    def test_permission_dialog_is_handled_without_restarting_episode(self):
         state = {"visible": False}
         bounds = types.SimpleNamespace(
             x_min=133, x_max=947, y_min=1231, y_max=1378
@@ -177,15 +300,116 @@ class AndroidWorldRecoveryTest(unittest.TestCase):
                     task, invoke_episode, environment, False
                 )
 
-        self.assertEqual(agent.calls, 2)
+        self.assertEqual(agent.calls, 1)
         self.assertEqual(result["episode_length"], 1)
-        self.assertEqual(result["aux_data"]["permission_controller_restarts"], 1)
+        self.assertEqual(result["aux_data"]["permission_controller_restarts"], 0)
         self.assertEqual(
             result["aux_data"]["permission_controller_dialogs_dismissed"], 1
         )
-        task.tear_down.assert_called_once_with(environment)
+        task.tear_down.assert_not_called()
         self.assertFalse(
             is_permission_controller_interruption(result)
+        )
+
+    def test_unknown_permission_choices_are_added_to_model_guidelines(self):
+        state = {"visible": False}
+        bounds = types.SimpleNamespace(
+            x_min=100, x_max=400, y_min=1000, y_max=1150
+        )
+
+        class PermissionController(_Controller):
+            def get_ui_elements(self) -> list[object]:
+                self.probes += 1
+                if not state["visible"]:
+                    return []
+                return [
+                    types.SimpleNamespace(
+                        package_name="com.google.android.permissioncontroller",
+                        resource_name="permission_cancel_button",
+                        resource_id=None,
+                        text="Cancel",
+                        content_description=None,
+                        class_name="android.widget.Button",
+                        is_clickable=True,
+                        is_enabled=True,
+                        bbox_pixels=bounds,
+                        bbox=None,
+                    ),
+                    types.SimpleNamespace(
+                        package_name="com.google.android.permissioncontroller",
+                        resource_name="permission_settings_button",
+                        resource_id=None,
+                        text="Settings",
+                        content_description=None,
+                        class_name="android.widget.Button",
+                        is_clickable=True,
+                        is_enabled=True,
+                        bbox_pixels=bounds,
+                        bbox=None,
+                    ),
+                ]
+
+        class Agent:
+            def __init__(self):
+                self.additional_guidelines = ["existing"]
+                self.guidelines_seen = None
+
+            def step(self, goal):
+                del goal
+                self.guidelines_seen = list(self.additional_guidelines)
+                return types.SimpleNamespace(done=False, data={})
+
+        controller = PermissionController()
+        environment = types.SimpleNamespace(controller=controller)
+        agent = Agent()
+        task = types.SimpleNamespace(name="PermissionChoiceTask")
+
+        def run_episode(*, goal, agent):
+            agent.step(goal)
+            return {
+                "exception_info": None,
+                "is_successful": 0.0,
+                "episode_length": 1,
+                "aux_data": {},
+            }
+
+        suite_utils = types.SimpleNamespace(
+            episode_runner=types.SimpleNamespace(run_episode=run_episode)
+        )
+
+        def invoke_episode(_task):
+            state["visible"] = True
+            return suite_utils.episode_runner.run_episode(
+                goal="continue the task", agent=agent
+            )
+
+        suite_utils._run_task = (
+            lambda task, runner, environment, demo_mode: runner(task)
+        )
+        config = AndroidWorldConfig(
+            permission_controller_recovery_attempts=2,
+            permission_controller_settle_seconds=0,
+        )
+
+        with mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery._adb_command",
+            return_value="",
+        ):
+            with recover_infrastructure_failures(
+                suite_utils, environment, config
+            ):
+                result = suite_utils._run_task(
+                    task, invoke_episode, environment, False
+                )
+
+        self.assertEqual(agent.additional_guidelines, ["existing"])
+        self.assertIsNotNone(agent.guidelines_seen)
+        guidance = "\n".join(agent.guidelines_seen)
+        self.assertIn("Cancel", guidance)
+        self.assertIn("Settings", guidance)
+        self.assertIn('"action_type":"click"', guidance)
+        self.assertEqual(
+            result["aux_data"]["permission_controller_model_delegations"], 2
         )
 
     def test_only_device_failures_are_classified_as_infrastructure(self):

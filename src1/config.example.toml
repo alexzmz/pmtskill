@@ -39,8 +39,8 @@ wait_after_action_seconds = 1.0
 # a11y/ADB 失效后先恢复网络和转发；仍失败则重启 emulator guest 并重试当前 task。
 # 0 表示关闭自动恢复。恢复耗尽时立即停止评测，避免后续任务全部空跑。
 infrastructure_recovery_attempts = 1
-# 系统权限弹窗不记入任务 step：自动点击 Allow，丢弃受干扰 episode 并重跑当前任务。
-# 设为 0 可关闭；默认最多连续重跑 3 次，以处理一个 App 连续请求多项权限的情况。
+# 正数启用系统权限弹窗处理：明确的 Allow 自动点击；无法确定时输出完整按钮清单并
+# 交给模型选择。处理失败不会终止整场评测；设为 0 可关闭。保留原参数名以兼容旧配置。
 permission_controller_recovery_attempts = 3
 permission_controller_settle_seconds = 0.5
 recovery_timeout_seconds = 180.0

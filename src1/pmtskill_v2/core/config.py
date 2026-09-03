@@ -132,8 +132,8 @@ class AndroidWorldConfig:
     # a11y/ADB 等基础设施故障后的恢复与当前 task 重试次数；0 表示关闭。
     infrastructure_recovery_attempts: int = 1
     # Android 运行时权限弹窗由系统 permission controller 承载，它不会造成
-    # a11y/ADB 异常，却会遮住被测 App。检测到后自动点击安全的 Allow 按钮，
-    # 丢弃当前未完成 episode 并从头重跑；0 表示关闭该专项恢复。
+    # a11y/ADB 异常，却会遮住被测 App。正数启用专项处理：明确的 Allow 自动
+    # 点击并继续当前 episode，不明确的按钮写入日志并交给模型；0 表示关闭。
     permission_controller_recovery_attempts: int = 3
     # 点击权限按钮后留给系统关闭/切换下一层权限弹窗的等待时间。
     permission_controller_settle_seconds: float = 0.5

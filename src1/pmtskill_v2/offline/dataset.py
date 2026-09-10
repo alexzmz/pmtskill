@@ -22,6 +22,30 @@ def infer_action_primitives(action_output: str) -> tuple[str, ...]:
     """从 M3A Action JSON 中提取原语标签，供后续分 adapter 训练。"""
 
     lowered = action_output.lower()
+    # 优先精确读取 JSONAction 的 action_type。旧实现直接搜索 ``type``，会因为
+    # 每条合法动作都包含字段名 ``action_type`` 而把 click 等动作误标为 action.type。
+    action_type_match = re.search(
+        r'["\']action_type["\']\s*:\s*["\']([^"\']+)["\']', lowered
+    )
+    if action_type_match:
+        exact_mapping = {
+            "click": "action.click",
+            "double_tap": "action.double_tap",
+            "long_press": "action.long_press",
+            "input_text": "action.type",
+            "keyboard_enter": "action.enter",
+            "scroll": "action.scroll",
+            "swipe": "action.swipe",
+            "navigate_back": "action.back",
+            "navigate_home": "action.home",
+            "open_app": "action.open_app",
+            "wait": "action.wait",
+            "status": "control.finish",
+            "answer": "control.finish",
+        }
+        primitive = exact_mapping.get(action_type_match.group(1).strip())
+        if primitive:
+            return (primitive,)
     mapping = (
         ("action.double_tap", ("double_tap", "double tap")),
         ("action.long_press", ("long_press", "long press")),

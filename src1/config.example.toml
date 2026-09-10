@@ -96,9 +96,11 @@ minimum_capability = 0.05
 maximum_candidates_per_position = 32
 
 [maintenance]
+# 同一序列的证据会跨多个 maintain 周期累计；不是单轮必须达到 5 条。
 minimum_support = 5
 minimum_candidate_trials = 10
 minimum_subsequence_length = 2
+# 高频窗口最多 5 个原语，但 Teacher 标准轨迹的完整成功路径会额外保留，不受此值截断。
 maximum_subsequence_length = 5
 promotion_success_rate = 0.70
 rollback_success_rate = 0.45

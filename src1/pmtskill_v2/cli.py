@@ -14,6 +14,7 @@ from typing import Any, Sequence
 
 from .core.config import ProjectConfig, load_config
 from .core.io import load_primitives, write_json_atomic
+from .core.models import SkillStatus
 from .core.run_records import CommandRunLogger, active_run_logger
 from .offline.pipeline import OfflineDistillationPipeline
 from .offline.trainer import (
@@ -62,9 +63,7 @@ def _run_label(args: argparse.Namespace) -> str:
     goal = getattr(args, "goal", None)
     if goal:
         return str(goal)[:56]
-    if getattr(args, "command", "").startswith("evaluate") or getattr(
-        args, "command", None
-    ) == "collect":
+    if getattr(args, "command", "").startswith(("evaluate", "collect")):
         return "all-tasks"
     return ""
 
@@ -654,6 +653,109 @@ def command_skills(args: argparse.Namespace) -> int:
             }
         )
     _print(rows)
+    return 0
+
+
+def command_collect_optimization_traces(args: argparse.Namespace) -> int:
+    """用 Teacher 生成可供 maintain 挖掘的统一原语级轨迹。"""
+
+    from .offline.optimization_collector import (
+        AndroidWorldOptimizationTraceCollector,
+        OptimizationTraceCollectionOptions,
+        default_optimization_trace_output,
+    )
+
+    if args.skill_limit <= 0:
+        raise ValueError("--skill-limit 必须是正整数")
+    if args.maximum_tasks_per_skill <= 0:
+        raise ValueError("--maximum-tasks-per-skill 必须是正整数")
+    if args.combinations <= 0:
+        raise ValueError("--combinations 必须是正整数")
+    if args.replan_every_steps < 0:
+        raise ValueError("--replan-every-steps 不能为负数")
+    config, store = _open(args.config)
+    source_kind = "raw_skill" if args.source == "raw-skill" else "task"
+    source_skills = []
+    if source_kind == "raw_skill":
+        available = store.list_skills()
+        by_id = {skill.skill_id: skill for skill in available}
+        if args.skills:
+            missing = [skill_id for skill_id in args.skills if skill_id not in by_id]
+            if missing:
+                raise KeyError(f"技能库中不存在这些 skill IDs: {missing}")
+            source_skills = [by_id[skill_id] for skill_id in args.skills]
+        else:
+            statuses = set(args.skill_statuses)
+            source_skills = [
+                skill
+                for skill in available
+                if (args.skill_kind == "all" or skill.kind == args.skill_kind)
+                and skill.status.value in statuses
+            ][: args.skill_limit]
+        if not source_skills:
+            raise ValueError(
+                "raw-skill 模式没有选中技能；请传 --skills，或调整 kind/status/limit"
+            )
+    elif args.skills or args.skill_task_map:
+        raise ValueError("--skills/--skill-task-map 只能用于 --source raw-skill")
+
+    teacher_model_id = args.teacher_model_id or config.offline.teacher_model_id
+    profile = config.model(teacher_model_id)
+    task_map = _load_calibration_task_map(args.skill_task_map)
+    optimized_skills = []
+    if args.allow_polished_units:
+        optimized_skills = [
+            skill
+            for skill in store.list_skills(kind="polished")
+            if skill.status == SkillStatus.ACTIVE
+            or (args.include_candidates and skill.status == SkillStatus.CANDIDATE)
+        ]
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else default_optimization_trace_output(config)
+    )
+    if args.dry_run:
+        _print(
+            {
+                "dry_run": True,
+                "command": "collect-optimization-traces",
+                "trace_schema": "pmtskill.teacher-primitive-trace/v1",
+                "source_kind": source_kind,
+                "teacher_model_id": teacher_model_id,
+                "tasks": _tasks(args.tasks) or "all_or_auto_bound",
+                "source_skills": [skill.skill_id for skill in source_skills],
+                "skill_task_map": task_map,
+                "auto_bind_skills": args.auto_bind_skills,
+                "optimized_skill_units": [skill.skill_id for skill in optimized_skills],
+                "replan_every_steps": args.replan_every_steps,
+                "record_traces": args.record_traces,
+                "skill_database": store.database.resolve(),
+                "output_dir": output_dir,
+            }
+        )
+        return 0
+
+    result = AndroidWorldOptimizationTraceCollector(config, store).run(
+        profile,
+        OptimizationTraceCollectionOptions(
+            source_kind=source_kind,
+            output_dir=output_dir,
+            tasks=tuple(_tasks(args.tasks) or ()) or None,
+            source_skills=tuple(source_skills),
+            skill_task_map=task_map,
+            family=args.family,
+            combinations=args.combinations,
+            seed=args.seed,
+            max_steps=args.max_steps,
+            replan_every_steps=args.replan_every_steps,
+            auto_bind_skills=args.auto_bind_skills,
+            maximum_tasks_per_skill=args.maximum_tasks_per_skill,
+            record_traces=args.record_traces,
+        ),
+        optimized_skills=optimized_skills,
+    )
+    _print(result.to_dict())
     return 0
 
 
@@ -1333,6 +1435,112 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个 episode 的步数上限；可调低，但无论配置为何都不会超过 50",
     )
     collect.set_defaults(handler=command_collect)
+
+    optimization_collect = subparsers.add_parser(
+        "collect-optimization-traces",
+        aliases=["collect-guided"],
+        help="用 Teacher 生成可动态修订、供技能库维护的标准原语轨迹",
+    )
+    optimization_collect.add_argument(
+        "--source",
+        choices=["task", "raw-skill"],
+        default="task",
+        help="task 从任务目标规划；raw-skill 从技能任务描述与解法规划",
+    )
+    optimization_collect.add_argument(
+        "--tasks",
+        nargs="*",
+        help=(
+            "task 模式选择任务；raw-skill 模式下作为所有技能共享的显式任务绑定"
+        ),
+    )
+    optimization_collect.add_argument(
+        "--skills",
+        nargs="*",
+        help="raw-skill 模式指定 skill IDs；省略时按 kind/status/limit 选择",
+    )
+    optimization_collect.add_argument(
+        "--skill-kind",
+        choices=["raw", "polished", "all"],
+        default="raw",
+        help="未显式指定 --skills 时的数据源技能类型",
+    )
+    optimization_collect.add_argument(
+        "--skill-statuses",
+        nargs="+",
+        choices=["imported", "candidate", "active", "deprecated"],
+        default=["imported", "candidate", "active"],
+        help="未显式指定 --skills 时允许的数据源技能状态",
+    )
+    optimization_collect.add_argument(
+        "--skill-limit",
+        type=int,
+        default=8,
+        help="未显式指定 --skills 时本批最多处理的技能数",
+    )
+    optimization_collect.add_argument(
+        "--skill-task-map",
+        help="JSON：skill_id -> AndroidWorld task names；语义与标定流程一致",
+    )
+    optimization_collect.add_argument(
+        "--auto-bind-skills",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="无显式/metadata 映射时，让 Teacher 从注册任务中选择可验证任务",
+    )
+    optimization_collect.add_argument(
+        "--maximum-tasks-per-skill",
+        type=int,
+        default=3,
+        help="每个输入技能最多绑定的 AndroidWorld 任务数",
+    )
+    optimization_collect.add_argument(
+        "--allow-polished-units",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="规划序列是否允许引用现有 active polished skill（落轨迹时仍展开原语）",
+    )
+    optimization_collect.add_argument(
+        "--include-candidates",
+        action="store_true",
+        help="允许 Teacher 试用 candidate polished skill；默认仅 active",
+    )
+    optimization_collect.add_argument(
+        "--teacher-model-id",
+        help="覆盖 [offline].teacher_model_id",
+    )
+    optimization_collect.add_argument("--family", default="android_world")
+    optimization_collect.add_argument(
+        "--combinations", type=int, default=1, help="每个任务的参数组合数"
+    )
+    optimization_collect.add_argument("--seed", type=int, default=42)
+    optimization_collect.add_argument(
+        "--max-steps",
+        type=int,
+        help="每 episode 最大环境步数；沿用 collect 的安全上限",
+    )
+    optimization_collect.add_argument(
+        "--replan-every-steps",
+        type=int,
+        default=1,
+        help="每 N 个真实环境动作检查并可修订剩余路径；0 仅在路径耗尽时修订",
+    )
+    optimization_collect.add_argument(
+        "--record-traces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="把统一轻量轨迹写入 skill_library.sqlite3；此命令默认开启",
+    )
+    optimization_collect.add_argument(
+        "--output-dir",
+        help="checkpoints/summary/report/traces/source_bindings 输出目录",
+    )
+    optimization_collect.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只显示模型、数据源和输出配置，不连接模型或 emulator",
+    )
+    optimization_collect.set_defaults(handler=command_collect_optimization_traces)
 
     dataset = subparsers.add_parser(
         "build-dataset", help="把轨迹转换成 ms-swift VL JSONL"

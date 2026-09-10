@@ -359,6 +359,20 @@ class ExecutionPlan:
             "metadata": self.metadata,
         }
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ExecutionPlan":
+        """恢复持久化计划，确保标准 Teacher 轨迹导入 SQLite 后不丢规划。"""
+
+        return cls(
+            goal=str(value.get("goal", "")),
+            topology=SkillTopology.from_dict(value.get("topology", {"nodes": []})),
+            steps=tuple(RouteStep.from_dict(item) for item in value.get("steps", ())),
+            total_score=float(value.get("total_score", 0.0)),
+            planner_id=str(value.get("planner_id", "unknown")),
+            created_at=str(value.get("created_at", utc_now())),
+            metadata=dict(value.get("metadata", {})),
+        )
+
 
 @dataclasses.dataclass(slots=True)
 class TraceEvent:
@@ -441,14 +455,18 @@ class ExecutionTrace:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ExecutionTrace":
-        # 读取数据库轨迹时 plan 主要用于审计，避免在这里重复实现复杂反序列化。
+        raw_plan = value.get("plan")
         return cls(
             trace_id=str(value["trace_id"]),
             goal=str(value.get("goal", "")),
             task_name=str(value.get("task_name", "unknown")),
             successful=bool(value.get("successful", False)),
             events=tuple(TraceEvent.from_dict(item) for item in value.get("events", ())),
-            plan=None,
+            plan=(
+                ExecutionPlan.from_dict(raw_plan)
+                if isinstance(raw_plan, Mapping)
+                else None
+            ),
             reward=float(value.get("reward", 0.0)),
             duration_ms=float(value.get("duration_ms", 0.0)),
             created_at=str(value.get("created_at", utc_now())),
@@ -465,4 +483,3 @@ def geometric_success(probabilities: Iterable[float]) -> float:
         log_probability += math.log(min(0.999999, max(0.000001, probability)))
         count += 1
     return math.exp(log_probability) if count else 1.0
-

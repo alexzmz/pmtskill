@@ -47,7 +47,9 @@ class TemplateSkillCompiler:
         return SkillRecord(
             skill_id=f"polished:{digest}:v1",
             name=f"polished_{digest}",
-            description=f"由 {support} 条成功轨迹发现的高频组合。",
+            # support 会持续累计，放在 metadata 而不是可执行定义中，避免仅因证据
+            # 数量变化就生成新 skill_version 并使既有模型标定失效。
+            description="由累计成功轨迹发现的高频组合。",
             kind="polished",
             status=SkillStatus.CANDIDATE,
             level=max(2, len(primitives)),
@@ -115,6 +117,50 @@ def subsequence_supporting_tasks(
     }
 
 
+def trace_executed_sequence(trace: ExecutionTrace) -> tuple[str, ...]:
+    """读取统一 Teacher trace 的实际序列，旧格式则回退到 event 展开结果。"""
+
+    recorded = trace.metadata.get("executed_primitive_sequence")
+    if isinstance(recorded, (list, tuple)):
+        sequence = tuple(str(item) for item in recorded if str(item))
+        if sequence:
+            return sequence
+    return trace.primitive_sequence()
+
+
+def _contains_executable_action(primitives: tuple[str, ...]) -> bool:
+    """过滤所有任务都会出现、但不能独立执行的纯 reasoning 高频片段。"""
+
+    return any(
+        primitive.startswith("action.") or primitive == "control.finish"
+        for primitive in primitives
+    )
+
+
+def trace_sequence_evidence(
+    trace: ExecutionTrace, minimum_length: int, maximum_length: int
+) -> dict[tuple[str, ...], bool]:
+    """提取一条轨迹的去重子序列，并额外保留超过窗口上限的完整路径。
+
+    value 为 ``True`` 表示该序列就是 trace 的完整执行序列。这样 maintain 既能发现
+    可复用的短组合，又不会因为 ``maximum_subsequence_length`` 默认仅为 5 而永远
+    丢失 Teacher 规划出的完整技能路径。
+    """
+
+    sequence = trace_executed_sequence(trace)
+    evidence: dict[tuple[str, ...], bool] = {}
+    for length in range(minimum_length, maximum_length + 1):
+        for start in range(0, len(sequence) - length + 1):
+            candidate = sequence[start : start + length]
+            if _contains_executable_action(candidate):
+                evidence[candidate] = evidence.get(candidate, False) or (
+                    start == 0 and length == len(sequence)
+                )
+    if len(sequence) >= minimum_length and _contains_executable_action(sequence):
+        evidence[sequence] = True
+    return evidence
+
+
 class SkillMaintainer:
     """backend 定时运行的技能库维护服务。"""
 
@@ -129,25 +175,65 @@ class SkillMaintainer:
         self.compiler = compiler or TemplateSkillCompiler()
 
     def discover_candidates(self, traces: list[ExecutionTrace]) -> tuple[list[str], int]:
-        counts = mine_successful_subsequences(
-            traces,
-            self.config.minimum_subsequence_length,
-            self.config.maximum_subsequence_length,
+        # 先把本轮证据幂等写入独立表，再基于跨维护周期的全部证据聚合。否则每轮
+        # support 都低于阈值时，即使长期累计足够也永远无法创建 candidate。
+        for trace in traces:
+            self.store.record_sequence_evidence(
+                trace,
+                trace_sequence_evidence(
+                    trace,
+                    self.config.minimum_subsequence_length,
+                    self.config.maximum_subsequence_length,
+                ),
+            )
+        aggregate: defaultdict[tuple[str, ...], dict[str, Any]] = defaultdict(
+            lambda: {
+                "successes": 0,
+                "failures": 0,
+                "full_successes": 0,
+                "tasks": set(),
+                "source_kinds": set(),
+                "source_skill_ids": set(),
+                "schemas": set(),
+            }
         )
-        supporting_tasks = subsequence_supporting_tasks(
-            traces,
-            self.config.minimum_subsequence_length,
-            self.config.maximum_subsequence_length,
-        )
+        for row in self.store.list_sequence_evidence():
+            primitives = tuple(row["primitives"])
+            item = aggregate[primitives]
+            if row["successful"]:
+                item["successes"] += 1
+                item["tasks"].add(str(row["task_name"]))
+                if row["is_full_sequence"]:
+                    item["full_successes"] += 1
+            else:
+                item["failures"] += 1
+            if row.get("source_kind"):
+                item["source_kinds"].add(str(row["source_kind"]))
+            if row.get("source_skill_id"):
+                item["source_skill_ids"].add(str(row["source_skill_id"]))
+            if row.get("trajectory_schema"):
+                item["schemas"].add(str(row["trajectory_schema"]))
         created: list[str] = []
-        frequent = [item for item in counts.items() if item[1] >= self.config.minimum_support]
+        frequent = [
+            (primitives, int(detail["successes"]), detail)
+            for primitives, detail in aggregate.items()
+            if int(detail["successes"]) >= self.config.minimum_support
+        ]
         # 优先固化更长、支持度更高的路径。
         frequent.sort(key=lambda item: (len(item[0]), item[1]), reverse=True)
-        for primitives, support in frequent:
+        for primitives, support, detail in frequent:
             skill = self.compiler.compile(primitives, support)
-            skill.metadata["calibration_tasks"] = list(
-                supporting_tasks.get(primitives, ())
-            )
+            provenance = {
+                "support": support,
+                "failure_support": int(detail["failures"]),
+                "full_sequence_support": int(detail["full_successes"]),
+                "calibration_tasks": sorted(detail["tasks"]),
+                "trajectory_source_kinds": sorted(detail["source_kinds"]),
+                "source_skill_ids": sorted(detail["source_skill_ids"]),
+                "trajectory_schemas": sorted(detail["schemas"]),
+                "evidence_scope": "cumulative_sequence_evidence",
+            }
+            skill.metadata.update(provenance)
             existing = self.store.get_skill(skill.skill_id)
             if existing:
                 previous = existing.metadata.get("calibration_tasks", ())
@@ -161,16 +247,16 @@ class SkillMaintainer:
                         *skill.metadata["calibration_tasks"],
                     }
                 )
-                existing.metadata["support"] = max(
-                    int(existing.metadata.get("support", 0)), support
-                )
+                # 这些值来自全量 evidence 聚合，不应再与旧批次做加法。
+                existing.metadata.update(provenance)
+                existing.description = skill.description
                 self.store.upsert_skill(existing)
                 continue
             self.store.upsert_skill(skill)
             self.store.log_maintenance_event(
                 "candidate_created",
                 skill.skill_id,
-                {"primitives": list(primitives), "support": support},
+                {"primitives": list(primitives), **provenance},
             )
             created.append(skill.skill_id)
         return created, len(frequent)

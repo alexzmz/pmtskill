@@ -12,15 +12,19 @@ from typing import Any, Sequence
 from ..core.config import ProjectConfig
 from ..core.io import load_primitives
 from ..core.models import (
+    ExecutionPlan,
     ExecutionTrace,
     ModelProfile,
+    RouteStep,
     SkillRecord,
     SkillStatus,
+    SkillTopology,
     TraceEvent,
 )
 from ..inference.model_pool import ModelPool
 from ..inference.vlm import OpenAICompatibleVLClient
 from ..offline.collector import bootstrap_android_world
+from ..offline.dataset import infer_action_primitives
 from ..online.executor import (
     ForcedSkillVLWrapper,
     RoutedVLWrapper,
@@ -67,6 +71,71 @@ def _extract_route_metadata(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def _is_parsed_action(value: Any) -> bool:
+    """兼容 checkpoint 中的 JSON dict 与 AndroidWorld ``JSONAction`` dataclass。"""
+
+    return isinstance(value, Mapping) or (
+        value is not None and isinstance(getattr(value, "action_type", None), str)
+    )
+
+
+def _execution_plan_from_route(goal: str, route: Mapping[str, Any]) -> ExecutionPlan | None:
+    """把 Teacher wrapper 的初始 action-unit 计划恢复成强类型审计对象。"""
+
+    raw_units = route.get("initial_plan")
+    if not isinstance(raw_units, list):
+        return None
+    primitive_sequence: list[str] = []
+    normalized: list[tuple[Mapping[str, Any], tuple[str, ...], tuple[str, ...]]] = []
+    for raw_unit in raw_units:
+        if not isinstance(raw_unit, Mapping):
+            continue
+        raw_primitives = raw_unit.get("primitive_ids", ())
+        if isinstance(raw_primitives, str):
+            raw_primitives = (raw_primitives,)
+        if not isinstance(raw_primitives, (list, tuple)):
+            continue
+        primitives = tuple(str(item) for item in raw_primitives if str(item))
+        if not primitives:
+            continue
+        start = len(primitive_sequence)
+        primitive_sequence.extend(primitives)
+        node_ids = tuple(f"n{index:04d}" for index in range(start, len(primitive_sequence)))
+        normalized.append((raw_unit, primitives, node_ids))
+    if not primitive_sequence:
+        return None
+    topology = SkillTopology.from_sequence(
+        primitive_sequence, topology_id=f"teacher-plan:{uuid.uuid4().hex[:16]}"
+    )
+    model_id = str(route.get("model_id", "unknown"))
+    steps = tuple(
+        RouteStep(
+            step_id=str(raw.get("unit_id", f"unit-{index + 1:03d}")),
+            model_id=model_id,
+            skill_id=(str(raw["skill_id"]) if raw.get("skill_id") else None),
+            primitive_ids=primitives,
+            node_ids=node_ids,
+            expected_success=0.0,
+            expected_latency_ms=0.0,
+            score=0.0,
+            is_polished=bool(raw.get("skill_id")),
+        )
+        for index, (raw, primitives, node_ids) in enumerate(normalized)
+    )
+    return ExecutionPlan(
+        goal=goal,
+        topology=topology,
+        steps=steps,
+        total_score=0.0,
+        planner_id=str(route.get("planner_id", "unknown")),
+        metadata={
+            "trajectory_schema": route.get("trajectory_schema"),
+            "source": route.get("source"),
+            "planned_step_count": route.get("planned_step_count", len(steps)),
+        },
+    )
+
+
 def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrace]:
     """把 M3A episode 转成 backend 接收的轻量轨迹并进行保守信用分配。"""
 
@@ -82,17 +151,56 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
         parsed_actions = episode_step_values(
             episode_data.get("action_output_json")
         )
+        summaries = episode_step_values(episode_data.get("summary"))
         events: list[TraceEvent] = []
+        route_snapshots: list[dict[str, Any]] = []
         for index, raw in enumerate(raw_responses):
             route = _extract_route_metadata(raw)
             if not route:
                 continue
-            action_parsed = index < len(parsed_actions) and isinstance(
-                parsed_actions[index], Mapping
+            route_snapshots.append(route)
+            action_parsed = index < len(parsed_actions) and _is_parsed_action(
+                parsed_actions[index]
             )
+            action_committed = bool(route.get("action_committed", action_parsed))
             # 组合技能只有在动作可解析且 episode 最终成功时计为成功，避免把局部
             # 看似正确、实际使任务失败的动作错误地用于技能晋升。
-            event_success = bool(action_parsed and successful)
+            event_success = bool(action_committed and successful)
+            action_text = str(actions[index]) if index < len(actions) else None
+            actual_primitives = (
+                infer_action_primitives(action_text) if action_text else ()
+            )
+            planned_actions = {
+                str(item)
+                for item in episode_step_values(route.get("primitive_ids"))
+                if str(item).startswith("action.") or str(item) == "control.finish"
+            }
+            actual_actions = {
+                item
+                for item in actual_primitives
+                if item.startswith("action.") or item == "control.finish"
+            }
+            aligned = (
+                bool(planned_actions.intersection(actual_actions))
+                if planned_actions
+                else None
+            )
+            planned_primitives = tuple(
+                str(item)
+                for item in episode_step_values(route.get("primitive_ids"))
+                if str(item)
+            )
+            executed_primitives = planned_primitives
+            if route.get("trajectory_schema") and action_committed and actual_actions:
+                # 标准 Teacher trace 同时保存 planned_unit 和真实执行序列。模型若为
+                # 恢复弹窗临时选择了不同动作，技能挖掘必须使用真实 action，而不能
+                # 把原计划误写成已执行事实。感知/定位/推理原语仍予以保留。
+                non_actions = tuple(
+                    item
+                    for item in planned_primitives
+                    if not item.startswith("action.") and item != "control.finish"
+                )
+                executed_primitives = non_actions + tuple(sorted(actual_actions))
             events.append(
                 TraceEvent(
                     index=len(events),
@@ -102,30 +210,72 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
                         if route.get("skill_id") is not None
                         else None
                     ),
-                    primitive_ids=tuple(
-                        str(item)
-                        for item in episode_step_values(
-                            route.get("primitive_ids")
-                        )
-                    ),
+                    primitive_ids=executed_primitives,
                     success=event_success,
                     latency_ms=finite_float_value(route.get("latency_ms")),
-                    action=str(actions[index]) if index < len(actions) else None,
+                    action=action_text,
+                    observation=(
+                        str(summaries[index]) if index < len(summaries) else None
+                    ),
                     metadata={"credit_assignment": "parsed_action_and_episode_success"},
                 )
             )
+            events[-1].metadata.update(
+                {
+                    "trajectory_schema": route.get("trajectory_schema"),
+                    "routing_mode": route.get("routing_mode"),
+                    "source": route.get("source"),
+                    "planner_id": route.get("planner_id"),
+                    "plan_revision": route.get("current_revision"),
+                    "planned_unit": route.get("planned_unit"),
+                    "planned_primitive_ids": list(planned_primitives),
+                    "action_parsed": action_parsed,
+                    "action_committed": action_committed,
+                    "actual_action_primitives": list(actual_primitives),
+                    "action_primitive_aligned": aligned,
+                }
+            )
+        first_route = route_snapshots[0] if route_snapshots else {}
+        last_route = route_snapshots[-1] if route_snapshots else {}
+        aligned_values = [
+            event.metadata.get("action_primitive_aligned")
+            for event in events
+            if event.metadata.get("action_primitive_aligned") is not None
+        ]
+        plan = _execution_plan_from_route(str(episode.get("goal", "")), first_route)
         traces.append(
             ExecutionTrace.new(
                 goal=str(episode.get("goal", "")),
                 task_name=str(episode.get("task_template", "unknown")),
                 successful=successful,
                 events=events,
+                plan=plan,
                 reward=float(successful),
                 duration_ms=finite_float_value(episode.get("run_time")) * 1000,
                 metadata={
                     "source": "android_world_m3a",
                     "episode_data_valid": episode_data_is_usable(raw_episode_data),
                     "had_exception": bool(episode.get("exception_info")),
+                    "instance_id": episode.get("instance_id"),
+                    "agent_name": episode.get("agent_name"),
+                    "trajectory_schema": first_route.get("trajectory_schema"),
+                    "metric_scope": first_route.get("metric_scope", "online"),
+                    "collection_source": first_route.get("source"),
+                    "collection_context": first_route.get("collection_context"),
+                    "teacher_model_id": first_route.get("model_id"),
+                    "planner_id": first_route.get("planner_id"),
+                    "planned_step_count": first_route.get("planned_step_count"),
+                    "initial_plan": first_route.get("initial_plan"),
+                    "plan_revisions": last_route.get("plan_revisions", ()),
+                    "completed_units": last_route.get("completed_units", ()),
+                    "executed_primitive_sequence": [
+                        primitive for event in events for primitive in event.primitive_ids
+                    ],
+                    "action_primitive_alignment_rate": (
+                        sum(bool(value) for value in aligned_values) / len(aligned_values)
+                        if aligned_values
+                        else None
+                    ),
                 },
             )
         )

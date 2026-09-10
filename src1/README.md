@@ -59,6 +59,8 @@ src1/
 - 改路由算法：实现 `online.router.RoutingAlgorithm.route()`；
 - 改训练算法：实现 `offline.trainer.TrainingAlgorithm`；
 - 改任务分解：实现 `online.planner.SkillTopologyPlanner`；
+- 改 Teacher 技能发现轨迹规划：实现
+  `offline.primitive_trajectory.PrimitivePlanGenerator`；
 - 改技能生成方式：实现 `skills.maintenance.SkillCompiler`；
 - 改模型服务：实现 `inference.vlm.VLModelClient`；
 - 改设备执行层：实现 `online.executor.ExecutionBackend`。
@@ -605,6 +607,59 @@ python -m src1 --config src1/config.local.toml calibrate-skills \
 
 ## 7. 技能库自主维护
 
+### 7.1 两种统一的 Teacher 原语轨迹来源
+
+用于监督蒸馏的旧 `collect` 保持不变。用于优化技能库时使用专门的
+`collect-optimization-traces`（短别名 `collect-guided`）；它会在第一步动作前要求
+Teacher 给出完整的原语 action-unit 计划和预计步数，然后按真实界面逐步执行。每个
+环境 step 结束后，wrapper 会读取 M3A 的动作解析结果；按 `--replan-every-steps` 检查
+并允许修改尚未执行的路径，已经完成的部分不会被改写。
+
+入口一：直接输入 AndroidWorld 任务：
+
+```bash
+python -m src1 --config src1/config.local.toml collect-optimization-traces \
+  --source task \
+  --tasks ContactsAddContact SimpleCalendarAddOneEvent \
+  --combinations 5 --seed 42 \
+  --replan-every-steps 1
+```
+
+入口二：输入技能库中的 raw skill。Teacher 会同时看到技能描述、解决方案、具体
+AndroidWorld goal 和截图，再生成相同格式的原语计划：
+
+```bash
+python -m src1 --config src1/config.local.toml collect-optimization-traces \
+  --source raw-skill \
+  --skills skvm:your-skill-id \
+  --skill-task-map ./skill_task_map.json \
+  --combinations 5 --seed 42 \
+  --replan-every-steps 1
+```
+
+`--skill-task-map` 与 `calibrate-skills` 使用相同的 JSON 格式。如果没有显式映射，
+依次尝试命令行 `--tasks`、skill 的 `metadata.trajectory_tasks`/
+`metadata.calibration_tasks`，最后默认由 Teacher 从 AndroidWorld registry 中做语义
+绑定；可以用 `--no-auto-bind-skills` 禁止自动绑定。通用 SKVM skill 若没有对应的
+AndroidWorld task evaluator，将被跳过而不会伪造成功标签。
+
+计划默认允许引用现有 active polished skill；轨迹中会保留 `skill_id`，同时把技能
+展开为 canonical 原语序列，因此两种入口仍能被同一个 maintain 算法处理。可以用
+`--no-allow-polished-units` 强制计划只含基础原语，或用 `--include-candidates` 让
+Teacher 灰度试用 candidate。
+
+两种入口都输出：
+
+- `checkpoints/`：AndroidWorld 原始 `.pkl.gz` episode；
+- `traces.jsonl`：统一的 `pmtskill.teacher-primitive-trace/v1` 轻量轨迹；
+- `summary.json`、`report.md`：成功率、失败分类和轨迹说明；
+- `source_bindings.json`：raw skill 与 AndroidWorld tasks 的绑定及来源。
+
+该命令的 `--record-traces` 默认开启，轨迹直接进入配置指向的
+`skill_library.sqlite3`，状态为 `processed=0`。它们的 `metric_scope` 是
+`skill_discovery`，因此不会污染在线自然流量的 `skill_metrics`；如只想先审查文件，
+使用 `--no-record-traces`。采集完成后运行 `maintain` 即可开始候选发现。
+
 ```bash
 python -m src1 --config src1/config.local.toml maintain
 python -m src1 --config src1/config.local.toml skills --kind polished
@@ -627,9 +682,11 @@ python -m src1 --config src1/config.local.toml maintain \
 1. 幂等同步 `libs/skvm/skvm-data/skills`；
 2. 若配置了 compiler model，逐批编译尚未处理的 raw skills；
 3. 用新轨迹增量更新每个模型/LoRA 的原语能力画像；
-4. 消费尚未处理的成功/失败轨迹；
-5. 按 episode 去重挖掘 2～5 个原语的高频成功子序列；
-6. 生成带 fallback 的 `candidate` polished skill；
+4. 消费尚未处理的成功/失败轨迹，并把完整序列与子序列证据幂等累计；
+5. 跨多个维护周期聚合 support，按 episode 去重挖掘 2～5 个原语的高频子序列，
+   同时保留超过窗口上限的完整成功路径；失败证据只记录风险，不直接创建技能；
+6. 过滤没有 action/control.finish 的纯推理公共片段，生成带来源 raw skill、任务、
+   成功/失败 support 和 fallback 的 `candidate` polished skill；
 7. 若存在配对标定，先按实际 adapter 版本分别计算技能 SR、裸模型 SR、uplift 和
    Wilson 下界，维护模型专属的 candidate/active/deprecated 状态；
 8. 任一模型–技能组合通过即可让技能全局晋升，但路由只会把它交给通过标定的模型；

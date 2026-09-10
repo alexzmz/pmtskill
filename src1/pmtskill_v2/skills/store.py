@@ -6,6 +6,7 @@ SQLite 适合当前单机/单设备原型：不需要额外服务，支持事务
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -182,6 +183,23 @@ class SkillStore:
         );
         CREATE INDEX IF NOT EXISTS idx_traces_processed
             ON traces(processed, successful, created_at);
+
+        CREATE TABLE IF NOT EXISTS skill_sequence_evidence (
+            sequence_hash TEXT NOT NULL,
+            trace_id TEXT NOT NULL,
+            primitives_json TEXT NOT NULL,
+            successful INTEGER NOT NULL,
+            is_full_sequence INTEGER NOT NULL DEFAULT 0,
+            task_name TEXT NOT NULL,
+            source_kind TEXT,
+            source_skill_id TEXT,
+            trajectory_schema TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(sequence_hash, trace_id),
+            FOREIGN KEY(trace_id) REFERENCES traces(trace_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sequence_evidence_lookup
+            ON skill_sequence_evidence(sequence_hash, successful, created_at);
 
         CREATE TABLE IF NOT EXISTS maintenance_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -871,10 +889,25 @@ class SkillStore:
             "average_latency_ms": latency_sum / trials if trials else 0.0,
         }
 
-    def append_trace(self, trace: ExecutionTrace) -> None:
-        """幂等保存一条设备轨迹，并同步累计技能统计。"""
+    def append_trace(
+        self,
+        trace: ExecutionTrace,
+        *,
+        update_skill_metrics: bool | None = None,
+    ) -> None:
+        """幂等保存一条设备轨迹，并按数据作用域决定是否累计在线统计。
+
+        ``skill_metrics`` 表示模型在在线自然流量中调用技能的观测，不应被 Teacher
+        生成的技能发现数据污染。调用方可以显式传入 ``False``；未指定时读取 trace
+        metadata 的 ``metric_scope``，``skill_discovery``/``maintenance_only`` 会只
+        保存轨迹。旧轨迹没有该字段，继续保持原有的统计行为。
+        """
 
         payload = json.dumps(trace.to_dict(), ensure_ascii=False)
+        if update_skill_metrics is None:
+            update_skill_metrics = str(
+                trace.metadata.get("metric_scope", "online")
+            ) not in {"skill_discovery", "maintenance_only"}
         with self.transaction() as connection:
             inserted = connection.execute(
                 """
@@ -890,7 +923,7 @@ class SkillStore:
                     trace.created_at,
                 ),
             ).rowcount
-            if inserted:
+            if inserted and update_skill_metrics:
                 for event in trace.events:
                     if not event.skill_id:
                         continue
@@ -954,6 +987,87 @@ class SkillStore:
                 "UPDATE traces SET processed = 1 WHERE trace_id = ?",
                 [(trace_id,) for trace_id in trace_ids],
             )
+
+    def record_sequence_evidence(
+        self,
+        trace: ExecutionTrace,
+        sequences: Mapping[tuple[str, ...], bool],
+    ) -> int:
+        """幂等保存一条轨迹提供的序列证据。
+
+        ``sequences`` 的 value 表示该序列是否也是该 trace 的完整执行序列。同一
+        trace 中重复出现的子序列只计一次，避免长 episode 刷高 support。
+        """
+
+        source = trace.metadata.get("collection_source")
+        source = dict(source) if isinstance(source, Mapping) else {}
+        rows: list[tuple[Any, ...]] = []
+        for primitives, is_full in sequences.items():
+            canonical = json.dumps(list(primitives), ensure_ascii=False, separators=(",", ":"))
+            sequence_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            rows.append(
+                (
+                    sequence_hash,
+                    trace.trace_id,
+                    canonical,
+                    int(trace.successful),
+                    int(is_full),
+                    trace.task_name,
+                    source.get("kind"),
+                    source.get("skill_id"),
+                    trace.metadata.get("trajectory_schema"),
+                    trace.created_at,
+                )
+            )
+        if not rows:
+            return 0
+        with self.transaction() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                """
+                INSERT INTO skill_sequence_evidence(
+                    sequence_hash, trace_id, primitives_json, successful,
+                    is_full_sequence, task_name, source_kind, source_skill_id,
+                    trajectory_schema, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sequence_hash, trace_id) DO UPDATE SET
+                    is_full_sequence=MAX(
+                        skill_sequence_evidence.is_full_sequence,
+                        excluded.is_full_sequence
+                    )
+                """,
+                rows,
+            )
+            return connection.total_changes - before
+
+    def list_sequence_evidence(self) -> list[dict[str, Any]]:
+        """返回技能发现的累计成功/失败证据，供维护算法透明聚合。"""
+
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT sequence_hash, trace_id, primitives_json, successful,
+                       is_full_sequence, task_name, source_kind, source_skill_id,
+                       trajectory_schema, created_at
+                FROM skill_sequence_evidence
+                ORDER BY created_at, trace_id, sequence_hash
+                """
+            ).fetchall()
+        return [
+            {
+                "sequence_hash": str(row["sequence_hash"]),
+                "trace_id": str(row["trace_id"]),
+                "primitives": tuple(json.loads(row["primitives_json"])),
+                "successful": bool(row["successful"]),
+                "is_full_sequence": bool(row["is_full_sequence"]),
+                "task_name": str(row["task_name"]),
+                "source_kind": row["source_kind"],
+                "source_skill_id": row["source_skill_id"],
+                "trajectory_schema": row["trajectory_schema"],
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     def log_maintenance_event(
         self, event_type: str, subject_id: str | None, detail: dict[str, Any]

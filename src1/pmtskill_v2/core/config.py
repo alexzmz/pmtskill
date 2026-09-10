@@ -340,6 +340,16 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         raise ValueError("training_evaluation.max_new_tokens 必须是正整数")
     routing = RoutingConfig(**_section(raw, "routing"))
     maintenance = MaintenanceConfig(**_section(raw, "maintenance"))
+    if maintenance.minimum_support <= 0:
+        raise ValueError("maintenance.minimum_support 必须是正整数")
+    if maintenance.minimum_candidate_trials <= 0:
+        raise ValueError("maintenance.minimum_candidate_trials 必须是正整数")
+    if not 0 <= maintenance.promotion_success_rate <= 1:
+        raise ValueError("maintenance.promotion_success_rate 必须在 [0, 1]")
+    if not 0 <= maintenance.rollback_success_rate <= 1:
+        raise ValueError("maintenance.rollback_success_rate 必须在 [0, 1]")
+    if not 0 <= maintenance.baseline_margin <= 1:
+        raise ValueError("maintenance.baseline_margin 必须在 [0, 1]")
     android_world = AndroidWorldConfig(**_section(raw, "android_world"))
     if android_world.max_steps <= 0:
         raise ValueError("android_world.max_steps 必须是正整数")

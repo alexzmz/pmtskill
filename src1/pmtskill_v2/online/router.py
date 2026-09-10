@@ -18,6 +18,7 @@ from ..core.models import (
     geometric_success,
 )
 from ..skills.store import SkillStore
+from ..skills.identity import model_variant_id, skill_version_id
 
 
 class RoutingAlgorithm(Protocol):
@@ -61,6 +62,12 @@ class DynamicProgrammingRouter:
     def __init__(self, config: RoutingConfig, store: SkillStore | None = None):
         self.config = config
         self.store = store
+        # 一轮在线评测中标定矩阵不变；缓存避免 DP 内层为同一 pair 反复扫描 trial。
+        self._calibration_cache: dict[tuple[str, str], dict[str, object]] = {}
+        self._pair_status_cache: dict[
+            tuple[str, str], dict[str, object] | None
+        ] = {}
+        self._skill_has_matrix_cache: dict[str, bool] = {}
 
     def _candidates(
         self,
@@ -103,18 +110,73 @@ class DynamicProgrammingRouter:
         )
         latency = model.average_latency_ms
         if candidate.skill and self.store:
-            metrics = self.store.skill_metrics(candidate.skill.skill_id, model.model_id)
-            # 真实样本达到 3 次后逐渐覆盖能力画像先验。
-            trials = int(metrics["trials"])
-            if trials:
-                weight = min(0.90, trials / (trials + 5))
+            pair_key = (
+                skill_version_id(candidate.skill),
+                model_variant_id(model),
+            )
+            calibration = self._calibration_cache.get(pair_key)
+            if calibration is None:
+                calibration = self.store.calibration_metrics(
+                    candidate.skill.skill_id,
+                    model_id=model.model_id,
+                    model_variant_id_value=pair_key[1],
+                )
+                self._calibration_cache[pair_key] = calibration
+            calibration_trials = int(calibration["valid_trials"])
+            if calibration_trials:
+                # SKVM-style 配对标定有明确 no-skill 对照，且绑定真实 adapter 版本，
+                # 优先级高于在线自然流量；小样本仍与原语先验平滑混合。
+                weight = min(0.95, calibration_trials / (calibration_trials + 5))
                 probability = (
-                    weight * float(metrics["smoothed_success_rate"])
+                    weight * float(calibration["smoothed_skill_success_rate"])
                     + (1 - weight) * probability
                 )
-                if metrics["average_latency_ms"]:
-                    latency = float(metrics["average_latency_ms"])
+            else:
+                metrics = self.store.skill_metrics(
+                    candidate.skill.skill_id, model.model_id
+                )
+                trials = int(metrics["trials"])
+                if trials:
+                    weight = min(0.90, trials / (trials + 5))
+                    probability = (
+                        weight * float(metrics["smoothed_success_rate"])
+                        + (1 - weight) * probability
+                    )
+                    if metrics["average_latency_ms"]:
+                        latency = float(metrics["average_latency_ms"])
         return probability, latency
+
+    def _model_skill_allowed(
+        self,
+        model: ModelProfile,
+        candidate: _Candidate,
+        *,
+        include_candidates: bool,
+    ) -> bool:
+        """应用模型专属生命周期；未迁移的旧技能库保持原有行为。"""
+
+        if candidate.skill is None or self.store is None:
+            return True
+        pair_key = (skill_version_id(candidate.skill), model_variant_id(model))
+        if pair_key not in self._pair_status_cache:
+            self._pair_status_cache[pair_key] = self.store.skill_model_status(
+                candidate.skill, model
+            )
+        pair = self._pair_status_cache[pair_key]
+        if pair is not None:
+            return pair["status"] == SkillStatus.ACTIVE.value or (
+                include_candidates
+                and pair["status"] == SkillStatus.CANDIDATE.value
+            )
+        # 一旦当前技能版本已有兼容矩阵，未标定的新模型视为 unknown，而不是
+        # 沿用其他 adapter 的成功率。灰度模式仍允许探索它。
+        if candidate.skill.skill_id not in self._skill_has_matrix_cache:
+            self._skill_has_matrix_cache[candidate.skill.skill_id] = (
+                self.store.has_current_skill_model_status(candidate.skill)
+                or self.store.has_any_skill_model_status(candidate.skill.skill_id)
+            )
+        has_matrix = self._skill_has_matrix_cache[candidate.skill.skill_id]
+        return include_candidates if has_matrix else True
 
     def route(
         self,
@@ -156,6 +218,12 @@ class DynamicProgrammingRouter:
             for (_, previous_model_id), state in position_states:
                 for candidate in candidates:
                     for model in enabled_models:
+                        if not self._model_skill_allowed(
+                            model,
+                            candidate,
+                            include_candidates=include_candidates,
+                        ):
+                            continue
                         capabilities = [model.capability(p) for p in candidate.primitive_ids]
                         if min(capabilities) < self.config.minimum_capability:
                             continue
@@ -214,4 +282,3 @@ class DynamicProgrammingRouter:
             planner_id=planner_id,
             metadata={"algorithm": self.algorithm_id},
         )
-

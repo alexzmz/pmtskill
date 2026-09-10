@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from ..core.models import (
     ExecutionTrace,
@@ -18,6 +19,12 @@ from ..core.models import (
     SkillRecord,
     SkillStatus,
     utc_now,
+)
+from .identity import (
+    model_variant_hash,
+    model_variant_id,
+    skill_definition_hash,
+    skill_version_id,
 )
 
 
@@ -65,6 +72,19 @@ class SkillStore:
         CREATE INDEX IF NOT EXISTS idx_skills_status_kind
             ON skills(status, kind);
 
+        CREATE TABLE IF NOT EXISTS skill_versions (
+            skill_version_id TEXT PRIMARY KEY,
+            skill_id TEXT NOT NULL,
+            definition_hash TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(skill_id, definition_hash),
+            FOREIGN KEY(skill_id) REFERENCES skills(skill_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_versions_skill
+            ON skill_versions(skill_id, created_at);
+
         CREATE TABLE IF NOT EXISTS skill_metrics (
             skill_id TEXT NOT NULL,
             model_id TEXT NOT NULL,
@@ -81,6 +101,76 @@ class SkillStore:
             profile_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS model_variants (
+            model_variant_id TEXT PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            variant_hash TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(model_id, variant_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_variants_model
+            ON model_variants(model_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS calibration_runs (
+            run_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            output_dir TEXT,
+            summary_json TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS skill_calibration_trials (
+            trial_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            pair_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            skill_version_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            model_variant_id TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            task_seed TEXT NOT NULL,
+            baseline_success INTEGER NOT NULL,
+            skill_success INTEGER NOT NULL,
+            baseline_steps INTEGER NOT NULL DEFAULT 0,
+            skill_steps INTEGER NOT NULL DEFAULT 0,
+            baseline_run_time_ms REAL NOT NULL DEFAULT 0,
+            skill_run_time_ms REAL NOT NULL DEFAULT 0,
+            baseline_parse_rate REAL NOT NULL DEFAULT 0,
+            skill_parse_rate REAL NOT NULL DEFAULT 0,
+            valid INTEGER NOT NULL DEFAULT 1,
+            detail_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(run_id, model_variant_id, skill_version_id, task_name, task_seed),
+            FOREIGN KEY(run_id) REFERENCES calibration_runs(run_id) ON DELETE CASCADE,
+            FOREIGN KEY(skill_id) REFERENCES skills(skill_id) ON DELETE CASCADE,
+            FOREIGN KEY(skill_version_id) REFERENCES skill_versions(skill_version_id),
+            FOREIGN KEY(model_variant_id) REFERENCES model_variants(model_variant_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_calibration_pair
+            ON skill_calibration_trials(skill_id, model_id, model_variant_id, valid);
+        CREATE INDEX IF NOT EXISTS idx_calibration_run
+            ON skill_calibration_trials(run_id, model_variant_id, skill_version_id);
+
+        CREATE TABLE IF NOT EXISTS skill_model_status (
+            skill_id TEXT NOT NULL,
+            skill_version_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            model_variant_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(skill_version_id, model_variant_id),
+            FOREIGN KEY(skill_id) REFERENCES skills(skill_id) ON DELETE CASCADE,
+            FOREIGN KEY(skill_version_id) REFERENCES skill_versions(skill_version_id),
+            FOREIGN KEY(model_variant_id) REFERENCES model_variants(model_variant_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_model_status_lookup
+            ON skill_model_status(skill_id, model_id, status);
 
         CREATE TABLE IF NOT EXISTS traces (
             trace_id TEXT PRIMARY KEY,
@@ -135,6 +225,23 @@ class SkillStore:
                     skill.source_hash,
                     payload,
                     skill.updated_at,
+                ),
+            )
+            definition_hash = skill_definition_hash(skill)
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO skill_versions(
+                    skill_version_id, skill_id, definition_hash, version,
+                    record_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    skill_version_id(skill),
+                    skill.skill_id,
+                    definition_hash,
+                    skill.version,
+                    payload,
+                    utc_now(),
                 ),
             )
         return existed is None
@@ -200,6 +307,456 @@ class SkillStore:
                 """,
                 (profile.model_id, payload, utc_now()),
             )
+
+    def register_skill_version(self, skill: SkillRecord) -> str:
+        """登记当前技能定义并返回版本 ID；重复调用不会产生重复版本。"""
+
+        version_id = skill_version_id(skill)
+        payload = json.dumps(skill.to_dict(), ensure_ascii=False)
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO skill_versions(
+                    skill_version_id, skill_id, definition_hash, version,
+                    record_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    skill.skill_id,
+                    skill_definition_hash(skill),
+                    skill.version,
+                    payload,
+                    utc_now(),
+                ),
+            )
+        return version_id
+
+    def register_model_variant(self, profile: ModelProfile) -> str:
+        """登记实际 base/adapter 部署版本，避免同名 LoRA 的历史指标互相污染。"""
+
+        variant_id = model_variant_id(profile)
+        payload = json.dumps(profile.to_dict(), ensure_ascii=False, default=str)
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO model_variants(
+                    model_variant_id, model_id, variant_hash, profile_json, created_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    variant_id,
+                    profile.model_id,
+                    model_variant_hash(profile),
+                    payload,
+                    utc_now(),
+                ),
+            )
+        return variant_id
+
+    def start_calibration_run(
+        self,
+        run_id: str,
+        config: Mapping[str, Any],
+        output_dir: str | Path,
+        *,
+        protocol: str = "skvm-paired-android-world-v1",
+    ) -> None:
+        """创建或恢复一次标定运行；配置原样保存，便于审计和复现实验。"""
+
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO calibration_runs(
+                    run_id, status, protocol, config_json, output_dir,
+                    summary_json, started_at, finished_at
+                ) VALUES(?, 'running', ?, ?, ?, NULL, ?, NULL)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    status='running',
+                    protocol=excluded.protocol,
+                    config_json=excluded.config_json,
+                    output_dir=excluded.output_dir,
+                    finished_at=NULL
+                """,
+                (
+                    run_id,
+                    protocol,
+                    json.dumps(dict(config), ensure_ascii=False, default=str),
+                    str(Path(output_dir).resolve()),
+                    utc_now(),
+                ),
+            )
+
+    def finish_calibration_run(
+        self, run_id: str, *, status: str, summary: Mapping[str, Any]
+    ) -> None:
+        """结束标定运行；失败运行同样保留已经完成的 trial，允许后续恢复。"""
+
+        with self.transaction() as connection:
+            updated = connection.execute(
+                """
+                UPDATE calibration_runs
+                SET status = ?, summary_json = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    status,
+                    json.dumps(dict(summary), ensure_ascii=False, default=str),
+                    utc_now(),
+                    run_id,
+                ),
+            ).rowcount
+        if not updated:
+            raise KeyError(f"标定运行不存在: {run_id}")
+
+    def record_skill_calibration_trial(
+        self,
+        *,
+        run_id: str,
+        pair_id: str,
+        skill: SkillRecord,
+        profile: ModelProfile,
+        task_name: str,
+        task_seed: str | int | None,
+        baseline_success: bool,
+        skill_success: bool,
+        baseline_steps: int = 0,
+        skill_steps: int = 0,
+        baseline_run_time_ms: float = 0.0,
+        skill_run_time_ms: float = 0.0,
+        baseline_parse_rate: float = 0.0,
+        skill_parse_rate: float = 0.0,
+        valid: bool = True,
+        detail: Mapping[str, Any] | None = None,
+    ) -> str:
+        """保存一条 no-skill/forced-skill 配对观测。
+
+        这里不更新旧 ``skill_metrics``。旧表代表在线自然流量；标定数据有强制选择，
+        必须独立保存，防止被当成无偏在线样本。
+        """
+
+        skill_version = self.register_skill_version(skill)
+        model_variant = self.register_model_variant(profile)
+        trial_id = uuid.uuid4().hex
+        payload = {
+            "pair_id": pair_id,
+            "task_name": task_name,
+            "task_seed": task_seed,
+            "baseline_success": bool(baseline_success),
+            "skill_success": bool(skill_success),
+            "baseline_steps": max(0, int(baseline_steps)),
+            "skill_steps": max(0, int(skill_steps)),
+            "baseline_run_time_ms": max(0.0, float(baseline_run_time_ms)),
+            "skill_run_time_ms": max(0.0, float(skill_run_time_ms)),
+            "baseline_parse_rate": min(1.0, max(0.0, float(baseline_parse_rate))),
+            "skill_parse_rate": min(1.0, max(0.0, float(skill_parse_rate))),
+            "valid": bool(valid),
+            "detail": dict(detail or {}),
+        }
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO skill_calibration_trials(
+                    trial_id, run_id, pair_id, skill_id, skill_version_id,
+                    model_id, model_variant_id, task_name, task_seed,
+                    baseline_success, skill_success, baseline_steps, skill_steps,
+                    baseline_run_time_ms, skill_run_time_ms,
+                    baseline_parse_rate, skill_parse_rate, valid,
+                    detail_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    run_id, model_variant_id, skill_version_id, task_name, task_seed
+                ) DO UPDATE SET
+                    trial_id=excluded.trial_id,
+                    pair_id=excluded.pair_id,
+                    baseline_success=excluded.baseline_success,
+                    skill_success=excluded.skill_success,
+                    baseline_steps=excluded.baseline_steps,
+                    skill_steps=excluded.skill_steps,
+                    baseline_run_time_ms=excluded.baseline_run_time_ms,
+                    skill_run_time_ms=excluded.skill_run_time_ms,
+                    baseline_parse_rate=excluded.baseline_parse_rate,
+                    skill_parse_rate=excluded.skill_parse_rate,
+                    valid=excluded.valid,
+                    detail_json=excluded.detail_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    trial_id,
+                    run_id,
+                    pair_id,
+                    skill.skill_id,
+                    skill_version,
+                    profile.model_id,
+                    model_variant,
+                    task_name,
+                    str(task_seed if task_seed is not None else "unknown"),
+                    int(payload["baseline_success"]),
+                    int(payload["skill_success"]),
+                    payload["baseline_steps"],
+                    payload["skill_steps"],
+                    payload["baseline_run_time_ms"],
+                    payload["skill_run_time_ms"],
+                    payload["baseline_parse_rate"],
+                    payload["skill_parse_rate"],
+                    int(payload["valid"]),
+                    json.dumps(payload["detail"], ensure_ascii=False, default=str),
+                    utc_now(),
+                ),
+            )
+        return trial_id
+
+    def list_calibration_trials(
+        self,
+        *,
+        run_id: str | None = None,
+        skill_id: str | None = None,
+        model_id: str | None = None,
+        model_variant_id_value: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取逐次标定结果；保留无效 trial 供排查基础设施问题。"""
+
+        clauses: list[str] = []
+        values: list[Any] = []
+        for column, value in (
+            ("run_id", run_id),
+            ("skill_id", skill_id),
+            ("model_id", model_id),
+            ("model_variant_id", model_variant_id_value),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                values.append(value)
+        sql = "SELECT * FROM skill_calibration_trials"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY model_id, skill_id, task_name, task_seed, created_at"
+        with closing(self._connect()) as connection:
+            rows = connection.execute(sql, values).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["baseline_success"] = bool(item["baseline_success"])
+            item["skill_success"] = bool(item["skill_success"])
+            item["valid"] = bool(item["valid"])
+            item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            result.append(item)
+        return result
+
+    def calibration_metrics(
+        self,
+        skill_id: str,
+        *,
+        model_id: str | None = None,
+        model_variant_id_value: str | None = None,
+        run_id: str | None = None,
+        current_skill_version_only: bool = True,
+    ) -> dict[str, Any]:
+        """汇总配对标定指标，并明确区分未标定与真实 0% 成功率。"""
+
+        rows = self.list_calibration_trials(
+            run_id=run_id,
+            skill_id=skill_id,
+            model_id=model_id,
+            model_variant_id_value=model_variant_id_value,
+        )
+        current_version: str | None = None
+        if current_skill_version_only:
+            skill = self.get_skill(skill_id)
+            current_version = skill_version_id(skill) if skill is not None else None
+            rows = [row for row in rows if row["skill_version_id"] == current_version]
+        valid = [row for row in rows if row["valid"]]
+        trials = len(valid)
+        skill_successes = sum(bool(row["skill_success"]) for row in valid)
+        baseline_successes = sum(bool(row["baseline_success"]) for row in valid)
+        wins = sum(
+            bool(row["skill_success"]) and not bool(row["baseline_success"])
+            for row in valid
+        )
+        losses = sum(
+            bool(row["baseline_success"]) and not bool(row["skill_success"])
+            for row in valid
+        )
+        ties = trials - wins - losses
+
+        def average(key: str) -> float:
+            return (
+                sum(float(row[key]) for row in valid) / trials if trials else 0.0
+            )
+
+        skill_rate = skill_successes / trials if trials else 0.0
+        baseline_rate = baseline_successes / trials if trials else 0.0
+        return {
+            "known": trials > 0,
+            "skill_id": skill_id,
+            "skill_version_id": current_version,
+            "model_id": model_id,
+            "model_variant_id": model_variant_id_value,
+            "trials_total": len(rows),
+            "valid_trials": trials,
+            "invalid_trials": len(rows) - trials,
+            "skill_successes": skill_successes,
+            "baseline_successes": baseline_successes,
+            "skill_success_rate": skill_rate,
+            "baseline_success_rate": baseline_rate,
+            "success_rate_uplift": skill_rate - baseline_rate,
+            "smoothed_skill_success_rate": (skill_successes + 1) / (trials + 2),
+            "skill_success_wilson_lower": wilson_lower_bound(
+                skill_successes, trials
+            ),
+            "paired_wins": wins,
+            "paired_losses": losses,
+            "paired_ties": ties,
+            "average_baseline_steps": average("baseline_steps"),
+            "average_skill_steps": average("skill_steps"),
+            "average_baseline_run_time_ms": average("baseline_run_time_ms"),
+            "average_skill_run_time_ms": average("skill_run_time_ms"),
+            "average_baseline_parse_rate": average("baseline_parse_rate"),
+            "average_skill_parse_rate": average("skill_parse_rate"),
+        }
+
+    def calibration_metrics_by_model(self, skill_id: str) -> list[dict[str, Any]]:
+        """返回当前技能版本的每个实际模型版本指标，而不是跨模型汇总。"""
+
+        skill = self.get_skill(skill_id)
+        if skill is None:
+            return []
+        current_version = skill_version_id(skill)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT model_id, model_variant_id
+                FROM skill_calibration_trials
+                WHERE skill_id = ? AND skill_version_id = ?
+                ORDER BY model_id, model_variant_id
+                """,
+                (skill_id, current_version),
+            ).fetchall()
+        return [
+            self.calibration_metrics(
+                skill_id,
+                model_id=str(row["model_id"]),
+                model_variant_id_value=str(row["model_variant_id"]),
+            )
+            for row in rows
+        ]
+
+    def set_skill_model_status(
+        self,
+        skill: SkillRecord,
+        *,
+        model_id: str,
+        model_variant_id_value: str,
+        status: SkillStatus,
+        reason: Mapping[str, Any],
+    ) -> None:
+        """更新某一技能版本对某一模型版本的独立生命周期状态。"""
+
+        version_id = self.register_skill_version(skill)
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO skill_model_status(
+                    skill_id, skill_version_id, model_id, model_variant_id,
+                    status, reason_json, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(skill_version_id, model_variant_id) DO UPDATE SET
+                    status=excluded.status,
+                    reason_json=excluded.reason_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    skill.skill_id,
+                    version_id,
+                    model_id,
+                    model_variant_id_value,
+                    status.value,
+                    json.dumps(dict(reason), ensure_ascii=False, default=str),
+                    utc_now(),
+                ),
+            )
+
+    def skill_model_status(
+        self, skill: SkillRecord, profile: ModelProfile
+    ) -> dict[str, Any] | None:
+        """查询当前 skill/model 版本的标定状态；无记录返回 None，而不是失败。"""
+
+        version_id = skill_version_id(skill)
+        variant_id = model_variant_id(profile)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT status, reason_json, updated_at
+                FROM skill_model_status
+                WHERE skill_version_id = ? AND model_variant_id = ?
+                """,
+                (version_id, variant_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": str(row["status"]),
+            "reason": json.loads(row["reason_json"] or "{}"),
+            "updated_at": str(row["updated_at"]),
+            "skill_version_id": version_id,
+            "model_variant_id": variant_id,
+        }
+
+    def has_current_skill_model_status(self, skill: SkillRecord) -> bool:
+        """当前技能版本是否已经开始构建模型兼容矩阵。"""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM skill_model_status WHERE skill_version_id = ? LIMIT 1",
+                (skill_version_id(skill),),
+            ).fetchone()
+        return row is not None
+
+    def has_any_skill_model_status(self, skill_id: str) -> bool:
+        """技能是否曾进入版本化兼容矩阵，用于识别更新后尚未重标定的版本。"""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM skill_model_status WHERE skill_id = ? LIMIT 1",
+                (skill_id,),
+            ).fetchone()
+        return row is not None
+
+    def list_skill_model_statuses(
+        self,
+        skill_id: str | None = None,
+        *,
+        current_skill_version_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """供 CLI/报告展示所有模型专属技能状态。"""
+
+        clauses: list[str] = []
+        values: list[Any] = []
+        if skill_id is not None:
+            clauses.append("skill_id = ?")
+            values.append(skill_id)
+        if current_skill_version_only:
+            if skill_id is None:
+                raise ValueError(
+                    "current_skill_version_only=True 时必须同时提供 skill_id"
+                )
+            skill = self.get_skill(skill_id)
+            if skill is None:
+                return []
+            clauses.append("skill_version_id = ?")
+            values.append(skill_version_id(skill))
+        sql = "SELECT * FROM skill_model_status"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY skill_id, model_id, model_variant_id"
+        with closing(self._connect()) as connection:
+            rows = connection.execute(sql, values).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["reason"] = json.loads(item.pop("reason_json") or "{}")
+            result.append(item)
+        return result
 
     def rollback_raw_skill_compile(self, skill_id: str) -> SkillRecord:
         """

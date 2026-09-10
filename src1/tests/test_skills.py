@@ -74,6 +74,10 @@ class SkillStoreTest(unittest.TestCase):
         report = maintainer.run_cycle()
         self.assertEqual(len(report.candidates_created), 1)
         skill_id = report.candidates_created[0]
+        self.assertEqual(
+            self.store.get_skill(skill_id).metadata["calibration_tasks"],
+            ["task-0", "task-1"],
+        )
         for trial in range(10):
             self.store.record_skill_trial(skill_id, "model", trial < 9, 10)
         promoted, rolled_back = maintainer.promote_and_rollback()

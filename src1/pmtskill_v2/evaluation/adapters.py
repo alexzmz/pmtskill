@@ -340,6 +340,7 @@ class MSSwiftAdapterDeployment(MSSwiftEvaluationDeployment):
                 enabled=True,
                 metadata={
                     **binding.template_profile.metadata,
+                    "base_model_path": self.base_model_path,
                     "evaluation_checkpoint": str(
                         binding.checkpoint.checkpoint_dir
                     ),

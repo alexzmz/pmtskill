@@ -22,6 +22,8 @@ class EvaluationArtifacts:
     report_markdown: Path
     traces_jsonl: Path
     summary: dict[str, Any]
+    # 标定流程需要逐实例配对；普通评测调用者可以忽略该字段。
+    episodes: tuple[dict[str, Any], ...] = ()
 
 
 def successful_episode_value(value: Any) -> bool:
@@ -307,4 +309,11 @@ def write_evaluation_report(
     write_json_atomic(summary_path, summary)
     write_jsonl(traces_path, (trace.to_dict() for trace in traces))
     markdown_path.write_text(_markdown(summary), encoding="utf-8")
-    return EvaluationArtifacts(target, summary_path, markdown_path, traces_path, summary)
+    return EvaluationArtifacts(
+        target,
+        summary_path,
+        markdown_path,
+        traces_path,
+        summary,
+        tuple(episodes),
+    )

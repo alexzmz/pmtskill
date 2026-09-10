@@ -254,8 +254,15 @@ class SimpleSkillVLWrapper:
     计算原语拓扑、模型切换代价或 polished skill 的组合路线。
     """
 
-    def __init__(self, client: Any, skills: Sequence[SkillRecord]):
+    def __init__(
+        self,
+        client: Any,
+        skills: Sequence[SkillRecord],
+        *,
+        model_id: str | None = None,
+    ):
         self.client = client
+        self.model_id = model_id or str(getattr(client, "model_id", "unknown"))
         self.skills = tuple(skills)
         self._by_id = {skill.skill_id: skill for skill in self.skills}
         self._planner = KeywordSkillPlanner(maximum_skills=1)
@@ -292,11 +299,63 @@ class SimpleSkillVLWrapper:
         if raw is not None:
             raw = dict(raw)
             route = raw.setdefault("_pmtskill", {})
+            route["model_id"] = self.model_id
             route["skill_id"] = skill.skill_id if skill is not None else None
             route["primitive_ids"] = (
                 list(skill.topology.primitive_sequence()) if skill is not None else []
             )
             route["routing_mode"] = "simple_keyword_skill"
+        return output, safe, raw
+
+    def predict(self, text_prompt: str):
+        return self.predict_mm(text_prompt, [])
+
+
+class ForcedSkillVLWrapper:
+    """SKVM ``original/custom-skill`` condition 的 AndroidWorld 对应实现。
+
+    标定时不能使用关键词检索或在线路由，否则模型只会接触路由器偏好的技能，形成
+    选择偏差。本 wrapper 在整个 episode 中强制注入同一个指定技能，并把模型、技能、
+    原语和 condition 写入轻量轨迹；动作总结调用不重复注入，保持 M3A 原有协议。
+    """
+
+    def __init__(self, client: Any, skill: SkillRecord, *, model_id: str):
+        self.client = client
+        self.skill = skill
+        self.model_id = model_id
+
+    def reset(self) -> None:
+        """与其他 wrapper 保持统一接口；强制技能本身无需 episode 状态。"""
+
+    def predict_mm(
+        self, text_prompt: str, images: list[Any]
+    ) -> tuple[str, bool | None, dict[str, Any] | None]:
+        is_summary = "summerize the latest step" in text_prompt.lower()
+        prompt = text_prompt
+        if not is_summary:
+            prompt += (
+                "\n\n技能标定约束（SKVM forced-skill condition）：\n"
+                f"- 必须使用技能：{self.skill.name}\n"
+                f"- 覆盖原语：{', '.join(self.skill.topology.primitive_sequence())}\n"
+                f"- 技能说明：{self.skill.body[:3000] or self.skill.description}\n"
+                "请根据当前真实界面执行技能，但仍严格遵循 AndroidWorld 要求的 "
+                "Reason/Action 输出格式；界面不满足前置条件时应安全停止或恢复。"
+            )
+        output, safe, raw = self.client.predict_mm(prompt, images)
+        if raw is not None:
+            raw = dict(raw)
+            route = raw.setdefault("_pmtskill", {})
+            route.update(
+                {
+                    "model_id": self.model_id,
+                    "skill_id": self.skill.skill_id,
+                    "primitive_ids": list(
+                        self.skill.topology.primitive_sequence()
+                    ),
+                    "routing_mode": "skvm_forced_skill",
+                    "is_summary": is_summary,
+                }
+            )
         return output, safe, raw
 
     def predict(self, text_prompt: str):

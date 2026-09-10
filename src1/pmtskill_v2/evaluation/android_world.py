@@ -21,7 +21,11 @@ from ..core.models import (
 from ..inference.model_pool import ModelPool
 from ..inference.vlm import OpenAICompatibleVLClient
 from ..offline.collector import bootstrap_android_world
-from ..online.executor import RoutedVLWrapper, SimpleSkillVLWrapper
+from ..online.executor import (
+    ForcedSkillVLWrapper,
+    RoutedVLWrapper,
+    SimpleSkillVLWrapper,
+)
 from ..online.planner import (
     KeywordSkillPlanner,
     LLMSkillPlanner,
@@ -312,7 +316,9 @@ class AndroidWorldSimpleSkillEvaluator:
         from android_world.env import env_launcher
 
         skills = self._skills(include_candidate_skills)
-        wrapper = SimpleSkillVLWrapper(OpenAICompatibleVLClient(profile), skills)
+        wrapper = SimpleSkillVLWrapper(
+            OpenAICompatibleVLClient(profile), skills, model_id=profile.model_id
+        )
         run_stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
         target = Path(output_dir).resolve() if output_dir else (
             self.config.paths.state_dir
@@ -407,6 +413,135 @@ class AndroidWorldSimpleSkillEvaluator:
                 "seed": seed,
                 "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
+                "episode_storage": "compact_without_screenshots",
+            },
+        )
+
+
+class AndroidWorldForcedSkillEvaluator:
+    """运行单模型、单技能的 SKVM-style forced-skill condition。
+
+    与关键词技能基线不同，本评测不做检索，也不做 PMT-Skill 路由；调用方指定的
+    skill 会在每个动作决策中被强制注入。它专用于与同任务、同 seed 的裸模型结果
+    做配对标定，不会直接写入在线 ``skill_metrics``。
+    """
+
+    def __init__(self, config: ProjectConfig, store: SkillStore):
+        self.config = config
+        self.store = store
+
+    def run(
+        self,
+        *,
+        profile: ModelProfile,
+        skill: SkillRecord,
+        tasks: Sequence[str] | None,
+        n_task_combinations: int = 1,
+        seed: int = 42,
+        family: str = "android_world",
+        max_steps: int = DEFAULT_EVALUATION_MAX_STEPS,
+        output_dir: str | Path | None = None,
+    ) -> EvaluationArtifacts:
+        max_steps = _evaluation_max_steps(max_steps)
+        bootstrap_android_world(self.config.paths.android_world_root)
+        from android_world import checkpointer as checkpointer_lib
+        from android_world import registry, suite_utils
+        from android_world.agents import m3a
+        from android_world.env import env_launcher
+
+        wrapper = ForcedSkillVLWrapper(
+            OpenAICompatibleVLClient(profile), skill, model_id=profile.model_id
+        )
+        run_stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        target = Path(output_dir).resolve() if output_dir else (
+            self.config.paths.state_dir
+            / "evaluations"
+            / f"forced_skill_{run_stamp}_{uuid.uuid4().hex[:8]}"
+        )
+        checkpoint_dir = target / "checkpoints"
+        self_outer = self
+
+        class ForcedSkillM3A(m3a.M3A):
+            def __init__(self, environment):
+                super().__init__(
+                    environment,
+                    wrapper,
+                    name=f"forced-skill:{profile.model_id}:{skill.skill_id}",
+                    wait_after_action_seconds=(
+                        self_outer.config.android_world.wait_after_action_seconds
+                    ),
+                )
+
+            def reset(self, go_home_on_reset: bool = False):
+                wrapper.reset()
+                return super().reset(go_home_on_reset)
+
+            def step(self, goal: str):
+                return compact_m3a_step_result(super().step(goal))
+
+        environment = env_launcher.load_and_setup_env(
+            console_port=self.config.android_world.console_port,
+            emulator_setup=self.config.android_world.emulator_setup,
+            adb_path=self.config.android_world.adb_path,
+        )
+        try:
+            task_registry = registry.TaskRegistry()
+            suite = suite_utils.create_suite(
+                task_registry.get_registry(family=family),
+                n_task_combinations=n_task_combinations,
+                seed=seed,
+                tasks=list(tasks) if tasks else None,
+                env=environment,
+            )
+            suite.suite_family = family
+            with recover_infrastructure_failures(
+                suite_utils, environment, self.config.android_world
+            ):
+                episodes = suite_utils.run(
+                    suite,
+                    ForcedSkillM3A(environment),
+                    checkpointer=checkpointer_lib.IncrementalCheckpointer(
+                        str(checkpoint_dir)
+                    ),
+                    demo_mode=False,
+                    return_full_episode_data=True,
+                    max_n_steps_override=max_steps,
+                    stop_on_task_success=(
+                        self.config.android_world.stop_on_task_success
+                    ),
+                )
+            ensure_valid_evaluation_episodes(
+                episodes,
+                expected_episodes=sum(len(instances) for instances in suite.values()),
+            )
+        finally:
+            environment.close()
+
+        traces = episodes_to_traces(episodes)
+        return write_evaluation_report(
+            target,
+            episodes,
+            traces,
+            metadata={
+                "evaluation_mode": "skvm_forced_skill_calibration",
+                "calibration_protocol": "skvm-paired-android-world-v1",
+                "model_id": profile.model_id,
+                "served_model": profile.served_model,
+                "evaluation_checkpoint": profile.metadata.get(
+                    "evaluation_checkpoint"
+                ),
+                "adapter_resolution": dict(profile.metadata),
+                "skill_database": str(self.store.database.resolve()),
+                "forced_skill_id": skill.skill_id,
+                "forced_skill_name": skill.name,
+                "family": family,
+                "tasks": list(tasks) if tasks else "all",
+                "n_task_combinations": n_task_combinations,
+                "seed": seed,
+                "max_steps": max_steps,
+                "stop_on_task_success": (
+                    self.config.android_world.stop_on_task_success
+                ),
                 "episode_storage": "compact_without_screenshots",
             },
         )

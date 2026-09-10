@@ -443,7 +443,8 @@ python -m src1 --config src1/config.local.toml plan \
   - primitive_fallback_cost ]
 ```
 
-真实技能统计会逐渐覆盖配置先验。polished skill 失败后，执行器会禁用当前技能，
+真实的模型×技能配对标定优先覆盖配置先验；未标定的旧技能库再使用在线自然流量统计。
+polished skill 失败后，执行器会禁用当前技能，
 展开其 fallback 原语 topology 并重新路由。
 
 ## 6. 三种 AndroidWorld 评测接口
@@ -549,12 +550,70 @@ backend 维护时显式增加 `--record-traces`。候选 polished skill 默认�
 此外每次 CLI 都会在 `[paths].log_dir` 下生成独立目录，其中 `runtime.log` 保存部署输出、
 warning/error/traceback，`result.json` 和 `result.md` 保存最终指标及完整 adapter 解析结果。
 
+### 6.4 模型×技能的无 LLM 配对标定
+
+普通评测只观察路由器实际选中的技能，不能完整回答“某个 adapter 是否支持某个技能”。
+`calibrate-skills` 借鉴 SKVM bench 的 `no-skill` 与 `original/custom-skill` condition：
+对完全相同的 AndroidWorld task、参数组合和 seed，先运行一次裸模型，再强制注入指定
+技能运行一次。最终标签直接使用 AndroidWorld task evaluator，不调用额外 LLM judge。
+部署端口、GPU、`max_model_len` 和显存比例沿用三种评测接口及
+`[training_evaluation]` 配置，也都能用相同 CLI 参数覆盖。
+
+```bash
+python -m src1 --config src1/config.local.toml calibrate-skills \
+  --adapter-paths \
+    ./runtime/checkpoints/ui_grounding \
+    ./runtime/checkpoints/planning \
+  --adapter-model-ids ui-grounding planning \
+  --skill-database ./runtime/skill_library.sqlite3 \
+  --skills polished:abc:v1 polished:def:v1 \
+  --tasks ContactsAddContact SimpleCalendarAddOneEvent \
+  --combinations 10 --seed 42 --max-steps 30 \
+  --cuda-visible-devices 1
+```
+
+不传 `--skills` 时默认标定所有 candidate/active polished skills；可用
+`--skill-kind raw|polished|all` 和 `--skill-statuses` 修改范围。polished candidate 会记录
+其来源成功轨迹中的 task 名到 `metadata.calibration_tasks`，标定时优先使用这些任务。
+也可以提供完全确定性的显式映射，避免用大模型判断技能相关性：
+
+```json
+{
+  "polished:abc:v1": ["ContactsAddContact", "ContactsEditContact"],
+  "polished:def:v1": ["SystemWifiTurnOn", "SystemWifiTurnOff"]
+}
+```
+
+```bash
+--skill-task-map ./skill_task_map.json
+```
+
+同一 adapter 的裸模型 baseline 只执行一次，之后被多个技能 condition 复用。显式使用
+同一 `--output-dir` 时默认从 `condition-result.json` 恢复已经完成的 condition；使用
+`--no-resume` 可拒绝复用。输出目录包含：
+
+- `summary.json`：每个模型版本×技能版本的绝对 SR、裸模型 SR、uplift、Wilson 下界；
+- `model_skill_matrix.csv`：方便绘图和路由分析的矩阵；
+- `trials.jsonl`：逐任务、逐 seed 的配对结果，基础设施异常保留但不计入 SR；
+- `report.md`：可读标定报告；
+- `conditions/`：每个 no-skill/forced-skill condition 的标准评测报告和 checkpoint。
+
+模型版本由 base model 与实际 LoRA checkpoint 生成指纹，技能版本由 body 与 topology
+生成指纹；同名 adapter 继续训练或技能正文被优化后，不会错误继承旧标定值。默认
+`--apply-maintenance` 会在标定结束后立即更新模型专属技能状态；可用
+`--no-apply-maintenance` 只记录结果，稍后再运行 `maintain`。
+
 ## 7. 技能库自主维护
 
 ```bash
 python -m src1 --config src1/config.local.toml maintain
 python -m src1 --config src1/config.local.toml skills --kind polished
+python -m src1 --config src1/config.local.toml skills \
+  --kind polished --model-id ui-grounding
 ```
+
+`skills` 同时显示旧的在线自然流量统计、逐模型版本的配对标定指标和模型专属生命周期
+状态；从未标定显示为未知/空数组，不会与真实 0% 成功率混淆。
 
 作为常驻 backend 自主循环（每 5 分钟同步、编译、画像更新和技能优化）：
 
@@ -571,8 +630,10 @@ python -m src1 --config src1/config.local.toml maintain \
 4. 消费尚未处理的成功/失败轨迹；
 5. 按 episode 去重挖掘 2～5 个原语的高频成功子序列；
 6. 生成带 fallback 的 `candidate` polished skill；
-7. 根据真实 trial 数、成功率和 Wilson 置信下界晋升为 `active`；
-8. active 技能低于回滚阈值时标记 `deprecated`；
+7. 若存在配对标定，先按实际 adapter 版本分别计算技能 SR、裸模型 SR、uplift 和
+   Wilson 下界，维护模型专属的 candidate/active/deprecated 状态；
+8. 任一模型–技能组合通过即可让技能全局晋升，但路由只会把它交给通过标定的模型；
+   所有已标定模型均退化时才全局 deprecated；旧库没有标定时继续兼容在线 trial 规则；
 9. 把本轮结果写到 `runtime/reports/maintenance_latest.json`。
 
 生产环境可以把 `TemplateSkillCompiler` 换成云端 LLM compiler。无论编译器多强，

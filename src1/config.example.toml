@@ -102,6 +102,8 @@ minimum_subsequence_length = 2
 maximum_subsequence_length = 5
 promotion_success_rate = 0.70
 rollback_success_rate = 0.45
+# 模型×技能配对标定中，技能 SR 至少比同任务裸模型 SR 高 2 个百分点才可晋升；
+# 低于 -2 个百分点则视为对该模型有害，可触发模型专属回滚。
 baseline_margin = 0.02
 # 取消注释后，backend 每轮会用该模型编译一批 SKVM raw skills。
 # raw_skill_compiler_model_id = "teacher-glm-vl"

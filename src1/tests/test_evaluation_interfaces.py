@@ -28,7 +28,10 @@ from src1.pmtskill_v2.evaluation.android_world import (
     AndroidWorldStandaloneEvaluator,
     sample_android_world_tasks,
 )
-from src1.pmtskill_v2.online.executor import SimpleSkillVLWrapper
+from src1.pmtskill_v2.online.executor import (
+    ForcedSkillVLWrapper,
+    SimpleSkillVLWrapper,
+)
 
 
 def _checkpoint(
@@ -161,6 +164,27 @@ class EvaluationInterfacesTest(unittest.TestCase):
         )
         wrapper.predict_mm("Summerize the latest step", [])
         self.assertNotIn("简单技能提示", client.prompts[-1])
+
+    def test_forced_skill_wrapper_records_exact_model_skill_condition(self):
+        client = _FakeVLClient()
+        skill = SkillRecord(
+            skill_id="wifi-on",
+            name="Turn on wifi",
+            description="enable wifi",
+            kind="polished",
+            status=SkillStatus.CANDIDATE,
+            level=2,
+            topology=SkillTopology.from_sequence(("action.click",)),
+            body="Enable the Wi-Fi switch.",
+        )
+        wrapper = ForcedSkillVLWrapper(client, skill, model_id="adapter-a")
+
+        _, _, raw = wrapper.predict_mm("choose next action", [])
+
+        self.assertIn("SKVM forced-skill condition", client.prompts[-1])
+        self.assertEqual(raw["_pmtskill"]["model_id"], "adapter-a")
+        self.assertEqual(raw["_pmtskill"]["skill_id"], "wifi-on")
+        self.assertEqual(raw["_pmtskill"]["routing_mode"], "skvm_forced_skill")
 
     def test_cli_exposes_three_distinct_evaluation_interfaces(self):
         parser = build_parser()

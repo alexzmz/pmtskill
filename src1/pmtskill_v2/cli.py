@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .core.config import ProjectConfig, load_config
-from .core.io import load_primitives
+from .core.io import load_primitives, write_json_atomic
 from .core.run_records import CommandRunLogger, active_run_logger
 from .offline.pipeline import OfflineDistillationPipeline
 from .offline.trainer import (
@@ -625,8 +625,19 @@ def command_compile_skills(args: argparse.Namespace) -> int:
 def command_skills(args: argparse.Namespace) -> int:
     _, store = _open(args.config)
     skills = store.list_skills(status=args.status, kind=args.kind)
-    _print(
-        [
+    rows = []
+    for skill in skills:
+        online = store.skill_metrics(skill.skill_id, args.model_id)
+        calibrations = store.calibration_metrics_by_model(skill.skill_id)
+        statuses = store.list_skill_model_statuses(
+            skill.skill_id, current_skill_version_only=True
+        )
+        if args.model_id:
+            calibrations = [
+                row for row in calibrations if row["model_id"] == args.model_id
+            ]
+            statuses = [row for row in statuses if row["model_id"] == args.model_id]
+        rows.append(
             {
                 "skill_id": skill.skill_id,
                 "name": skill.name,
@@ -635,12 +646,36 @@ def command_skills(args: argparse.Namespace) -> int:
                 "level": skill.level,
                 "primitives": skill.topology.primitive_sequence(),
                 "android_relevant": skill.metadata.get("android_relevant"),
-                "metrics": store.skill_metrics(skill.skill_id),
+                # ``metrics`` 保留旧 CLI 字段；新名称强调它只来自在线自然流量。
+                "metrics": online,
+                "online_metrics": online,
+                "calibration_by_model": calibrations,
+                "model_statuses": statuses,
             }
-            for skill in skills
-        ]
-    )
+        )
+    _print(rows)
     return 0
+
+
+def _load_calibration_task_map(path: str | None) -> dict[str, tuple[str, ...]]:
+    """读取 ``skill_id -> AndroidWorld task names`` 的可选确定性映射。"""
+
+    if not path:
+        return {}
+    source = Path(path).expanduser().resolve()
+    value = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("--skill-task-map 必须是 JSON object")
+    result: dict[str, tuple[str, ...]] = {}
+    for skill_id, tasks in value.items():
+        if not isinstance(tasks, list) or not all(
+            isinstance(task, str) and task.strip() for task in tasks
+        ):
+            raise ValueError(
+                f"--skill-task-map 中 {skill_id!r} 必须对应非空任务名数组"
+            )
+        result[str(skill_id)] = tuple(dict.fromkeys(task.strip() for task in tasks))
+    return result
 
 
 def command_profile(args: argparse.Namespace) -> int:
@@ -1063,6 +1098,126 @@ def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_calibrate_skills(args: argparse.Namespace) -> int:
+    """对每个 adapter×skill 运行 no-skill/forced-skill 配对标定。"""
+
+    from .calibration import CalibrationOptions, SkillCalibrationWorkflow
+    from .skills.maintenance import SkillMaintainer
+
+    config = load_config(args.config)
+    config.ensure_runtime_dirs()
+    store = _open_evaluation_skill_store(config, args.skill_database)
+    deployment, bindings = _adapter_deployment(
+        config,
+        store,
+        args,
+        args.adapter_paths,
+        args.adapter_model_ids,
+    )
+    tasks = _evaluation_tasks(config, args)
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else (
+            config.paths.state_dir
+            / "calibrations"
+            / f"{time.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        ).resolve()
+    )
+    task_map = _load_calibration_task_map(args.skill_task_map)
+    if args.dry_run:
+        _print(
+            {
+                "dry_run": True,
+                "calibration_protocol": "skvm-paired-android-world-v1",
+                "uses_external_llm_judge": False,
+                "deployment_command": deployment.build_adapter_command(),
+                "adapters": [
+                    {"model_id": item.model_id, **item.checkpoint.to_dict()}
+                    for item in bindings
+                ],
+                "skills": args.skills or {
+                    "kind": args.skill_kind,
+                    "statuses": args.skill_statuses,
+                },
+                "tasks": tasks or "all",
+                "task_map": task_map,
+                "conditions": ["no-skill", "forced-skill"],
+                "combinations": args.combinations,
+                "seed": args.seed,
+                "max_steps": args.max_steps,
+                "output_dir": output_dir,
+                "apply_maintenance": args.apply_maintenance,
+            }
+        )
+        return 0
+
+    with deployment.activate_adapters() as profiles:
+        artifacts = SkillCalibrationWorkflow(store, config=config).run(
+            profiles,
+            CalibrationOptions(
+                output_dir=output_dir,
+                tasks=tuple(tasks) if tasks is not None else None,
+                family=args.family,
+                combinations=args.combinations,
+                seed=args.seed,
+                max_steps=args.max_steps,
+                skill_ids=tuple(args.skills or ()),
+                skill_kind=args.skill_kind,
+                statuses=tuple(args.skill_statuses),
+                task_map=task_map,
+                resume=args.resume,
+            ),
+        )
+
+    lifecycle = {
+        "applied": False,
+        "model_pair_updates": [],
+        "promoted": [],
+        "rolled_back": [],
+    }
+    if args.apply_maintenance:
+        maintainer = SkillMaintainer(store, config.maintenance)
+        lifecycle["model_pair_updates"] = maintainer.reconcile_calibrations()
+        promoted, rolled_back = maintainer.promote_and_rollback()
+        lifecycle.update(
+            {
+                "applied": True,
+                "promoted": promoted,
+                "rolled_back": rolled_back,
+            }
+        )
+        artifacts.summary["maintenance"] = lifecycle
+        write_json_atomic(artifacts.summary_json, artifacts.summary)
+        store.finish_calibration_run(
+            str(artifacts.summary["run_id"]),
+            status="completed",
+            summary=artifacts.summary,
+        )
+        with artifacts.report_markdown.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "\n## 本次生命周期更新\n\n"
+                f"- 模型–技能状态更新：{len(lifecycle['model_pair_updates'])}\n"
+                f"- 全局晋升：{json.dumps(promoted, ensure_ascii=False)}\n"
+                f"- 全局回滚：{json.dumps(rolled_back, ensure_ascii=False)}\n"
+            )
+
+    _print(
+        {
+            "calibration_protocol": "skvm-paired-android-world-v1",
+            "uses_external_llm_judge": False,
+            "summary": artifacts.summary,
+            "summary_json": artifacts.summary_json,
+            "report_markdown": artifacts.report_markdown,
+            "model_skill_matrix_csv": artifacts.matrix_csv,
+            "trials_jsonl": artifacts.trials_jsonl,
+            "skill_database": store.database.resolve(),
+            "maintenance": lifecycle,
+        }
+    )
+    return 0
+
+
 def _add_common_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
     """三种评测共享的任务选择、部署资源和输出参数。"""
 
@@ -1342,11 +1497,16 @@ def build_parser() -> argparse.ArgumentParser:
     compile_skills.add_argument("--limit", type=int, default=8, help="本批最大技能数")
     compile_skills.set_defaults(handler=command_compile_skills)
 
-    skills = subparsers.add_parser("skills", help="查看技能及其真实在线统计")
+    skills = subparsers.add_parser(
+        "skills", help="查看技能、在线统计和逐模型配对标定指标"
+    )
     skills.add_argument(
         "--status", choices=["imported", "candidate", "active", "deprecated"]
     )
     skills.add_argument("--kind", choices=["raw", "polished"])
+    skills.add_argument(
+        "--model-id", help="只显示某个逻辑模型的在线/标定指标"
+    )
     skills.set_defaults(handler=command_skills)
 
     profile = subparsers.add_parser("profile", help="更新模型/LoRA 的原语能力画像")
@@ -1421,6 +1581,65 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--routing-minimum-capability", type=float)
     evaluate.add_argument("--routing-maximum-candidates", type=int)
     evaluate.set_defaults(handler=command_evaluate_pmtskill)
+
+    calibrate = subparsers.add_parser(
+        "calibrate-skills",
+        help="用 AndroidWorld 真值标定每个 adapter 对每个技能的支持度",
+    )
+    calibrate.add_argument(
+        "--adapter-paths",
+        nargs="+",
+        required=True,
+        help="一个或多个 adapter 顶层目录；在同一服务中顺序标定",
+    )
+    calibrate.add_argument(
+        "--adapter-model-ids",
+        nargs="*",
+        help="与 adapter-paths 一一对应的模型 ID；默认使用目录名",
+    )
+    calibrate.add_argument(
+        "--skill-database",
+        help="覆盖 [paths].skill_library_db，必须指向已有 skill_library.sqlite3",
+    )
+    calibrate.add_argument(
+        "--skills",
+        nargs="*",
+        help="显式 skill_id；不传时按 kind/status 选择",
+    )
+    calibrate.add_argument(
+        "--skill-kind",
+        choices=["polished", "raw", "all"],
+        default="polished",
+        help="自动选择时的技能类型；默认 polished",
+    )
+    calibrate.add_argument(
+        "--skill-statuses",
+        nargs="*",
+        choices=["imported", "candidate", "active", "deprecated"],
+        default=["candidate", "active"],
+        help="自动选择 polished skill 的生命周期状态",
+    )
+    calibrate.add_argument(
+        "--skill-task-map",
+        help=(
+            "可选 JSON：skill_id -> task name 数组；默认优先使用候选技能从成功轨迹"
+            "继承的 calibration_tasks，再回退本次全局任务范围"
+        ),
+    )
+    calibrate.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="从同一 output-dir 已完成的 condition 恢复（默认启用）",
+    )
+    calibrate.add_argument(
+        "--apply-maintenance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="标定后立即更新模型专属状态与技能全局生命周期（默认启用）",
+    )
+    _add_common_evaluation_arguments(calibrate)
+    calibrate.set_defaults(handler=command_calibrate_skills)
     return parser
 
 

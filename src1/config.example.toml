@@ -12,7 +12,7 @@ skill_library_db = "./runtime/skill_library.sqlite3"
 log_dir = "./runtime/logs"
 
 [offline]
-teacher_model_id = "teacher-deepseek-v4-flash"
+teacher_model_id = "teacher-qwen3.7-plus"
 student_model_path = "/home/zmz/Workspace/models/qwen3-vl-4b-instruct"
 trajectory_dir = "./runtime/trajectories"
 dataset_dir = "./runtime/dataset"
@@ -116,6 +116,15 @@ model_id = "teacher-deepseek-v4-flash"
 served_model = "/home/zmz/Workspace/models/deepseek-v4-flash"
 base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
+average_latency_ms = 2200.0
+switch_cost_ms = 0.0
+enabled = true
+
+[[models]]
+model_id = "teacher-qwen3.7-plus"
+served_model="qwen3.7-plus"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
 average_latency_ms = 2200.0
 switch_cost_ms = 0.0
 enabled = true

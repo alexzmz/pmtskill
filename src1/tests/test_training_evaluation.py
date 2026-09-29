@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from src1.pmtskill_v2.cli import (
     _training_evaluation_output_dir,
@@ -27,6 +28,7 @@ from src1.pmtskill_v2.core.config import (
 from src1.pmtskill_v2.core.models import ModelProfile
 from src1.pmtskill_v2.evaluation.deployment import MSSwiftEvaluationDeployment
 from src1.pmtskill_v2.evaluation.reporter import EvaluationArtifacts
+from src1.pmtskill_v2.evaluation.capabilities import summarize_capabilities
 from src1.pmtskill_v2.offline.trainer import (
     AdapterJob,
     MSSwiftLoraTrainer,
@@ -35,6 +37,7 @@ from src1.pmtskill_v2.offline.trainer import (
     staged_training_job,
 )
 from src1.pmtskill_v2.offline.training_workflow import (
+    TrainingEvaluationRecorder,
     TrainingEvaluationOptions,
     TrainingEvaluationWorkflow,
     build_epoch_plan,
@@ -179,6 +182,73 @@ class _InterruptedEvaluator(_FakeEvaluator):
 
 
 class TrainingEvaluationTest(unittest.TestCase):
+    def test_training_comparison_reports_final_capability_distribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = {
+                "tasks": ["CameraTakePhoto"],
+                "combinations": 1,
+                "seed": 42,
+                "evaluation_max_steps": 30,
+                "full_evaluation": True,
+            }
+            recorder = TrainingEvaluationRecorder(root, manifest)
+            distribution, unclassified = summarize_capabilities(
+                {
+                    "CameraTakePhoto": {
+                        "successes": 1,
+                        "episodes": 1,
+                        "success_rate": 1.0,
+                    }
+                }
+            )
+            summary = {
+                "episodes_evaluated": 1,
+                "successes": 1,
+                "success_rate_micro": 1.0,
+                "success_rate_macro": 1.0,
+                "average_steps": 2.0,
+                "capability_distribution": distribution,
+                "capability_unclassified_tasks": unclassified,
+            }
+            artifact_dir = root / "evaluations" / "epoch_001" / "standalone"
+            artifact_dir.mkdir(parents=True)
+            artifacts = EvaluationArtifacts(
+                artifact_dir,
+                artifact_dir / "summary.json",
+                artifact_dir / "report.md",
+                artifact_dir / "traces.jsonl",
+                summary,
+            )
+            with patch(
+                "src1.pmtskill_v2.offline.training_workflow.render_capability_plot",
+                return_value={
+                    "png": "capability_distribution_final_standalone.png",
+                    "pdf": "capability_distribution_final_standalone.pdf",
+                },
+            ):
+                recorder.record_evaluation(
+                    label="epoch_001_standalone",
+                    mode="standalone",
+                    epoch=1.0,
+                    checkpoint=root / "checkpoint-10",
+                    artifacts=artifacts,
+                    final_checkpoint=True,
+                )
+
+            markdown = recorder.comparison_markdown.read_text(encoding="utf-8")
+            self.assertIn("## 各阶段七维能力变化", markdown)
+            self.assertIn("## 训练后裸模型七维能力", markdown)
+            self.assertIn("| Control | 1/1 |", markdown)
+            self.assertIn("capability_distribution_final_standalone.png", markdown)
+            history = json.loads(recorder.history_json.read_text(encoding="utf-8"))
+            self.assertEqual(
+                history["stages"][0]["capability_distribution"]["control"][
+                    "score"
+                ],
+                100.0,
+            )
+
     def test_epoch_targets_include_interval_and_fractional_final(self):
         self.assertEqual(build_epoch_targets(3.0, 1), [1.0, 2.0, 3.0])
         self.assertEqual(build_epoch_targets(5.0, 2), [2.0, 4.0, 5.0])

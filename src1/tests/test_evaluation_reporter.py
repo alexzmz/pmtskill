@@ -3,13 +3,65 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 
 from src1.pmtskill_v2.evaluation.android_world import episodes_to_traces
-from src1.pmtskill_v2.evaluation.reporter import summarize_episodes
+from src1.pmtskill_v2.evaluation.capabilities import (
+    CAPABILITY_ORDER,
+    TASK_CLASSES,
+    summarize_capabilities,
+)
+from src1.pmtskill_v2.evaluation.reporter import (
+    summarize_episodes,
+    write_evaluation_report,
+)
 
 
 class EvaluationReporterTest(unittest.TestCase):
+    def test_seven_capability_classes_are_unique_and_complete(self):
+        self.assertEqual(
+            tuple(TASK_CLASSES),
+            CAPABILITY_ORDER,
+        )
+        tasks = [task for values in TASK_CLASSES.values() for task in values]
+        self.assertEqual(len(tasks), len(set(tasks)))
+        self.assertEqual(len(tasks), 116)
+
+    def test_capability_score_is_episode_weighted_and_missing_is_na(self):
+        distribution, unclassified = summarize_capabilities(
+            {
+                "CameraTakePhoto": {
+                    "successes": 1,
+                    "episodes": 2,
+                    "success_rate": 0.5,
+                },
+                "SystemWifiTurnOn": {
+                    "successes": 3,
+                    "episodes": 3,
+                    "success_rate": 1.0,
+                },
+                "ContactsAddContact": {
+                    "successes": 0,
+                    "episodes": 1,
+                    "success_rate": 0.0,
+                },
+                "FutureAndroidWorldTask": {
+                    "successes": 1,
+                    "episodes": 1,
+                    "success_rate": 1.0,
+                },
+            }
+        )
+
+        self.assertEqual(distribution["control"]["successes"], 4)
+        self.assertEqual(distribution["control"]["episodes"], 5)
+        self.assertEqual(distribution["control"]["score"], 80.0)
+        self.assertEqual(distribution["create"]["score"], 0.0)
+        self.assertIsNone(distribution["edit"]["score"])
+        self.assertEqual(unclassified, ["FutureAndroidWorldTask"])
+
     def test_nan_reward_is_not_reported_as_success(self):
         summary = summarize_episodes(
             [
@@ -116,6 +168,43 @@ class EvaluationReporterTest(unittest.TestCase):
         self.assertEqual(summary["permission_controller_restarts"], 0)
         self.assertEqual(summary["permission_controller_dialogs_dismissed"], 1)
         self.assertEqual(summary["permission_controller_model_delegations"], 2)
+
+    def test_evaluation_report_contains_capability_table_and_plot_reference(self):
+        episode = {
+            "task_template": "BrowserMaze",
+            "is_successful": 1.0,
+            "episode_length": 2,
+            "run_time": 1.0,
+            "exception_info": None,
+            "episode_data": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = write_evaluation_report(
+                Path(directory),
+                [episode],
+                [],
+                metadata={"model_id": "student-vl"},
+            )
+            markdown = artifacts.report_markdown.read_text(encoding="utf-8")
+            self.assertIn("## 七维能力分布", markdown)
+            self.assertIn("| Interactive | 1/1 |", markdown)
+            self.assertEqual(
+                artifacts.summary["capability_distribution"]["interactive"][
+                    "score"
+                ],
+                100.0,
+            )
+            # 有 matplotlib 时必须同时生成 PNG/PDF；精简测试环境则记录明确错误。
+            if "capability_plot" in artifacts.summary:
+                self.assertTrue(
+                    (Path(directory) / "capability_distribution.png").is_file()
+                )
+                self.assertTrue(
+                    (Path(directory) / "capability_distribution.pdf").is_file()
+                )
+                self.assertIn("![七维能力分布]", markdown)
+            else:
+                self.assertIn("capability_plot_error", artifacts.summary)
 
 
 if __name__ == "__main__":

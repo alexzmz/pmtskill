@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import sys
 import time
@@ -35,7 +36,12 @@ from .online.planner import (
     PrimitiveTopologyGenerator,
 )
 from .online.router import DynamicProgrammingRouter
-from .skills.importer import import_skvm_skills, relevant_raw_skills
+from .skills.importer import (
+    import_skill_cluster,
+    import_skvm_skills,
+    relevant_raw_skills,
+    scan_skill_cluster,
+)
 from .skills.compiler import LLMRawSkillCompiler, compile_imported_raw_skills
 from .skills.store import SkillStore
 
@@ -93,7 +99,51 @@ def _open(config_path: str) -> tuple[ProjectConfig, SkillStore]:
     config.ensure_runtime_dirs()
     store = SkillStore(config.paths.database)
     store.initialize()
+    # primitives.json 仍是可版本控制的权威定义；SQLite 保存可查询镜像，与优化技能、
+    # 优秀轨迹共同组成完整技能数据层。
+    store.sync_primitive_catalog(load_primitives())
     return config, store
+
+
+def _external_skill_namespace(root: Path, value: str | None) -> str:
+    """生成稳定且适合 SQLite ID 的外部技能簇 namespace。"""
+
+    # 显式 namespace 在目录移动后仍稳定；默认值加入绝对路径指纹，避免多个都叫
+    # ``skills`` 的簇静默覆盖彼此。
+    raw = value or root.name
+    compact = "".join(
+        character.lower()
+        if character.isalnum() or character in {"-", "_", "."}
+        else "-"
+        for character in raw.strip()
+    ).strip("-.")
+    if not compact:
+        raise ValueError("--skill-namespace 不能是空标识")
+    if value:
+        return f"external:{compact}"
+    path_fingerprint = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:8]
+    return f"external:{compact}-{path_fingerprint}"
+
+
+def _scan_summary(root: Path, namespace: str) -> tuple[list[Any], dict[str, Any]]:
+    """只读扫描外部技能簇，供 dry-run 和独立 import-skills 预览复用。"""
+
+    skills = list(scan_skill_cluster(root, namespace=namespace))
+    resources = sum(
+        len(skill.metadata.get("package_manifest", ())) for skill in skills
+    )
+    skipped_resources = sum(
+        len(skill.metadata.get("package_skipped_resources", ())) for skill in skills
+    )
+    return skills, {
+        "root": str(root),
+        "namespace": namespace,
+        "scanned": len(skills),
+        "resources": resources,
+        "skipped_resources": skipped_resources,
+        "skill_ids": [skill.skill_id for skill in skills],
+        "write_database": False,
+    }
 
 
 def command_init(args: argparse.Namespace) -> int:
@@ -645,6 +695,7 @@ def command_skills(args: argparse.Namespace) -> int:
                 "level": skill.level,
                 "primitives": skill.topology.primitive_sequence(),
                 "android_relevant": skill.metadata.get("android_relevant"),
+                "relations": store.list_skill_relations(skill.skill_id),
                 # ``metrics`` 保留旧 CLI 字段；新名称强调它只来自在线自然流量。
                 "metrics": online,
                 "online_metrics": online,
@@ -653,6 +704,73 @@ def command_skills(args: argparse.Namespace) -> int:
             }
         )
     _print(rows)
+    return 0
+
+
+def command_primitives(args: argparse.Namespace) -> int:
+    """查看 SQLite 中同步后的原语目录。"""
+
+    _, store = _open(args.config)
+    primitives = store.list_primitive_catalog(enabled_only=not args.include_disabled)
+    _print(
+        {
+            "count": len(primitives),
+            "primitives": [primitive.to_dict() for primitive in primitives],
+        }
+    )
+    return 0
+
+
+def command_trajectories(args: argparse.Namespace) -> int:
+    """查看优秀轨迹库索引；完整事件仍可按 trace_id 从 traces 读取。"""
+
+    _, store = _open(args.config)
+    if args.trace_id:
+        trace = store.get_trace(args.trace_id)
+        if trace is None:
+            raise KeyError(f"轨迹不存在: {args.trace_id}")
+        entries = store.list_trajectory_library(trace_id=args.trace_id, limit=1)
+        entry = entries[0] if entries else None
+        _print(
+            {
+                "counts": store.trajectory_library_counts(),
+                "entry": entry,
+                "trace": trace.to_dict(),
+            }
+        )
+        return 0
+    rows = store.list_trajectory_library(
+        quality_status=args.quality_status,
+        source_kind=args.source_kind,
+        source_skill_id=args.source_skill_id,
+        limit=args.limit,
+    )
+    if args.include_events:
+        for row in rows:
+            trace = store.get_trace(str(row["trace_id"]))
+            row["trace"] = trace.to_dict() if trace else None
+    _print(
+        {
+            "counts": store.trajectory_library_counts(),
+            "matched": len(rows),
+            "trajectories": rows,
+        }
+    )
+    return 0
+
+
+def command_import_skills(args: argparse.Namespace) -> int:
+    """独立导入/预览任意 SKILL.md 技能簇，不需要先运行旧 init 链路。"""
+
+    _, store = _open(args.config)
+    root = Path(args.skill_root).expanduser().resolve()
+    namespace = _external_skill_namespace(root, args.skill_namespace)
+    if args.dry_run:
+        _, summary = _scan_summary(root, namespace)
+        _print(summary)
+        return 0
+    summary = import_skill_cluster(root, store, namespace=namespace)
+    _print(summary.to_dict())
     return 0
 
 
@@ -665,6 +783,18 @@ def command_collect_optimization_traces(args: argparse.Namespace) -> int:
         default_optimization_trace_output,
     )
 
+    if args.source == "task" and any(
+        (args.skills, args.skill_task_map, args.skill_root, args.skill_namespace)
+    ):
+        raise ValueError(
+            "task 模式不能使用 --skills/--skill-task-map/--skill-root"
+        )
+    if args.source == "skill-cluster" and not args.skill_root:
+        raise ValueError("--source skill-cluster 必须提供 --skill-root")
+    if args.source != "skill-cluster" and (args.skill_root or args.skill_namespace):
+        raise ValueError(
+            "--skill-root/--skill-namespace 只能用于 --source skill-cluster"
+        )
     if args.skill_limit <= 0:
         raise ValueError("--skill-limit 必须是正整数")
     if args.maximum_tasks_per_skill <= 0:
@@ -673,35 +803,78 @@ def command_collect_optimization_traces(args: argparse.Namespace) -> int:
         raise ValueError("--combinations 必须是正整数")
     if args.replan_every_steps < 0:
         raise ValueError("--replan-every-steps 不能为负数")
+    task_map = _load_calibration_task_map(args.skill_task_map)
     config, store = _open(args.config)
-    source_kind = "raw_skill" if args.source == "raw-skill" else "task"
-    source_skills = []
-    if source_kind == "raw_skill":
-        available = store.list_skills()
-        by_id = {skill.skill_id: skill for skill in available}
+    source_kind = {
+        "task": "task",
+        # 旧名称继续保留，其轨迹 provenance 也保持 raw_skill，避免破坏已有分析。
+        "raw-skill": "raw_skill",
+        "database-skills": "database_skill",
+        "skill-cluster": "skill_cluster",
+    }[args.source]
+    is_skill_source = source_kind != "task"
+    source_skills: list[Any] = []
+    source_metadata: dict[str, Any] = {"cli_source": args.source}
+
+    if source_kind == "skill_cluster":
+        root = Path(args.skill_root).expanduser().resolve()
+        namespace = _external_skill_namespace(root, args.skill_namespace)
+        if args.dry_run:
+            source_skills, scan_summary = _scan_summary(root, namespace)
+            source_metadata["skill_cluster"] = scan_summary
+        else:
+            imported = import_skill_cluster(root, store, namespace=namespace)
+            source_metadata["skill_cluster"] = {
+                **imported.to_dict(),
+                "write_database": True,
+            }
+            source_skills = [
+                skill
+                for skill_id in imported.skill_ids
+                if (skill := store.get_skill(skill_id)) is not None
+            ]
+    elif source_kind in {"raw_skill", "database_skill"}:
+        source_skills = store.list_skills()
+
+    if is_skill_source:
+        by_id = {skill.skill_id: skill for skill in source_skills}
         if args.skills:
             missing = [skill_id for skill_id in args.skills if skill_id not in by_id]
             if missing:
-                raise KeyError(f"技能库中不存在这些 skill IDs: {missing}")
+                location = "本次技能簇" if source_kind == "skill_cluster" else "技能库"
+                raise KeyError(f"{location}中不存在这些 skill IDs: {missing}")
             source_skills = [by_id[skill_id] for skill_id in args.skills]
         else:
             statuses = set(args.skill_statuses)
             source_skills = [
                 skill
-                for skill in available
+                for skill in source_skills
                 if (args.skill_kind == "all" or skill.kind == args.skill_kind)
                 and skill.status.value in statuses
             ][: args.skill_limit]
         if not source_skills:
             raise ValueError(
-                "raw-skill 模式没有选中技能；请传 --skills，或调整 kind/status/limit"
+                "技能来源模式没有选中技能；请检查目录/--skills，或调整 kind/status/limit"
             )
-    elif args.skills or args.skill_task_map:
-        raise ValueError("--skills/--skill-task-map 只能用于 --source raw-skill")
+        if task_map:
+            selected_ids = {skill.skill_id for skill in source_skills}
+            matched_map = {
+                skill_id: tasks
+                for skill_id, tasks in task_map.items()
+                if skill_id in selected_ids
+            }
+            ignored = sorted(set(task_map) - selected_ids)
+            if not matched_map:
+                raise KeyError(
+                    "--skill-task-map 没有任何 key 命中本批选中的 skill IDs；"
+                    f"未命中: {ignored}"
+                )
+            if ignored:
+                source_metadata["ignored_skill_task_map_keys"] = ignored
+            task_map = matched_map
 
     teacher_model_id = args.teacher_model_id or config.offline.teacher_model_id
     profile = config.model(teacher_model_id)
-    task_map = _load_calibration_task_map(args.skill_task_map)
     optimized_skills = []
     if args.allow_polished_units:
         optimized_skills = [
@@ -732,6 +905,7 @@ def command_collect_optimization_traces(args: argparse.Namespace) -> int:
                 "record_traces": args.record_traces,
                 "skill_database": store.database.resolve(),
                 "output_dir": output_dir,
+                "source_metadata": source_metadata,
             }
         )
         return 0
@@ -752,6 +926,7 @@ def command_collect_optimization_traces(args: argparse.Namespace) -> int:
             auto_bind_skills=args.auto_bind_skills,
             maximum_tasks_per_skill=args.maximum_tasks_per_skill,
             record_traces=args.record_traces,
+            source_metadata=source_metadata,
         ),
         optimized_skills=optimized_skills,
     )
@@ -770,7 +945,7 @@ def _load_calibration_task_map(path: str | None) -> dict[str, tuple[str, ...]]:
         raise ValueError("--skill-task-map 必须是 JSON object")
     result: dict[str, tuple[str, ...]] = {}
     for skill_id, tasks in value.items():
-        if not isinstance(tasks, list) or not all(
+        if not isinstance(tasks, list) or not tasks or not all(
             isinstance(task, str) and task.strip() for task in tasks
         ):
             raise ValueError(
@@ -1418,6 +1593,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.set_defaults(handler=command_init)
 
+    import_skills = subparsers.add_parser(
+        "import-skills",
+        help="从任意 SKILL.md 技能包/技能簇导入 raw skills，不运行 compile",
+    )
+    import_skills.add_argument(
+        "--skill-root",
+        "--skill-cluster-path",
+        dest="skill_root",
+        required=True,
+        help="技能包或技能簇绝对路径；支持根目录自身或递归子目录中的 SKILL.md",
+    )
+    import_skills.add_argument(
+        "--skill-namespace",
+        help="稳定来源名；默认取目录名，用来避免不同技能簇的同名 ID 冲突",
+    )
+    import_skills.add_argument(
+        "--dry-run", action="store_true", help="只扫描 manifest，不写入 skills 表"
+    )
+    import_skills.set_defaults(handler=command_import_skills)
+
     doctor = subparsers.add_parser("doctor", help="检查本地路径和必要组件")
     doctor.set_defaults(handler=command_doctor)
 
@@ -1443,21 +1638,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     optimization_collect.add_argument(
         "--source",
-        choices=["task", "raw-skill"],
+        choices=["task", "database-skills", "skill-cluster", "raw-skill"],
         default="task",
-        help="task 从任务目标规划；raw-skill 从技能任务描述与解法规划",
+        help=(
+            "task=直接任务；database-skills=SQLite 已有技能；"
+            "skill-cluster=导入外部目录后立即标注；raw-skill 为旧兼容名"
+        ),
     )
     optimization_collect.add_argument(
         "--tasks",
+        "--shared-tasks",
+        dest="tasks",
         nargs="*",
         help=(
-            "task 模式选择任务；raw-skill 模式下作为所有技能共享的显式任务绑定"
+            "task 模式选择任务；技能模式下作为所有技能共享的显式任务绑定"
         ),
     )
     optimization_collect.add_argument(
         "--skills",
         nargs="*",
-        help="raw-skill 模式指定 skill IDs；省略时按 kind/status/limit 选择",
+        help="技能模式指定 skill IDs；省略时按 kind/status/limit 选择",
+    )
+    optimization_collect.add_argument(
+        "--skill-root",
+        "--skill-cluster-path",
+        dest="skill_root",
+        help="skill-cluster 模式的技能包/技能簇绝对路径",
+    )
+    optimization_collect.add_argument(
+        "--skill-namespace",
+        help="外部技能簇稳定来源名；默认取 --skill-root 的目录名",
     )
     optimization_collect.add_argument(
         "--skill-kind",
@@ -1480,7 +1690,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     optimization_collect.add_argument(
         "--skill-task-map",
-        help="JSON：skill_id -> AndroidWorld task names；语义与标定流程一致",
+        help=(
+            "可选 JSON：skill_id -> AndroidWorld task names；不传时默认由 metadata/Teacher 自动绑定"
+        ),
     )
     optimization_collect.add_argument(
         "--auto-bind-skills",
@@ -1716,6 +1928,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-id", help="只显示某个逻辑模型的在线/标定指标"
     )
     skills.set_defaults(handler=command_skills)
+
+    primitives = subparsers.add_parser(
+        "primitives", help="查看 SQLite 中的原语目录"
+    )
+    primitives.add_argument(
+        "--include-disabled", action="store_true", help="同时显示已从 JSON 移除的历史原语"
+    )
+    primitives.set_defaults(handler=command_primitives)
+
+    trajectories = subparsers.add_parser(
+        "trajectories", help="查看优秀/失败/拒绝轨迹库索引"
+    )
+    trajectories.add_argument(
+        "--quality-status",
+        choices=["excellent", "candidate", "failed", "rejected"],
+    )
+    trajectories.add_argument(
+        "--source-kind", help="按 collection_source.kind 过滤；允许未来自定义来源名"
+    )
+    trajectories.add_argument("--source-skill-id")
+    trajectories.add_argument("--trace-id", help="读取一条完整 trace 及所有事件")
+    trajectories.add_argument(
+        "--include-events", action="store_true", help="列表结果中也展开完整事件"
+    )
+    trajectories.add_argument("--limit", type=int, default=100)
+    trajectories.set_defaults(handler=command_trajectories)
 
     profile = subparsers.add_parser("profile", help="更新模型/LoRA 的原语能力画像")
     profile.add_argument("--model-id", required=True)

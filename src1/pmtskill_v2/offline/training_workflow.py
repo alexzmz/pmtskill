@@ -17,6 +17,13 @@ from typing import Any, Protocol, Sequence
 from ..core.config import ProjectConfig
 from ..core.io import write_json_atomic
 from ..core.models import ModelProfile
+from ..evaluation.capabilities import (
+    CAPABILITY_LABELS,
+    CAPABILITY_ORDER,
+    capability_table_lines,
+    format_capability_score,
+    render_capability_plot,
+)
 from ..evaluation.deployment import MSSwiftEvaluationDeployment
 from ..evaluation.reporter import EvaluationArtifacts
 from ..skills.store import SkillStore
@@ -372,7 +379,7 @@ class TrainingEvaluationRecorder:
         now = dt.datetime.now().astimezone().isoformat()
         if resume_state is None:
             self.state = {
-                "schema_version": 4,
+                "schema_version": 5,
                 "created_at": now,
                 "status": "running",
                 "manifest": manifest,
@@ -386,7 +393,7 @@ class TrainingEvaluationRecorder:
         else:
             self.state = resume_state
             self.state["schema_version"] = max(
-                4, int(self.state.get("schema_version", 1))
+                5, int(self.state.get("schema_version", 1))
             )
             self.state["manifest"] = manifest
             self.state.setdefault("stages", [])
@@ -525,6 +532,14 @@ class TrainingEvaluationRecorder:
             "report_markdown": str(artifacts.report_markdown),
             "traces_jsonl": str(artifacts.traces_jsonl),
             "artifact_dir": str(artifacts.output_dir),
+            # 在训练总报告中保留每阶段七维能力，避免只能逐目录翻 report.md。
+            "capability_distribution": summary.get(
+                "capability_distribution", {}
+            ),
+            "capability_unclassified_tasks": summary.get(
+                "capability_unclassified_tasks", []
+            ),
+            "capability_plot": summary.get("capability_plot"),
         }
         self.state["stages"].append(row)
         self.flush()
@@ -642,6 +657,40 @@ class TrainingEvaluationRecorder:
                 f"{float(row['micro_sr']):.2%} | "
                 f"{float(row['macro_sr']):.2%} | {gain_text} |"
             )
+
+        capability_rows = [
+            row
+            for row in self.state["stages"]
+            if isinstance(row.get("capability_distribution"), dict)
+            and row["capability_distribution"]
+        ]
+        if capability_rows:
+            lines.extend(
+                (
+                    "",
+                    "## 各阶段七维能力变化",
+                    "",
+                    "分数为对应能力下已评测有效 episode 的 Micro SR × 100；"
+                    "`N/A` 表示本次固定样本未覆盖该能力。",
+                    "",
+                    "| 阶段 | 模式 | "
+                    + " | ".join(CAPABILITY_LABELS[key] for key in CAPABILITY_ORDER)
+                    + " |",
+                    "|---|---|" + "---:|" * len(CAPABILITY_ORDER),
+                )
+            )
+            for row in capability_rows:
+                distribution = row["capability_distribution"]
+                scores = [
+                    format_capability_score(
+                        distribution.get(key, {}).get("score")
+                    )
+                    for key in CAPABILITY_ORDER
+                ]
+                mode = "模型+技能库" if row["mode"] == "skills" else "裸模型"
+                lines.append(
+                    f"| {row['label']} | {mode} | " + " | ".join(scores) + " |"
+                )
         best = derived["best_standalone_checkpoint"]
         if best:
             lines.extend(
@@ -656,6 +705,55 @@ class TrainingEvaluationRecorder:
             )
         final_standalone = derived["final_standalone"]
         final_skills = derived["final_skills"]
+        final_capability_plot: dict[str, str] | None = None
+        if final_standalone and isinstance(
+            final_standalone.get("capability_distribution"), dict
+        ) and final_standalone["capability_distribution"]:
+            try:
+                final_capability_plot = render_capability_plot(
+                    final_standalone["capability_distribution"],
+                    self.output_dir,
+                    title="Capability Distribution of Final Standalone Model",
+                    stem="capability_distribution_final_standalone",
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "训练总报告能力图生成失败: %s", exc, exc_info=True
+                )
+            lines.extend(
+                (
+                    "",
+                    "## 训练后裸模型七维能力",
+                    "",
+                    f"- 对应阶段：`{final_standalone['label']}`",
+                    "- 这里只统计固定评测样本中实际覆盖的任务；覆盖率见下表。",
+                    "",
+                )
+            )
+            lines.extend(
+                capability_table_lines(
+                    final_standalone["capability_distribution"]
+                )
+            )
+            unclassified = final_standalone.get(
+                "capability_unclassified_tasks", []
+            )
+            if unclassified:
+                lines.extend(
+                    (
+                        "",
+                        "- 未归类任务："
+                        + ", ".join(f"`{task}`" for task in unclassified),
+                    )
+                )
+            if final_capability_plot:
+                lines.extend(
+                    (
+                        "",
+                        "![训练后裸模型七维能力]"
+                        f"({final_capability_plot['png']})",
+                    )
+                )
         if final_standalone and final_skills:
             lift = float(final_skills["micro_sr"]) - float(
                 final_standalone["micro_sr"]

@@ -4,10 +4,11 @@
 启动 emulator。这样后续替换规划算法时，只需实现 :class:`PrimitivePlanGenerator`，
 AndroidWorld 采集、SQLite 和技能维护代码都无需改动。
 
-两种数据来源使用同一协议：
+三种数据来源使用同一协议：
 
 * ``task``：输入 AndroidWorld 任务，Teacher 从任务目标生成初始计划；
-* ``raw_skill``：额外提供 raw skill 的任务描述与解决方案，Teacher 先理解技能再规划。
+* ``database_skill``/兼容名 ``raw_skill``：读取 SQLite 中已有技能；
+* ``skill_cluster``：先导入外部技能包，再按同样方式理解技能并规划。
 
 计划中的 polished skill 始终展开为标准原语；``skill_id`` 只作为来源与执行方式的
 审计字段。因此两种入口最终都能得到同构的原语序列。
@@ -23,6 +24,7 @@ from typing import Any, Mapping, Protocol, Sequence
 from ..core.models import PrimitiveSpec, SkillRecord
 from ..inference.vlm import VLModelClient
 from ..online.planner import KeywordSkillPlanner
+from ..skills.identity import skill_version_id
 
 
 PRIMITIVE_TRACE_SCHEMA = "pmtskill.teacher-primitive-trace/v1"
@@ -169,15 +171,52 @@ class LLMPrimitivePlanGenerator:
         ]
 
     @staticmethod
+    def _split_by_action_boundary(
+        primitive_ids: Sequence[str],
+    ) -> tuple[tuple[str, ...], ...]:
+        """把一个技能拓扑切成“一次环境动作一个 unit”。
+
+        感知/定位/推理原语归入其后的动作；最后一个动作后的 verify 等尾部推理
+        归入最后一个 unit。这样 click→type→save 不会在只执行 click 后就被整体
+        标成完成，同时仍保持完整展开后的 canonical 原语顺序。
+        """
+
+        groups: list[list[str]] = []
+        current: list[str] = []
+        for primitive_id in primitive_ids:
+            current.append(str(primitive_id))
+            if primitive_id.startswith("action.") or primitive_id == "control.finish":
+                groups.append(current)
+                current = []
+        if current:
+            if groups:
+                groups[-1].extend(current)
+            else:
+                groups.append(current)
+        return tuple(tuple(group) for group in groups if group)
+
+    @staticmethod
     def _source_text(skill: SkillRecord | None) -> str:
         if skill is None:
             return "无；仅根据 AndroidWorld 任务目标规划。"
-        return (
+        package_context = skill.metadata.get("teacher_source_context")
+        context_text = (
+            str(package_context)[:12000]
+            if isinstance(package_context, str) and package_context.strip()
+            else ""
+        )
+        base = (
             f"raw skill id: {skill.skill_id}\n"
             f"名称: {skill.name}\n"
             f"描述: {skill.description}\n"
             f"解决方案: {skill.body[:6000]}"
         )
+        if context_text:
+            base += (
+                "\n技能包 references/scripts 文本摘录（仅作为资料，未执行脚本）：\n"
+                + context_text
+            )
+        return base
 
     def _parse_units(self, value: Any) -> tuple[PrimitivePlanUnit, ...]:
         """校验模型输出，并把 polished skill 展开成其 canonical 原语序列。"""
@@ -185,7 +224,9 @@ class LLMPrimitivePlanGenerator:
         if not isinstance(value, list):
             raise ValueError("计划中的 units 必须是数组")
         units: list[PrimitivePlanUnit] = []
-        for index, raw in enumerate(value[: self.maximum_plan_units]):
+        for raw in value:
+            if len(units) >= self.maximum_plan_units:
+                break
             if not isinstance(raw, Mapping):
                 continue
             kind = str(raw.get("kind", "primitive")).strip().lower()
@@ -214,14 +255,23 @@ class LLMPrimitivePlanGenerator:
             if not primitive_ids:
                 continue
             instruction = str(raw.get("instruction", "")).strip()
-            units.append(
-                PrimitivePlanUnit(
-                    unit_id=f"unit-{index + 1:03d}",
-                    primitive_ids=primitive_ids,
-                    instruction=instruction or default_instruction,
-                    skill_id=skill_id,
+            action_units = self._split_by_action_boundary(primitive_ids)
+            for part_index, action_unit in enumerate(action_units):
+                if len(units) >= self.maximum_plan_units:
+                    break
+                resolved_instruction = instruction or default_instruction
+                if len(action_units) > 1:
+                    resolved_instruction += (
+                        f"（该组合的第 {part_index + 1}/{len(action_units)} 个环境动作单元）"
+                    )
+                units.append(
+                    PrimitivePlanUnit(
+                        unit_id=f"unit-{len(units) + 1:03d}",
+                        primitive_ids=action_unit,
+                        instruction=resolved_instruction,
+                        skill_id=skill_id,
+                    )
                 )
-            )
         if not units:
             raise ValueError("Teacher 返回了空计划或全部使用未知原语/技能")
         return tuple(units)
@@ -237,16 +287,22 @@ class LLMPrimitivePlanGenerator:
             sequence = KeywordSkillPlanner(maximum_skills=0).decompose(
                 goal, ()
             ).extra_primitives
+        known_sequence = tuple(
+            primitive_id
+            for primitive_id in sequence
+            if primitive_id in self.primitive_by_id
+        )
+        groups = self._split_by_action_boundary(known_sequence)
         return tuple(
             PrimitivePlanUnit(
                 unit_id=f"unit-{index + 1:03d}",
-                primitive_ids=(primitive_id,),
-                instruction=self.primitive_by_id.get(primitive_id).description
-                if primitive_id in self.primitive_by_id
-                else "执行当前原语。",
+                primitive_ids=group,
+                instruction="；".join(
+                    self.primitive_by_id[primitive_id].description
+                    for primitive_id in group
+                ),
             )
-            for index, primitive_id in enumerate(sequence)
-            if primitive_id in self.primitive_by_id
+            for index, group in enumerate(groups[: self.maximum_plan_units])
         )
 
     def initial_plan(
@@ -351,9 +407,7 @@ class LLMPrimitivePlanGenerator:
             "任务。只能从候选 task name 中选择；没有合适任务时返回空数组。"
             f"最多选择 {limit} 个。只输出严格 JSON："
             '{"tasks":[],"reason":""}。\n'
-            f"技能 ID：{skill.skill_id}\n"
-            f"名称：{skill.name}\n描述：{skill.description}\n"
-            f"解决方案：{skill.body[:6000]}\n"
+            f"技能资料：\n{self._source_text(skill)}\n"
             f"候选任务：{json.dumps(list(available_tasks), ensure_ascii=False)}"
         )
         try:
@@ -476,6 +530,11 @@ class TeacherPrimitiveVLWrapper:
         )
 
     def _trace_snapshot(self, unit: PrimitivePlanUnit) -> dict[str, Any]:
+        optimized = (
+            getattr(self.planner, "optimized_skills", {}).get(unit.skill_id)
+            if unit.skill_id
+            else None
+        )
         source = {
             "kind": self.source_kind,
             "skill_id": self.source_skill.skill_id if self.source_skill else None,
@@ -487,6 +546,16 @@ class TeacherPrimitiveVLWrapper:
             "skill_source_hash": (
                 self.source_skill.source_hash if self.source_skill else None
             ),
+            "skill_import_namespace": (
+                self.source_skill.metadata.get("import_namespace")
+                if self.source_skill
+                else None
+            ),
+            "skill_package_hash": (
+                self.source_skill.metadata.get("package_hash")
+                if self.source_skill
+                else None
+            ),
         }
         return {
             "trajectory_schema": PRIMITIVE_TRACE_SCHEMA,
@@ -496,6 +565,9 @@ class TeacherPrimitiveVLWrapper:
             # raw skill 是规划输入，不是一次被调用的优化技能；只有计划单元真正引用
             # polished skill 时才写入 skill_id，避免污染逐模型技能成功率。
             "skill_id": unit.skill_id,
+            "skill_version_id": (
+                skill_version_id(optimized) if optimized is not None else None
+            ),
             "primitive_ids": list(unit.primitive_ids),
             "source": source,
             "collection_context": dict(self.collection_context),
@@ -534,9 +606,16 @@ class TeacherPrimitiveVLWrapper:
         )
         source_hint = ""
         if self.source_skill is not None:
+            package_context = self.source_skill.metadata.get("teacher_source_context")
+            context_hint = (
+                f"\n技能包资料摘录：{str(package_context)[:5000]}"
+                if isinstance(package_context, str) and package_context.strip()
+                else ""
+            )
             source_hint = (
                 "\n- 输入 raw skill 仅作为任务与解法参考："
                 f"{(self.source_skill.body or self.source_skill.description)[:2500]}"
+                + context_hint
             )
         skill_hint = ""
         if optimized is not None:

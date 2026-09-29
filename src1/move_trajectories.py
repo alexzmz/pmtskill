@@ -4,12 +4,16 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
+from src1.pmtskill_v2.evaluation.capabilities import TASK_CLASSES
+
 SOURCE_DIR = Path("/home/zmz/Workspace/gui/src1/runtime/trajectories")
 
 OUTPUT_ROOT = Path("/home/zmz/Workspace/gui/src1/runtime/trajectories_classes")
 
 
-TASK_CLASSES: dict[str, set[str]] = {
+# 仅保留旧目录口径用于人工核对历史数据；当前复制逻辑只使用上方从
+# evaluation.capabilities 导入的七维 TASK_CLASSES。
+_LEGACY_TASK_CLASSES: dict[str, set[str]] = {
     # 系统控制、Clock、简单设备操作
     "os": {
         "OpenAppTaskEval",

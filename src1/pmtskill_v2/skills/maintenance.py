@@ -13,7 +13,7 @@ from typing import Any, Iterable, Protocol
 
 from ..core.config import MaintenanceConfig
 from ..core.models import ExecutionTrace, SkillRecord, SkillStatus, SkillTopology
-from .store import SkillStore, wilson_lower_bound
+from .store import SkillStore, classify_trajectory_quality, wilson_lower_bound
 from .identity import skill_version_id
 
 
@@ -147,6 +147,14 @@ def trace_sequence_evidence(
     丢失 Teacher 规划出的完整技能路径。
     """
 
+    # 每次按当前 classifier 重算，避免旧 metadata 在规则升级后永久沿用过期等级。
+    quality = classify_trajectory_quality(trace)
+    quality_status = str(quality.get("status", ""))
+    # 无真实动作/基础设施异常不应成为正例或负例。有效失败仍要保留，以便报告风险。
+    if quality_status == "rejected":
+        return {}
+    if trace.successful and quality_status != "excellent":
+        return {}
     sequence = trace_executed_sequence(trace)
     evidence: dict[tuple[str, ...], bool] = {}
     for length in range(minimum_length, maximum_length + 1):
@@ -193,26 +201,96 @@ class SkillMaintainer:
                 "full_successes": 0,
                 "tasks": set(),
                 "source_kinds": set(),
-                "source_skill_ids": set(),
+                "failed_source_kinds": set(),
+                "source_skill_support": Counter(),
+                "failed_source_skill_support": Counter(),
+                "component_skill_support": Counter(),
+                "component_skill_versions": defaultdict(set),
+                "source_skill_versions": defaultdict(set),
+                "source_skill_hashes": defaultdict(set),
                 "schemas": set(),
+                "failed_schemas": set(),
             }
         )
+        traces_by_id = {
+            trace.trace_id: trace for trace in self.store.list_traces()
+        }
         for row in self.store.list_sequence_evidence():
+            supporting_trace = traces_by_id.get(str(row["trace_id"]))
+            if supporting_trace is not None:
+                quality = classify_trajectory_quality(supporting_trace)
+                status = str(quality.get("status", ""))
+                if status == "rejected" or (row["successful"] and status != "excellent"):
+                    # 也过滤升级前已经写入 evidence 表的无效历史行。
+                    continue
             primitives = tuple(row["primitives"])
+            if len(primitives) < self.config.minimum_subsequence_length:
+                continue
+            if (
+                not row["is_full_sequence"]
+                and len(primitives) > self.config.maximum_subsequence_length
+            ):
+                continue
             item = aggregate[primitives]
             if row["successful"]:
                 item["successes"] += 1
                 item["tasks"].add(str(row["task_name"]))
                 if row["is_full_sequence"]:
                     item["full_successes"] += 1
+                if row.get("source_skill_id"):
+                    item["source_skill_support"][str(row["source_skill_id"])] += 1
+                if row.get("source_kind"):
+                    item["source_kinds"].add(str(row["source_kind"]))
+                if row.get("trajectory_schema"):
+                    item["schemas"].add(str(row["trajectory_schema"]))
+                if supporting_trace is not None:
+                    source = supporting_trace.metadata.get("collection_source")
+                    if isinstance(source, dict) and source.get("skill_id"):
+                        source_id = str(source["skill_id"])
+                        if source.get("skill_version") is not None:
+                            item["source_skill_versions"][source_id].add(
+                                str(source["skill_version"])
+                            )
+                        if source.get("skill_source_hash"):
+                            item["source_skill_hashes"][source_id].add(
+                                str(source["skill_source_hash"])
+                            )
+                    # 这是 trace 级组成证据；planned unit 在 event metadata 中还保留
+                    # exact skill_version_id，后续可升级为 span 级 attribution。
+                    if row["is_full_sequence"]:
+                        # evidence 表目前没有子序列 span。只有完整序列才能安全把整条
+                        # trace 的 polished 调用归因给候选，避免给局部子序列制造伪边。
+                        components = {
+                            str(event.skill_id)
+                            for event in supporting_trace.events
+                            if event.skill_id
+                            and event.success
+                            and event.metadata.get("action_committed", True) is not False
+                        }
+                        for component_id in components:
+                            item["component_skill_support"][component_id] += 1
+                        for event in supporting_trace.events:
+                            if (
+                                not event.skill_id
+                                or not event.success
+                                or event.metadata.get("action_committed", True) is False
+                            ):
+                                continue
+                            version_id = event.metadata.get("skill_version_id")
+                            if version_id:
+                                item["component_skill_versions"][
+                                    str(event.skill_id)
+                                ].add(str(version_id))
             else:
                 item["failures"] += 1
-            if row.get("source_kind"):
-                item["source_kinds"].add(str(row["source_kind"]))
-            if row.get("source_skill_id"):
-                item["source_skill_ids"].add(str(row["source_skill_id"]))
-            if row.get("trajectory_schema"):
-                item["schemas"].add(str(row["trajectory_schema"]))
+                if row.get("source_skill_id"):
+                    item["failed_source_skill_support"][
+                        str(row["source_skill_id"])
+                    ] += 1
+                if row.get("source_kind"):
+                    item["failed_source_kinds"].add(str(row["source_kind"]))
+                if row.get("trajectory_schema"):
+                    item["failed_schemas"].add(str(row["trajectory_schema"]))
         created: list[str] = []
         frequent = [
             (primitives, int(detail["successes"]), detail)
@@ -229,8 +307,16 @@ class SkillMaintainer:
                 "full_sequence_support": int(detail["full_successes"]),
                 "calibration_tasks": sorted(detail["tasks"]),
                 "trajectory_source_kinds": sorted(detail["source_kinds"]),
-                "source_skill_ids": sorted(detail["source_skill_ids"]),
+                "failed_trajectory_source_kinds": sorted(
+                    detail["failed_source_kinds"]
+                ),
+                "source_skill_ids": sorted(detail["source_skill_support"]),
+                "failed_source_skill_ids": sorted(
+                    detail["failed_source_skill_support"]
+                ),
+                "component_skill_ids": sorted(detail["component_skill_support"]),
                 "trajectory_schemas": sorted(detail["schemas"]),
+                "failed_trajectory_schemas": sorted(detail["failed_schemas"]),
                 "evidence_scope": "cumulative_sequence_evidence",
             }
             skill.metadata.update(provenance)
@@ -251,14 +337,65 @@ class SkillMaintainer:
                 existing.metadata.update(provenance)
                 existing.description = skill.description
                 self.store.upsert_skill(existing)
-                continue
-            self.store.upsert_skill(skill)
-            self.store.log_maintenance_event(
-                "candidate_created",
-                skill.skill_id,
-                {"primitives": list(primitives), **provenance},
-            )
-            created.append(skill.skill_id)
+                target = existing
+            else:
+                self.store.upsert_skill(skill)
+                self.store.log_maintenance_event(
+                    "candidate_created",
+                    skill.skill_id,
+                    {"primitives": list(primitives), **provenance},
+                )
+                created.append(skill.skill_id)
+                target = skill
+
+            # 把“由输入 raw skill 派生”和“复用了既有 polished skill”分成两类边。
+            # evidence_count 使用累计绝对值，重复 maintain 不会把同一证据反复加算。
+            for source_id, count in detail["source_skill_support"].items():
+                source_skill = self.store.get_skill(str(source_id))
+                if source_skill is None or source_skill.skill_id == target.skill_id:
+                    continue
+                relation_type = (
+                    "derived_from_raw"
+                    if source_skill.kind == "raw"
+                    else "derived_from_input_skill"
+                )
+                self.store.upsert_skill_relation(
+                    target.skill_id,
+                    source_skill.skill_id,
+                    relation_type,
+                    evidence_count=int(count),
+                    detail={
+                        "evidence_scope": "successful_sequence_trace",
+                        "source_skill_versions": sorted(
+                            detail["source_skill_versions"].get(source_id, ())
+                        ),
+                        "source_skill_hashes": sorted(
+                            detail["source_skill_hashes"].get(source_id, ())
+                        ),
+                    },
+                )
+            for component_id, count in detail["component_skill_support"].items():
+                component = self.store.get_skill(str(component_id))
+                if (
+                    component is None
+                    or component.kind != "polished"
+                    or component.skill_id == target.skill_id
+                ):
+                    continue
+                self.store.upsert_skill_relation(
+                    target.skill_id,
+                    component.skill_id,
+                    "composes_polished",
+                    evidence_count=int(count),
+                    detail={
+                        "evidence_scope": "full_sequence_trace",
+                        "component_skill_version_ids": sorted(
+                            detail["component_skill_versions"].get(
+                                component_id, ()
+                            )
+                        ),
+                    },
+                )
         return created, len(frequent)
 
     def promote_and_rollback(self) -> tuple[list[str], list[str]]:
@@ -414,7 +551,11 @@ class SkillMaintainer:
         """消费尚未处理的设备轨迹并完成一次维护周期。"""
 
         traces = self.store.list_traces(processed=False)
-        created, subsequences_found = self.discover_candidates(traces)
+        # 对全库重跑幂等 extractor，允许用户调整子序列长度后补出历史证据；聚合阶段
+        # 会按当前配置过滤旧窗口，processed 仍只表示本轮新消费数量。
+        created, subsequences_found = self.discover_candidates(
+            self.store.list_traces()
+        )
         model_pair_updates = self.reconcile_calibrations()
         promoted, rolled_back = self.promote_and_rollback()
         self.store.mark_traces_processed([trace.trace_id for trace in traces])

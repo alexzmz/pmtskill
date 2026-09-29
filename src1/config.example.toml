@@ -4,6 +4,8 @@
 repo_root = ".."
 android_world_root = "../libs/android_world"
 skvm_skills_root = "/home/zmz/Workspace/gui/libs/skvm/skvm-data/skills"
+# 这是 init/backend 周期同步的默认簇；临时外部簇无需改 TOML，可直接传
+# collect-optimization-traces --source skill-cluster --skill-root /absolute/path。
 ms_swift_root = "../libs/ms-swift"
 state_dir = "./runtime"
 # 后两种 AndroidWorld 评测固定读取这份技能库；CLI 仍可用 --skill-database 覆盖。
@@ -97,6 +99,8 @@ maximum_candidates_per_position = 32
 
 [maintenance]
 # 同一序列的证据会跨多个 maintain 周期累计；不是单轮必须达到 5 条。
+# excellent 轨迹提供成功 support，failed 仅提供失败风险；成功但路径质量不足的
+# candidate 和基础设施异常/空动作 rejected 都不参与挖掘。
 minimum_support = 5
 minimum_candidate_trials = 10
 minimum_subsequence_length = 2

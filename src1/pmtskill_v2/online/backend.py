@@ -19,7 +19,7 @@ from ..skills.compiler import (
 )
 from ..skills.importer import ImportSummary, import_skvm_skills
 from ..skills.maintenance import MaintenanceReport, SkillMaintainer
-from ..skills.store import SkillStore
+from ..skills.store import SkillStore, classify_trajectory_quality
 
 
 @dataclass(slots=True)
@@ -87,6 +87,10 @@ class SkillOptimizationBackend:
             lambda: defaultdict(lambda: [0, 0])
         )
         for trace in traces:
+            quality = classify_trajectory_quality(trace)
+            if quality.get("status") == "rejected":
+                # 基础设施异常/空动作不代表模型能力失败，不能拉低原语画像。
+                continue
             for event in trace.events:
                 for primitive in event.primitive_ids:
                     batch[event.model_id][primitive][0] += int(event.success)

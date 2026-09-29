@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 import math
 import statistics
 from collections.abc import Mapping
@@ -13,6 +14,14 @@ from typing import Any, Iterable
 
 from ..core.io import write_json_atomic, write_jsonl
 from ..core.models import ExecutionTrace
+from .capabilities import (
+    capability_table_lines,
+    render_capability_plot,
+    summarize_capabilities,
+)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -179,6 +188,7 @@ def summarize_episodes(
         switch_counts.append(switches)
 
     per_task_rates = [row["success_rate"] for row in task_rows.values()]
+    capability_distribution, unclassified_tasks = summarize_capabilities(task_rows)
     return {
         "episodes_total": len(episode_list),
         "episodes_evaluated": len(valid),
@@ -196,6 +206,8 @@ def summarize_episodes(
         "skill_usage": dict(skill_usage.most_common()),
         "failure_reasons": dict(failure_reasons.most_common()),
         "per_task": task_rows,
+        "capability_distribution": capability_distribution,
+        "capability_unclassified_tasks": unclassified_tasks,
     }
 
 
@@ -261,6 +273,38 @@ def _markdown(summary: dict[str, Any]) -> str:
                     f"  - scheduler：`{detail.get('scheduler_state')}`",
                 )
             )
+    capability_distribution = summary.get("capability_distribution", {})
+    if isinstance(capability_distribution, Mapping):
+        lines.extend(
+            (
+                "",
+                "## 七维能力分布",
+                "",
+                "能力分数为该能力下已评测有效 episode 的 Micro SR × 100；"
+                "未抽样到的能力显示为 `N/A`，不按失败计。",
+                "",
+            )
+        )
+        lines.extend(capability_table_lines(capability_distribution))
+        unclassified = summary.get("capability_unclassified_tasks", [])
+        if unclassified:
+            lines.extend(
+                (
+                    "",
+                    "- 未归入七维能力的任务："
+                    + ", ".join(f"`{task}`" for task in unclassified),
+                )
+            )
+        plot = summary.get("capability_plot", {})
+        if isinstance(plot, Mapping) and plot.get("png"):
+            lines.extend(("", f"![七维能力分布]({plot['png']})"))
+        elif summary.get("capability_plot_error"):
+            lines.extend(
+                (
+                    "",
+                    f"> 能力图生成失败：{summary['capability_plot_error']}",
+                )
+            )
     lines.extend(
         [
             "",
@@ -306,6 +350,20 @@ def write_evaluation_report(
     summary_path = target / "summary.json"
     markdown_path = target / "report.md"
     traces_path = target / "traces.jsonl"
+    plot_title = str(
+        (metadata or {}).get("model_id")
+        or (metadata or {}).get("served_model")
+        or "AndroidWorld Model"
+    )
+    try:
+        summary["capability_plot"] = render_capability_plot(
+            summary["capability_distribution"],
+            target,
+            title=f"Capability Distribution of {plot_title}",
+        )
+    except Exception as exc:  # 绘图失败不应丢失耗时很长的 AndroidWorld 结果。
+        LOGGER.warning("七维能力图生成失败: %s", exc, exc_info=True)
+        summary["capability_plot_error"] = str(exc)
     write_json_atomic(summary_path, summary)
     write_jsonl(traces_path, (trace.to_dict() for trace in traces))
     markdown_path.write_text(_markdown(summary), encoding="utf-8")

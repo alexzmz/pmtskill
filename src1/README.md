@@ -322,7 +322,8 @@ runtime/checkpoints/<adapter>/training_runs/<time>/
 ├── training_stage_commands.json      # 各累计 epoch 的命令与恢复来源
 ├── history.json                      # SR 历史、早退判定、停止 epoch 和最佳 checkpoint
 ├── history.csv                       # 方便表格/画图的 SR 曲线
-├── comparison.md                     # 基座、逐 epoch、最终技能增益总览
+├── comparison.md                     # SR 与七维能力的基座、逐 epoch、最终总览
+├── capability_distribution_final_standalone.{png,pdf} # 训练后裸模型能力图
 ├── checkpoints.json                  # epoch→checkpoint、是否永久保留
 ├── dataset_snapshot/                 # 固定 JSONL、路径修复/坏图过滤报告
 ├── training/
@@ -544,8 +545,9 @@ backend 维护时显式增加 `--record-traces`。候选 polished skill 默认�
 
 每次评测目录包含：
 
-- `summary.json`：完整机器可读指标；
-- `report.md`：评测模式、实际 adapter checkpoint、Micro/Macro SR、每任务 SR、平均步数、模型切换、技能使用、失败分类；
+- `summary.json`：完整机器可读指标，含七类能力的成功数、覆盖任务数和 `[0,100]` 分数；
+- `report.md`：评测模式、实际 adapter checkpoint、Micro/Macro SR、七维能力表、每任务 SR、平均步数、模型切换、技能使用、失败分类；
+- `capability_distribution.png/.pdf`：Control、Create、Edit、Delete、Query、Cross-App、Interactive 的极坐标能力图；
 - `traces.jsonl`：backend 可直接消费的轻量轨迹；
 - `checkpoints/*.pkl.gz`：AndroidWorld 原始 episode。
 
@@ -607,7 +609,7 @@ python -m src1 --config src1/config.local.toml calibrate-skills \
 
 ## 7. 技能库自主维护
 
-### 7.1 两种统一的 Teacher 原语轨迹来源
+### 7.1 三种统一的 Teacher 原语轨迹来源
 
 用于监督蒸馏的旧 `collect` 保持不变。用于优化技能库时使用专门的
 `collect-optimization-traces`（短别名 `collect-guided`）；它会在第一步动作前要求
@@ -625,35 +627,76 @@ python -m src1 --config src1/config.local.toml collect-optimization-traces \
   --replan-every-steps 1
 ```
 
-入口二：输入技能库中的 raw skill。Teacher 会同时看到技能描述、解决方案、具体
-AndroidWorld goal 和截图，再生成相同格式的原语计划：
+入口二：输入 SQLite 技能库中已经存在的 raw skill。Teacher 会同时看到技能描述、
+解决方案、具体 AndroidWorld goal 和截图，再生成相同格式的原语计划：
 
 ```bash
+python -m src1 --config src1/config.local.toml skills \
+  --kind raw --status imported
+
 python -m src1 --config src1/config.local.toml collect-optimization-traces \
-  --source raw-skill \
+  --source database-skills \
   --skills skvm:your-skill-id \
-  --skill-task-map ./skill_task_map.json \
   --combinations 5 --seed 42 \
   --replan-every-steps 1
 ```
 
-`--skill-task-map` 与 `calibrate-skills` 使用相同的 JSON 格式。如果没有显式映射，
-依次尝试命令行 `--tasks`、skill 的 `metadata.trajectory_tasks`/
-`metadata.calibration_tasks`，最后默认由 Teacher 从 AndroidWorld registry 中做语义
-绑定；可以用 `--no-auto-bind-skills` 禁止自动绑定。通用 SKVM skill 若没有对应的
+旧写法 `--source raw-skill` 继续兼容。`--skill-task-map` **不是必需文件**，无需为每批
+技能手工生成；默认会依次尝试命令行 `--tasks`、skill metadata，最后由 Teacher 从
+AndroidWorld registry 自动绑定有 evaluator 的任务。只有希望完全固定实验映射时，才
+自行准备下面的可选 JSON：
+
+```json
+{
+  "skvm:contact-helper": ["ContactsAddContact", "ContactsEditContact"],
+  "skvm:wifi-helper": ["SystemWifiTurnOn", "SystemWifiTurnOff"]
+}
+```
+
+```bash
+--skill-task-map ./skill_task_map.json
+```
+
+入口三：直接输入一个外部技能包或技能簇路径。根目录自身可以包含 `SKILL.md`，也可
+递归包含多个 `*/SKILL.md`；每个包的 `references/`、`scripts/`、`assets/` 会被哈希并
+形成 manifest，文本资源在严格长度预算下作为 Teacher 资料，脚本绝不会被执行。该入口
+会导入本批精确 skill IDs 后直接生成标准轨迹，**不要求先运行 `init` 或
+`compile-skills`**：
+
+```bash
+python -m src1 --config src1/config.local.toml collect-optimization-traces \
+  --source skill-cluster \
+  --skill-root /home/zmz/Workspace/gui/libs/skvm/skvm-data/skills \
+  --skill-namespace skvm-direct-2026 \
+  --skill-limit 20 \
+  --combinations 5 --seed 42 \
+  --replan-every-steps 1
+```
+
+也可以先只预览或导入，确认 ID/manifest 后再执行昂贵的 emulator 采集：
+
+```bash
+python -m src1 --config src1/config.local.toml import-skills \
+  --skill-root /absolute/path/to/skills --dry-run
+
+python -m src1 --config src1/config.local.toml import-skills \
+  --skill-root /absolute/path/to/skills --skill-namespace my-corpus
+```
+
+上述自动绑定可以用 `--no-auto-bind-skills` 禁止。通用 SKVM skill 若没有对应的
 AndroidWorld task evaluator，将被跳过而不会伪造成功标签。
 
 计划默认允许引用现有 active polished skill；轨迹中会保留 `skill_id`，同时把技能
-展开为 canonical 原语序列，因此两种入口仍能被同一个 maintain 算法处理。可以用
+展开为 canonical 原语序列，因此三种入口仍能被同一个 maintain 算法处理。可以用
 `--no-allow-polished-units` 强制计划只含基础原语，或用 `--include-candidates` 让
 Teacher 灰度试用 candidate。
 
-两种入口都输出：
+三种入口都输出同一个 `pmtskill.teacher-primitive-trace/v1` schema：
 
 - `checkpoints/`：AndroidWorld 原始 `.pkl.gz` episode；
 - `traces.jsonl`：统一的 `pmtskill.teacher-primitive-trace/v1` 轻量轨迹；
 - `summary.json`、`report.md`：成功率、失败分类和轨迹说明；
-- `source_bindings.json`：raw skill 与 AndroidWorld tasks 的绑定及来源。
+- `source_bindings.json`：输入技能与 AndroidWorld tasks 的绑定、导入批次和来源。
 
 该命令的 `--record-traces` 默认开启，轨迹直接进入配置指向的
 `skill_library.sqlite3`，状态为 `processed=0`。它们的 `metric_scope` 是
@@ -662,13 +705,23 @@ Teacher 灰度试用 candidate。
 
 ```bash
 python -m src1 --config src1/config.local.toml maintain
+python -m src1 --config src1/config.local.toml primitives
+python -m src1 --config src1/config.local.toml trajectories --quality-status excellent
+# 展开一条轨迹的完整 plan/events/metadata：
+python -m src1 --config src1/config.local.toml trajectories --trace-id TRACE_ID
 python -m src1 --config src1/config.local.toml skills --kind polished
 python -m src1 --config src1/config.local.toml skills \
   --kind polished --model-id ui-grounding
 ```
 
-`skills` 同时显示旧的在线自然流量统计、逐模型版本的配对标定指标和模型专属生命周期
-状态；从未标定显示为未知/空数组，不会与真实 0% 成功率混淆。
+SQLite 现在按职责维护三层信息：`primitive_catalog` 是原语目录镜像；`skills` 加
+`skill_relations` 表达 raw、polished 以及 `derived_from_raw`/
+`composes_polished` 层级；`traces` 加 `trajectory_library` 表达完整轨迹及
+`excellent`/`candidate`/`failed`/`rejected` 质量索引。轨迹质量由 AndroidWorld
+evaluator、episode
+有效性和真实动作确定，不使用 Teacher 自评。`skills` 同时显示关系、在线自然流量
+统计、逐模型版本配对标定指标和模型专属生命周期状态；从未标定显示为空数组，不会与
+真实 0% 成功率混淆。
 
 作为常驻 backend 自主循环（每 5 分钟同步、编译、画像更新和技能优化）：
 

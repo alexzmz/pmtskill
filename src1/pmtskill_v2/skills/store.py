@@ -17,6 +17,7 @@ from typing import Any, Iterator, Mapping
 from ..core.models import (
     ExecutionTrace,
     ModelProfile,
+    PrimitiveSpec,
     SkillRecord,
     SkillStatus,
     utc_now,
@@ -27,6 +28,161 @@ from .identity import (
     skill_definition_hash,
     skill_version_id,
 )
+
+
+TRAJECTORY_QUALITY_CLASSIFIER = "deterministic-androidworld-v2"
+
+
+def classify_trajectory_quality(trace: ExecutionTrace) -> dict[str, Any]:
+    """用可复核规则给轨迹分级，成功真值只来自环境 evaluator。
+
+    ``excellent`` 表示 evaluator 成功且路径质量达标；``candidate`` 表示任务成功但
+    路径需人工审查；``failed`` 是结构有效的负证据；``rejected`` 表示环境异常、
+    空轨迹或没有真实动作。这里不调用 Teacher/LLM 做自评。
+    """
+
+    metadata = trace.metadata
+    episode_valid = metadata.get("episode_data_valid") is not False
+    had_exception = bool(metadata.get("had_exception", False))
+    executable_events = [
+        event
+        for event in trace.events
+        if any(
+            primitive.startswith("action.") or primitive == "control.finish"
+            for primitive in event.primitive_ids
+        )
+    ]
+    committed_events = [
+        event
+        for event in executable_events
+        if event.metadata.get("action_committed", True) is not False
+    ]
+    schema = str(metadata.get("trajectory_schema") or "")
+    standard_teacher_trace = schema.startswith("pmtskill.teacher-primitive-trace/")
+    guided_teacher_trace = standard_teacher_trace and (
+        metadata.get("routing_mode") == "teacher_primitive_guided"
+        or any(
+            event.metadata.get("routing_mode") == "teacher_primitive_guided"
+            for event in trace.events
+        )
+    )
+    has_plan = bool(trace.plan or metadata.get("initial_plan"))
+    raw_planned_steps = metadata.get("planned_step_count")
+    if raw_planned_steps is None and trace.plan is not None:
+        raw_planned_steps = len(trace.plan.steps)
+    try:
+        planned_steps = max(0, int(raw_planned_steps or 0))
+    except (TypeError, ValueError):
+        planned_steps = 0
+    revisions = metadata.get("plan_revisions")
+    changed_revisions = 0
+    if isinstance(revisions, (list, tuple)):
+        changed_revisions = sum(
+            isinstance(item, Mapping) and item.get("trigger") == "path_changed"
+            for item in revisions
+        )
+    alignment = metadata.get("action_primitive_alignment_rate")
+    try:
+        alignment_value = (
+            max(0.0, min(1.0, float(alignment))) if alignment is not None else None
+        )
+    except (TypeError, ValueError):
+        alignment_value = None
+
+    reasons: list[str] = []
+    if not episode_valid:
+        reasons.append("invalid_episode_data")
+    if had_exception:
+        reasons.append("environment_or_agent_exception")
+    if not trace.events:
+        reasons.append("no_trace_events")
+    if not executable_events:
+        reasons.append("no_executable_action")
+    if executable_events and not committed_events:
+        reasons.append("no_committed_action")
+    if executable_events and len(committed_events) != len(executable_events):
+        reasons.append("contains_uncommitted_actions")
+    if guided_teacher_trace and not has_plan:
+        reasons.append("guided_trace_missing_initial_plan")
+    if guided_teacher_trace and alignment_value is None:
+        reasons.append("guided_trace_missing_action_alignment")
+    if guided_teacher_trace and alignment_value is not None and alignment_value < 0.8:
+        reasons.append("guided_trace_low_action_alignment")
+    maximum_reasonable_steps = max(planned_steps + 2, int(planned_steps * 1.5))
+    if (
+        guided_teacher_trace
+        and planned_steps > 0
+        and len(executable_events) > maximum_reasonable_steps
+    ):
+        reasons.append("guided_trace_excessive_step_inflation")
+    maximum_reasonable_replans = max(2, planned_steps // 2)
+    if guided_teacher_trace and changed_revisions > maximum_reasonable_replans:
+        reasons.append("guided_trace_excessive_replanning")
+
+    structurally_valid = (
+        episode_valid
+        and not had_exception
+        and bool(executable_events)
+        and bool(committed_events)
+    )
+    guided_quality_ok = (
+        not guided_teacher_trace
+        or (
+            has_plan
+            and planned_steps > 0
+            and len(committed_events) == len(executable_events)
+            and alignment_value is not None
+            and alignment_value >= 0.8
+            and len(executable_events) <= maximum_reasonable_steps
+            and changed_revisions <= maximum_reasonable_replans
+        )
+    )
+    if not structurally_valid:
+        status = "rejected"
+    elif not trace.successful:
+        status = "failed"
+    elif guided_quality_ok:
+        status = "excellent"
+    else:
+        status = "candidate"
+
+    # 分数仅用于排序和人工检查，status 才是维护算法的门控条件。各项均可从 trace
+    # 重算，避免不可解释的 LLM quality judge。
+    components = [
+        float(trace.successful),
+        float(episode_valid),
+        float(not had_exception),
+        float(bool(executable_events)),
+        (
+            len(committed_events) / len(executable_events)
+            if executable_events
+            else 0.0
+        ),
+        float(has_plan) if standard_teacher_trace else 1.0,
+    ]
+    if alignment_value is not None:
+        components.append(alignment_value)
+    score = sum(components) / len(components)
+    return {
+        "classifier": TRAJECTORY_QUALITY_CLASSIFIER,
+        "status": status,
+        "score": round(score, 6),
+        "evaluator": "android_world" if metadata.get("source") == "android_world_m3a" else "recorded_environment",
+        "successful": bool(trace.successful),
+        "episode_data_valid": episode_valid,
+        "had_exception": had_exception,
+        "event_count": len(trace.events),
+        "executable_event_count": len(executable_events),
+        "committed_event_count": len(committed_events),
+        "standard_teacher_trace": standard_teacher_trace,
+        "guided_teacher_trace": guided_teacher_trace,
+        "has_initial_plan": has_plan,
+        "planned_step_count": planned_steps,
+        "actual_executable_steps": len(executable_events),
+        "changed_replan_count": changed_revisions,
+        "action_primitive_alignment_rate": alignment_value,
+        "reasons": reasons,
+    }
 
 
 class SkillStore:
@@ -73,6 +229,19 @@ class SkillStore:
         CREATE INDEX IF NOT EXISTS idx_skills_status_kind
             ON skills(status, kind);
 
+        CREATE TABLE IF NOT EXISTS primitive_catalog (
+            primitive_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            aliases_json TEXT NOT NULL,
+            definition_hash TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_primitive_catalog_category
+            ON primitive_catalog(enabled, category, primitive_id);
+
         CREATE TABLE IF NOT EXISTS skill_versions (
             skill_version_id TEXT PRIMARY KEY,
             skill_id TEXT NOT NULL,
@@ -85,6 +254,20 @@ class SkillStore:
         );
         CREATE INDEX IF NOT EXISTS idx_skill_versions_skill
             ON skill_versions(skill_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS skill_relations (
+            parent_skill_id TEXT NOT NULL,
+            child_skill_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            evidence_count INTEGER NOT NULL DEFAULT 1,
+            detail_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(parent_skill_id, child_skill_id, relation_type),
+            FOREIGN KEY(parent_skill_id) REFERENCES skills(skill_id) ON DELETE CASCADE,
+            FOREIGN KEY(child_skill_id) REFERENCES skills(skill_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_relations_child
+            ON skill_relations(child_skill_id, relation_type, parent_skill_id);
 
         CREATE TABLE IF NOT EXISTS skill_metrics (
             skill_id TEXT NOT NULL,
@@ -184,6 +367,24 @@ class SkillStore:
         CREATE INDEX IF NOT EXISTS idx_traces_processed
             ON traces(processed, successful, created_at);
 
+        CREATE TABLE IF NOT EXISTS trajectory_library (
+            trace_id TEXT PRIMARY KEY,
+            quality_status TEXT NOT NULL,
+            quality_score REAL NOT NULL,
+            source_kind TEXT,
+            source_skill_id TEXT,
+            trajectory_schema TEXT,
+            primitives_json TEXT NOT NULL,
+            used_skill_ids_json TEXT NOT NULL,
+            detail_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(trace_id) REFERENCES traces(trace_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_trajectory_library_quality
+            ON trajectory_library(quality_status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_trajectory_library_source
+            ON trajectory_library(source_kind, source_skill_id, updated_at);
+
         CREATE TABLE IF NOT EXISTS skill_sequence_evidence (
             sequence_hash TEXT NOT NULL,
             trace_id TEXT NOT NULL,
@@ -211,6 +412,96 @@ class SkillStore:
         """
         with self.transaction() as connection:
             connection.executescript(schema)
+        self._backfill_trajectory_library()
+
+    def sync_primitive_catalog(
+        self, primitives: list[PrimitiveSpec] | tuple[PrimitiveSpec, ...]
+    ) -> dict[str, int]:
+        """把 JSON 权威目录幂等镜像到 SQLite；被移除的旧项仅禁用，不删除。"""
+
+        current = {item.primitive_id: item for item in primitives}
+        inserted = 0
+        updated = 0
+        with self.transaction() as connection:
+            existing = {
+                str(row["primitive_id"]): {
+                    "definition_hash": str(row["definition_hash"]),
+                    "enabled": bool(row["enabled"]),
+                }
+                for row in connection.execute(
+                    "SELECT primitive_id, definition_hash, enabled FROM primitive_catalog"
+                ).fetchall()
+            }
+            removed = set(existing) - set(current)
+            if removed:
+                connection.executemany(
+                    "UPDATE primitive_catalog SET enabled = 0, updated_at = ? "
+                    "WHERE primitive_id = ? AND enabled != 0",
+                    [(utc_now(), primitive_id) for primitive_id in sorted(removed)],
+                )
+            for primitive in current.values():
+                payload = json.dumps(
+                    primitive.to_dict(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                definition_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                if primitive.primitive_id not in existing:
+                    inserted += 1
+                elif existing[primitive.primitive_id]["definition_hash"] != definition_hash:
+                    updated += 1
+                elif existing[primitive.primitive_id]["enabled"]:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO primitive_catalog(
+                        primitive_id, title, description, category, aliases_json,
+                        definition_hash, enabled, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(primitive_id) DO UPDATE SET
+                        title=excluded.title,
+                        description=excluded.description,
+                        category=excluded.category,
+                        aliases_json=excluded.aliases_json,
+                        definition_hash=excluded.definition_hash,
+                        enabled=1,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        primitive.primitive_id,
+                        primitive.title,
+                        primitive.description,
+                        primitive.category,
+                        json.dumps(list(primitive.aliases), ensure_ascii=False),
+                        definition_hash,
+                        utc_now(),
+                    ),
+                )
+        return {"total": len(current), "inserted": inserted, "updated": updated}
+
+    def list_primitive_catalog(self, *, enabled_only: bool = True) -> list[PrimitiveSpec]:
+        """读取 SQLite 中当前原语目录，供审计工具和后续动态原语扩展使用。"""
+
+        sql = (
+            "SELECT primitive_id, title, description, category, aliases_json "
+            "FROM primitive_catalog"
+        )
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY category, primitive_id"
+        with closing(self._connect()) as connection:
+            rows = connection.execute(sql).fetchall()
+        return [
+            PrimitiveSpec(
+                primitive_id=str(row["primitive_id"]),
+                title=str(row["title"]),
+                description=str(row["description"]),
+                category=str(row["category"]),
+                aliases=tuple(json.loads(row["aliases_json"])),
+            )
+            for row in rows
+        ]
 
     def upsert_skill(self, skill: SkillRecord) -> bool:
         """新增或更新技能；返回是否为首次插入。"""
@@ -301,6 +592,128 @@ class SkillStore:
         with closing(self._connect()) as connection:
             rows = connection.execute(sql, values).fetchall()
         return [SkillRecord.from_dict(json.loads(row[0])) for row in rows]
+
+    def upsert_skill_relation(
+        self,
+        parent_skill_id: str,
+        child_skill_id: str,
+        relation_type: str,
+        *,
+        evidence_count: int = 1,
+        detail: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """保存优化技能的层级边。
+
+        方向固定为“高层/新生成技能 ``parent`` → 来源或组成技能 ``child``”。
+        ``derived_from_raw`` 和 ``composes_polished`` 因而可以共存且语义明确。
+        返回值表示是否首次创建该关系。
+        """
+
+        if parent_skill_id == child_skill_id:
+            return False
+        relation = str(relation_type).strip()
+        if not relation:
+            raise ValueError("relation_type 不能为空")
+        with self.transaction() as connection:
+            known = {
+                str(row["skill_id"])
+                for row in connection.execute(
+                    "SELECT skill_id FROM skills WHERE skill_id IN (?, ?)",
+                    (parent_skill_id, child_skill_id),
+                ).fetchall()
+            }
+            missing = {parent_skill_id, child_skill_id} - known
+            if missing:
+                raise KeyError(f"技能关系引用了不存在的 skill IDs: {sorted(missing)}")
+            cycle = connection.execute(
+                """
+                WITH RECURSIVE reachable(skill_id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT relations.child_skill_id
+                    FROM skill_relations AS relations
+                    JOIN reachable
+                      ON relations.parent_skill_id = reachable.skill_id
+                )
+                SELECT 1 FROM reachable WHERE skill_id = ? LIMIT 1
+                """,
+                (child_skill_id, parent_skill_id),
+            ).fetchone()
+            if cycle is not None:
+                raise ValueError(
+                    f"技能关系会形成环: {parent_skill_id} -> {child_skill_id}"
+                )
+            existed = connection.execute(
+                """
+                SELECT 1 FROM skill_relations
+                WHERE parent_skill_id = ? AND child_skill_id = ? AND relation_type = ?
+                """,
+                (parent_skill_id, child_skill_id, relation),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO skill_relations(
+                    parent_skill_id, child_skill_id, relation_type,
+                    evidence_count, detail_json, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(parent_skill_id, child_skill_id, relation_type) DO UPDATE SET
+                    evidence_count=excluded.evidence_count,
+                    detail_json=excluded.detail_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    parent_skill_id,
+                    child_skill_id,
+                    relation,
+                    max(1, int(evidence_count)),
+                    json.dumps(dict(detail or {}), ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
+        return existed is None
+
+    def list_skill_relations(
+        self,
+        skill_id: str | None = None,
+        *,
+        direction: str = "both",
+    ) -> list[dict[str, Any]]:
+        """查询技能层级；direction 可为 ``parents``、``children`` 或 ``both``。"""
+
+        if direction not in {"parents", "children", "both"}:
+            raise ValueError("direction 必须是 parents、children 或 both")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if skill_id:
+            if direction == "parents":
+                clauses.append("child_skill_id = ?")
+                values.append(skill_id)
+            elif direction == "children":
+                clauses.append("parent_skill_id = ?")
+                values.append(skill_id)
+            else:
+                clauses.append("(parent_skill_id = ? OR child_skill_id = ?)")
+                values.extend((skill_id, skill_id))
+        sql = (
+            "SELECT parent_skill_id, child_skill_id, relation_type, evidence_count, "
+            "detail_json, updated_at FROM skill_relations"
+        )
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY parent_skill_id, relation_type, child_skill_id"
+        with closing(self._connect()) as connection:
+            rows = connection.execute(sql, values).fetchall()
+        return [
+            {
+                "parent_skill_id": str(row["parent_skill_id"]),
+                "child_skill_id": str(row["child_skill_id"]),
+                "relation_type": str(row["relation_type"]),
+                "evidence_count": int(row["evidence_count"]),
+                "detail": json.loads(row["detail_json"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        ]
 
     def set_skill_status(self, skill_id: str, status: SkillStatus) -> None:
         """原子更新索引列和 JSON，保证两者永远一致。"""
@@ -889,12 +1302,100 @@ class SkillStore:
             "average_latency_ms": latency_sum / trials if trials else 0.0,
         }
 
+    @staticmethod
+    def _upsert_trajectory_library_entry(
+        connection: sqlite3.Connection,
+        trace: ExecutionTrace,
+        quality: Mapping[str, Any],
+    ) -> None:
+        source = trace.metadata.get("collection_source")
+        source = dict(source) if isinstance(source, Mapping) else {}
+        used_skill_ids = sorted(
+            {str(event.skill_id) for event in trace.events if event.skill_id}
+        )
+        connection.execute(
+            """
+            INSERT INTO trajectory_library(
+                trace_id, quality_status, quality_score, source_kind,
+                source_skill_id, trajectory_schema, primitives_json,
+                used_skill_ids_json, detail_json, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trace_id) DO UPDATE SET
+                quality_status=excluded.quality_status,
+                quality_score=excluded.quality_score,
+                source_kind=excluded.source_kind,
+                source_skill_id=excluded.source_skill_id,
+                trajectory_schema=excluded.trajectory_schema,
+                primitives_json=excluded.primitives_json,
+                used_skill_ids_json=excluded.used_skill_ids_json,
+                detail_json=excluded.detail_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                trace.trace_id,
+                str(quality["status"]),
+                float(quality["score"]),
+                source.get("kind"),
+                source.get("skill_id"),
+                trace.metadata.get("trajectory_schema"),
+                json.dumps(
+                    list(
+                        trace.metadata.get("executed_primitive_sequence")
+                        if isinstance(
+                            trace.metadata.get("executed_primitive_sequence"),
+                            (list, tuple),
+                        )
+                        and trace.metadata.get("executed_primitive_sequence")
+                        else trace.primitive_sequence()
+                    ),
+                    ensure_ascii=False,
+                ),
+                json.dumps(used_skill_ids, ensure_ascii=False),
+                json.dumps(dict(quality), ensure_ascii=False),
+                utc_now(),
+            ),
+        )
+
+    def _backfill_trajectory_library(self) -> int:
+        """为旧 SQLite 中已经存在的 traces 补建质量索引，不改原 trace JSON。"""
+
+        inserted = 0
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT traces.trace_json, trajectory_library.detail_json
+                FROM traces
+                LEFT JOIN trajectory_library
+                  ON trajectory_library.trace_id = traces.trace_id
+                """
+            ).fetchall()
+            for row in rows:
+                if row["detail_json"]:
+                    try:
+                        existing_detail = json.loads(row["detail_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        existing_detail = {}
+                    if (
+                        existing_detail.get("classifier")
+                        == TRAJECTORY_QUALITY_CLASSIFIER
+                    ):
+                        continue
+                try:
+                    trace = ExecutionTrace.from_dict(json.loads(row["trace_json"]))
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    # 单条历史坏数据不能阻止整个数据库迁移；原 traces 行仍保留供审计。
+                    continue
+                quality = classify_trajectory_quality(trace)
+                self._upsert_trajectory_library_entry(connection, trace, quality)
+                inserted += 1
+        return inserted
+
     def append_trace(
         self,
         trace: ExecutionTrace,
         *,
         update_skill_metrics: bool | None = None,
-    ) -> None:
+    ) -> bool:
         """幂等保存一条设备轨迹，并按数据作用域决定是否累计在线统计。
 
         ``skill_metrics`` 表示模型在在线自然流量中调用技能的观测，不应被 Teacher
@@ -903,6 +1404,8 @@ class SkillStore:
         保存轨迹。旧轨迹没有该字段，继续保持原有的统计行为。
         """
 
+        quality = classify_trajectory_quality(trace)
+        trace.metadata["trajectory_quality"] = dict(quality)
         payload = json.dumps(trace.to_dict(), ensure_ascii=False)
         if update_skill_metrics is None:
             update_skill_metrics = str(
@@ -923,6 +1426,22 @@ class SkillStore:
                     trace.created_at,
                 ),
             ).rowcount
+            # 重复 trace_id 必须以 traces 主表中已落盘的 payload 为准，不能让调用方
+            # 传入的冲突内容把旁表改成另一套来源/质量。
+            catalog_trace = trace
+            catalog_quality = quality
+            if not inserted:
+                stored = connection.execute(
+                    "SELECT trace_json FROM traces WHERE trace_id = ?", (trace.trace_id,)
+                ).fetchone()
+                if stored is not None:
+                    catalog_trace = ExecutionTrace.from_dict(
+                        json.loads(stored["trace_json"])
+                    )
+                    catalog_quality = classify_trajectory_quality(catalog_trace)
+            self._upsert_trajectory_library_entry(
+                connection, catalog_trace, catalog_quality
+            )
             if inserted and update_skill_metrics:
                 for event in trace.events:
                     if not event.skill_id:
@@ -952,6 +1471,91 @@ class SkillStore:
                             utc_now(),
                         ),
                     )
+        return bool(inserted)
+
+    def list_trajectory_library(
+        self,
+        *,
+        quality_status: str | None = None,
+        source_kind: str | None = None,
+        source_skill_id: str | None = None,
+        trace_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """查询优秀/待审/失败/拒绝轨迹目录；完整内容仍保存在 ``traces``。"""
+
+        clauses: list[str] = []
+        values: list[Any] = []
+        if quality_status:
+            clauses.append("library.quality_status = ?")
+            values.append(quality_status)
+        if source_kind:
+            clauses.append("library.source_kind = ?")
+            values.append(source_kind)
+        if source_skill_id:
+            clauses.append("library.source_skill_id = ?")
+            values.append(source_skill_id)
+        if trace_id:
+            clauses.append("library.trace_id = ?")
+            values.append(trace_id)
+        sql = """
+            SELECT library.trace_id, library.quality_status, library.quality_score,
+                   library.source_kind, library.source_skill_id,
+                   library.trajectory_schema, library.primitives_json,
+                   library.used_skill_ids_json, library.detail_json,
+                   library.updated_at, traces.task_name, traces.successful,
+                   traces.processed, traces.created_at
+            FROM trajectory_library AS library
+            JOIN traces ON traces.trace_id = library.trace_id
+        """
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY library.updated_at DESC, library.trace_id"
+        if limit is not None:
+            if limit <= 0:
+                raise ValueError("limit 必须是正整数")
+            sql += " LIMIT ?"
+            values.append(limit)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(sql, values).fetchall()
+        return [
+            {
+                "trace_id": str(row["trace_id"]),
+                "task_name": str(row["task_name"]),
+                "successful": bool(row["successful"]),
+                "processed": bool(row["processed"]),
+                "quality_status": str(row["quality_status"]),
+                "quality_score": float(row["quality_score"]),
+                "source_kind": row["source_kind"],
+                "source_skill_id": row["source_skill_id"],
+                "trajectory_schema": row["trajectory_schema"],
+                "primitives": tuple(json.loads(row["primitives_json"])),
+                "used_skill_ids": tuple(json.loads(row["used_skill_ids_json"])),
+                "quality_detail": json.loads(row["detail_json"]),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def trajectory_library_counts(self) -> dict[str, int]:
+        """按质量状态汇总轨迹，不反序列化完整 trace。"""
+
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT quality_status, COUNT(*) AS total "
+                "FROM trajectory_library GROUP BY quality_status"
+            ).fetchall()
+        return {str(row["quality_status"]): int(row["total"]) for row in rows}
+
+    def get_trace(self, trace_id: str) -> ExecutionTrace | None:
+        """按 ID 读取完整轨迹事件，供审计单条优秀路径。"""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT trace_json FROM traces WHERE trace_id = ?", (trace_id,)
+            ).fetchone()
+        return ExecutionTrace.from_dict(json.loads(row["trace_json"])) if row else None
 
     def list_traces(
         self,

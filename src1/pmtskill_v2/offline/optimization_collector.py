@@ -1,7 +1,7 @@
 """面向技能库优化的 AndroidWorld Teacher 标准轨迹采集器。
 
 旧 ``collect`` 服务于监督蒸馏数据生产；本模块服务于技能发现，二者刻意分开，避免
-改变既有训练实验。这里的 task/raw-skill 两种入口在创建 source binding 后，共用
+改变既有训练实验。这里的 task/database-skill/skill-cluster 三种入口在创建 source binding 后，共用
 完全相同的 planner、M3A wrapper、episode converter、报告和 SQLite 写入路径。
 """
 
@@ -25,7 +25,7 @@ from ..evaluation.recovery import (
 )
 from ..evaluation.reporter import EvaluationArtifacts, write_evaluation_report
 from ..inference.vlm import OpenAICompatibleVLClient
-from ..skills.store import SkillStore
+from ..skills.store import SkillStore, classify_trajectory_quality
 from .collector import (
     bootstrap_android_world,
     enforce_episode_step_limit,
@@ -75,6 +75,8 @@ class OptimizationTraceCollectionOptions:
     auto_bind_skills: bool = True
     maximum_tasks_per_skill: int = 3
     record_traces: bool = True
+    # 外部技能簇的 root/namespace/import manifest 等审计信息；task/DB 模式可为空。
+    source_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -88,6 +90,7 @@ class OptimizationTraceCollectionResult:
     traces_inserted: int
     checkpoint_dir: Path
     bindings_json: Path
+    source_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +108,7 @@ class OptimizationTraceCollectionResult:
             "traces_jsonl": str(self.artifacts.traces_jsonl),
             "checkpoint_dir": str(self.checkpoint_dir),
             "bindings_json": str(self.bindings_json),
+            "source_metadata": dict(self.source_metadata),
         }
 
 
@@ -192,8 +196,31 @@ def _safe_component(value: str) -> str:
     return f"{(compact or 'skill')[:80]}_{digest}"
 
 
+def _compact_step_source_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    """去掉批量 ID 清单，避免同一大对象被复制到每个 episode 的每一步。"""
+
+    compact: dict[str, Any] = {}
+    if value.get("cli_source") is not None:
+        compact["cli_source"] = value.get("cli_source")
+    cluster = value.get("skill_cluster")
+    if isinstance(cluster, Mapping):
+        compact["skill_cluster"] = {
+            key: cluster.get(key)
+            for key in (
+                "root",
+                "namespace",
+                "scanned",
+                "resources",
+                "skipped_resources",
+                "write_database",
+            )
+            if cluster.get(key) is not None
+        }
+    return compact
+
+
 class AndroidWorldOptimizationTraceCollector:
-    """运行受约束 Teacher，并把两类来源写成统一标准轨迹。"""
+    """运行受约束 Teacher，并把三类来源写成统一标准轨迹。"""
 
     def __init__(
         self,
@@ -239,6 +266,10 @@ class AndroidWorldOptimizationTraceCollector:
                 "task_combinations": options.combinations,
                 "bound_tasks": list(tasks) if tasks else "all",
                 "binding_source": binding_source,
+                "input_mode": options.source_kind,
+                "source_metadata": _compact_step_source_metadata(
+                    options.source_metadata
+                ),
             },
         )
 
@@ -310,14 +341,18 @@ class AndroidWorldOptimizationTraceCollector:
     ) -> OptimizationTraceCollectionResult:
         """完成采集、标准化、SQLite 写入和人机可读报告生成。"""
 
-        if options.source_kind not in {"task", "raw_skill"}:
-            raise ValueError("source_kind 必须是 task 或 raw_skill")
+        allowed_source_kinds = {"task", "raw_skill", "database_skill", "skill_cluster"}
+        if options.source_kind not in allowed_source_kinds:
+            raise ValueError(
+                "source_kind 必须是 task、database_skill、skill_cluster 或兼容 raw_skill"
+            )
         if options.combinations <= 0:
             raise ValueError("combinations 必须是正整数")
         if options.maximum_tasks_per_skill <= 0:
             raise ValueError("maximum_tasks_per_skill 必须是正整数")
-        if options.source_kind == "raw_skill" and not options.source_skills:
-            raise ValueError("raw_skill 模式至少需要一个 source skill")
+        is_skill_source = options.source_kind != "task"
+        if is_skill_source and not options.source_skills:
+            raise ValueError("技能来源模式至少需要一个 source skill")
 
         bootstrap_android_world(self.config.paths.android_world_root)
         from android_world import checkpointer as checkpointer_lib
@@ -344,7 +379,7 @@ class AndroidWorldOptimizationTraceCollector:
 
         bindings: tuple[SkillTaskBinding, ...] = ()
         skipped: dict[str, str] = {}
-        if options.source_kind == "raw_skill":
+        if is_skill_source:
             bindings, skipped = resolve_skill_task_bindings(
                 options.source_skills,
                 available,
@@ -369,6 +404,7 @@ class AndroidWorldOptimizationTraceCollector:
                 "source_kind": options.source_kind,
                 "bindings": [item.to_dict() for item in bindings],
                 "skipped_skills": skipped,
+                "source_metadata": dict(options.source_metadata),
             },
         )
 
@@ -417,7 +453,7 @@ class AndroidWorldOptimizationTraceCollector:
                             client=client,
                             planner=planner,
                             tasks=binding.tasks,
-                            source_kind="raw_skill",
+                            source_kind=options.source_kind,
                             source_skill=skill,
                             binding_source=binding.source,
                             options=options,
@@ -431,13 +467,17 @@ class AndroidWorldOptimizationTraceCollector:
             environment.close()
 
         traces = episodes_to_traces(all_episodes)
-        inserted_before = len(self.store.list_traces()) if options.record_traces else 0
+        for trace in traces:
+            # 即使本轮 --no-record-traces，文件报告也带相同的 deterministic 分级。
+            trace.metadata["trajectory_quality"] = classify_trajectory_quality(trace)
+        traces_inserted = 0
         if options.record_traces:
             for trace in traces:
                 # 标准 Teacher 数据用于技能发现，不是在线自然流量，不能直接累计
                 # skill_metrics；候选仍需 calibrate-skills 的配对实测才能晋升。
-                self.store.append_trace(trace, update_skill_metrics=False)
-        inserted_after = len(self.store.list_traces()) if options.record_traces else 0
+                traces_inserted += int(
+                    self.store.append_trace(trace, update_skill_metrics=False)
+                )
         alignment_values = [
             float(trace.metadata["action_primitive_alignment_rate"])
             for trace in traces
@@ -452,6 +492,13 @@ class AndroidWorldOptimizationTraceCollector:
             "traces": len(traces),
             "successful": sum(trace.successful for trace in traces),
             "failed": sum(not trace.successful for trace in traces),
+            "library_statuses": {
+                status: sum(
+                    trace.metadata.get("trajectory_quality", {}).get("status") == status
+                    for trace in traces
+                )
+                for status in ("excellent", "candidate", "failed", "rejected")
+            },
             "with_events": sum(bool(trace.events) for trace in traces),
             "with_initial_plan": sum(trace.plan is not None for trace in traces),
             "average_initial_action_units": (
@@ -489,6 +536,7 @@ class AndroidWorldOptimizationTraceCollector:
                 "record_traces": options.record_traces,
                 "trajectory_quality": trajectory_quality,
                 "skill_database": str(self.store.database.resolve()),
+                "source_metadata": dict(options.source_metadata),
                 "created_at": dt.datetime.now().astimezone().isoformat(),
                 "run_id": uuid.uuid4().hex,
             },
@@ -514,9 +562,10 @@ class AndroidWorldOptimizationTraceCollector:
             source_kind=options.source_kind,
             bindings=bindings,
             skipped_skills=skipped,
-            traces_inserted=max(0, inserted_after - inserted_before),
+            traces_inserted=traces_inserted,
             checkpoint_dir=checkpoint_root,
             bindings_json=bindings_path,
+            source_metadata=dict(options.source_metadata),
         )
 
 

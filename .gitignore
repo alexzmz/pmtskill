@@ -5,6 +5,8 @@
 # submodule
 Android/
 Android/Sdk/
+figures/outputs/*
+results/*
 
 # runtime folders
 __pycache__/

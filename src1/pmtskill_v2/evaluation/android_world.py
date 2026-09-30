@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import random
 import uuid
 from collections.abc import Mapping
@@ -62,6 +63,22 @@ def _evaluation_max_steps(value: int) -> int:
     if value <= 0:
         raise ValueError("评测 max_steps 必须是正整数")
     return value
+
+
+def _close_environment(environment: Any, *, tolerate_failure: bool) -> None:
+    """训练容错模式下，环境收尾失败只落日志，不覆盖已完成的 episode。"""
+
+    try:
+        environment.close()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        if not tolerate_failure:
+            raise
+        logging.exception(
+            "ANDROIDWORLD_ENVIRONMENT_CLOSE_FAILED: 环境关闭失败；"
+            "保留已完成的评测结果，训练将继续。"
+        )
 
 
 def _extract_route_metadata(raw: Any) -> dict[str, Any]:
@@ -330,6 +347,7 @@ class AndroidWorldStandaloneEvaluator:
         family: str = "android_world",
         max_steps: int = DEFAULT_EVALUATION_MAX_STEPS,
         output_dir: str | Path | None = None,
+        continue_on_infrastructure_failure: bool = False,
     ) -> EvaluationArtifacts:
         max_steps = _evaluation_max_steps(max_steps)
         bootstrap_android_world(self.config.paths.android_world_root)
@@ -377,7 +395,12 @@ class AndroidWorldStandaloneEvaluator:
                 ),
             )
             with recover_infrastructure_failures(
-                suite_utils, environment, self.config.android_world
+                suite_utils,
+                environment,
+                self.config.android_world,
+                continue_on_infrastructure_failure=(
+                    continue_on_infrastructure_failure
+                ),
             ):
                 episodes = suite_utils.run(
                     suite,
@@ -393,9 +416,13 @@ class AndroidWorldStandaloneEvaluator:
             ensure_valid_evaluation_episodes(
                 episodes,
                 expected_episodes=sum(len(instances) for instances in suite.values()),
+                allow_infrastructure_failures=continue_on_infrastructure_failure,
             )
         finally:
-            environment.close()
+            _close_environment(
+                environment,
+                tolerate_failure=continue_on_infrastructure_failure,
+            )
 
         traces = episodes_to_traces(episodes)
         return write_evaluation_report(
@@ -735,6 +762,7 @@ class AndroidWorldOnlineEvaluator:
         output_dir: str | Path | None = None,
         model_profiles: Sequence[ModelProfile] | None = None,
         record_traces: bool = True,
+        continue_on_infrastructure_failure: bool = False,
     ) -> EvaluationArtifacts:
         max_steps = _evaluation_max_steps(max_steps)
         bootstrap_android_world(self.config.paths.android_world_root)
@@ -816,7 +844,12 @@ class AndroidWorldOnlineEvaluator:
             suite.suite_family = family
             agent = DynamicRoutingM3A(environment)
             with recover_infrastructure_failures(
-                suite_utils, environment, self.config.android_world
+                suite_utils,
+                environment,
+                self.config.android_world,
+                continue_on_infrastructure_failure=(
+                    continue_on_infrastructure_failure
+                ),
             ):
                 episodes = suite_utils.run(
                     suite,
@@ -830,9 +863,13 @@ class AndroidWorldOnlineEvaluator:
             ensure_valid_evaluation_episodes(
                 episodes,
                 expected_episodes=sum(len(instances) for instances in suite.values()),
+                allow_infrastructure_failures=continue_on_infrastructure_failure,
             )
         finally:
-            environment.close()
+            _close_environment(
+                environment,
+                tolerate_failure=continue_on_infrastructure_failure,
+            )
 
         traces = episodes_to_traces(episodes)
         if record_traces:

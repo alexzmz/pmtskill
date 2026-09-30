@@ -7,6 +7,8 @@ Android/
 Android/Sdk/
 figures/outputs/*
 results/*
+.codex*
+deliverables/*
 
 # runtime folders
 __pycache__/

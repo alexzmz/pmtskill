@@ -113,6 +113,7 @@ def summarize_episodes(
     )
     by_task: dict[str, list[bool]] = collections.defaultdict(list)
     failure_reasons: collections.Counter[str] = collections.Counter()
+    infrastructure_skipped_tasks: list[str] = []
     permission_restarts = 0
     permission_dialogs_dismissed = 0
     permission_model_delegations = 0
@@ -121,7 +122,14 @@ def summarize_episodes(
     for episode in episode_list:
         task = str(_episode_field(episode, "task_template", "task_name", default="unknown"))
         if _episode_field(episode, "exception_info"):
-            failure_reasons["exception"] += 1
+            aux_data = _episode_field(episode, "aux_data", default={})
+            if isinstance(aux_data, Mapping) and aux_data.get(
+                "infrastructure_failure_skipped"
+            ):
+                failure_reasons["infrastructure_skipped"] += 1
+                infrastructure_skipped_tasks.append(task)
+            else:
+                failure_reasons["exception"] += 1
             continue
         successful = successful_episode_value(
             _episode_field(episode, "is_successful", default=False)
@@ -190,6 +198,7 @@ def summarize_episodes(
     per_task_rates = [row["success_rate"] for row in task_rows.values()]
     capability_distribution, unclassified_tasks = summarize_capabilities(task_rows)
     return {
+        "evaluation_available": bool(valid),
         "episodes_total": len(episode_list),
         "episodes_evaluated": len(valid),
         "successes": successes,
@@ -205,6 +214,7 @@ def summarize_episodes(
         "model_usage": dict(model_usage.most_common()),
         "skill_usage": dict(skill_usage.most_common()),
         "failure_reasons": dict(failure_reasons.most_common()),
+        "infrastructure_skipped_tasks": infrastructure_skipped_tasks,
         "per_task": task_rows,
         "capability_distribution": capability_distribution,
         "capability_unclassified_tasks": unclassified_tasks,
@@ -220,6 +230,7 @@ def _markdown(summary: dict[str, Any]) -> str:
         "",
         "| 指标 | 数值 |",
         "|---|---:|",
+        f"| 评测可用 | {'是' if summary['evaluation_available'] else '否'} |",
         f"| 有效 episode | {summary['episodes_evaluated']} / {summary['episodes_total']} |",
         f"| 成功数 | {summary['successes']} |",
         f"| Micro SR | {summary['success_rate_micro']:.2%} |",
@@ -240,6 +251,15 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"`{metadata.get('seed', 42)}`",
         f"- 每个 episode 步数上限：`{metadata.get('max_steps', 30)}`",
     ]
+    skipped_tasks = summary.get("infrastructure_skipped_tasks", [])
+    if skipped_tasks:
+        lines.extend(
+            (
+                "- 基础设施故障跳过的任务："
+                + ", ".join(f"`{task}`" for task in skipped_tasks),
+                "- 这些任务不计入 SR；完整 traceback 已写入本次 CLI 的 `errors.log`。",
+            )
+        )
     checkpoints = metadata.get("evaluation_checkpoints")
     if isinstance(checkpoints, Mapping):
         lines.extend(("", "### Adapter checkpoint", ""))

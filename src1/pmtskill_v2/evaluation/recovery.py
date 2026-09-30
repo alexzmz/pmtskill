@@ -8,6 +8,7 @@ import logging
 import re
 import subprocess
 import time
+import traceback
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from typing import Any
@@ -40,6 +41,10 @@ _CONNECTION_FAILURE_MARKERS = (
     "_inactiverpcerror",
     "connection refused",
     "connection reset",
+)
+
+_ADB_DEVICE_NOT_FOUND_PATTERN = re.compile(
+    r"device\s+(?:['\"][^'\"]+['\"]|\S+)\s+not\s+found"
 )
 
 _ANDROID_CONNECTION_CONTEXT = (
@@ -124,6 +129,8 @@ def is_infrastructure_failure(episode: Any) -> bool:
     if not normalized:
         return False
     if _PERMISSION_INTERRUPTION_MARKER in normalized:
+        return True
+    if _ADB_DEVICE_NOT_FOUND_PATTERN.search(normalized):
         return True
     if any(marker in normalized for marker in _INFRASTRUCTURE_FAILURE_MARKERS):
         return True
@@ -698,13 +705,22 @@ def recover_android_world_environment(
 
     logging.warning("AndroidWorld 环境失去 UI 可观测性，开始状态恢复。")
     try:
-        if _adb_command(config, "get-state") == "device":
+        device_state = _adb_command(config, "get-state")
+    except Exception as exc:
+        serial = f"emulator-{config.console_port}"
+        raise RuntimeError(
+            f"目标设备 {serial} 已从 ADB 消失，无法通过 adb reboot 恢复 guest；"
+            "当前 task 应跳过，后续 task 将重新探活。"
+        ) from exc
+
+    if device_state == "device":
+        try:
             _restore_networking(config)
             _refresh_environment(environment)
             logging.warning("AndroidWorld 环境已通过软恢复重新可用。")
             return
-    except Exception as exc:
-        logging.warning("AndroidWorld 软恢复失败，将重启 emulator guest: %s", exc)
+        except Exception as exc:
+            logging.warning("AndroidWorld 软恢复失败，将重启 emulator guest: %s", exc)
 
     _adb_command(config, "reboot")
     _wait_for_boot(config)
@@ -717,13 +733,21 @@ def ensure_valid_evaluation_episodes(
     episodes: Any,
     *,
     expected_episodes: int,
+    allow_infrastructure_failures: bool = False,
 ) -> None:
-    """拒绝把基础设施全挂误写成 SR=0，同时允许任务级异常被报告。"""
+    """拒绝把基础设施全挂误写成 SR=0，训练容错模式除外。"""
 
     if expected_episodes <= 0:
         return
     rows = list(episodes or ())
     if not rows:
+        if allow_infrastructure_failures:
+            logging.error(
+                "ANDROIDWORLD_EVALUATION_UNAVAILABLE: 评测未返回任何 episode；"
+                "本阶段不产生可用 SR，但训练将继续。expected_episodes=%d",
+                expected_episodes,
+            )
+            return
         raise AndroidWorldInfrastructureError(
             "AndroidWorld 评测未返回任何 episode，拒绝记录伪造的 SR=0。"
         )
@@ -749,6 +773,14 @@ def ensure_valid_evaluation_episodes(
         if first_error.strip()
         else first_error
     )
+    if allow_infrastructure_failures:
+        logging.error(
+            "ANDROIDWORLD_EVALUATION_UNAVAILABLE: %d 个 episode 均未产生有效结果；"
+            "保留失败记录，训练将继续。首个异常: %s",
+            len(rows),
+            first_line,
+        )
+        return
     raise AndroidWorldInfrastructureError(
         "AndroidWorld 评测未产生任何有效 episode，拒绝记录伪造的 SR=0；"
         f"首个异常: {first_line}"
@@ -760,18 +792,25 @@ def recover_infrastructure_failures(
     suite_utils: Any,
     environment: Any,
     config: AndroidWorldConfig,
+    *,
+    continue_on_infrastructure_failure: bool = False,
 ) -> Iterator[None]:
-    """在 suite 的每个任务前探活，并在基础设施异常后恢复、重试当前任务。"""
+    """在每个任务前探活，恢复并重试；训练模式下耗尽后只跳过当前任务。"""
 
     attempts = config.infrastructure_recovery_attempts
     permission_attempts = config.permission_controller_recovery_attempts
     permission_activity = {"dismissed": 0, "model_delegations": 0}
     original_run_task = getattr(suite_utils, "_run_task", None)
-    if (attempts <= 0 and permission_attempts <= 0) or not callable(original_run_task):
+    if (
+        (attempts <= 0 and permission_attempts <= 0)
+        and not continue_on_infrastructure_failure
+    ) or not callable(original_run_task):
         yield
         return
 
-    def recover_or_raise(task_name: str, reason: BaseException | str) -> None:
+    def recover_or_raise(
+        task_name: str, reason: BaseException | str
+    ) -> BaseException | None:
         latest: BaseException | None = None
         for attempt in range(1, attempts + 1):
             logging.error(
@@ -783,16 +822,109 @@ def recover_infrastructure_failures(
             )
             try:
                 recover_android_world_environment(environment, config)
-                return
+                return None
             except BaseException as exc:  # 需保留 KeyboardInterrupt/SystemExit 语义。
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 latest = exc
                 logging.exception("AndroidWorld 环境恢复尝试失败")
+        if continue_on_infrastructure_failure:
+            return latest or AndroidWorldInfrastructureError(
+                f"AndroidWorld 环境恢复已关闭或未成功。task={task_name}; reason={reason}"
+            )
         raise AndroidWorldInfrastructureError(
             f"AndroidWorld 环境在 {attempts} 次恢复后仍不可用；"
             f"停止评测以避免后续任务全部被记为 0 episode。task={task_name}"
         ) from latest
+
+    def mark_task_skipped(
+        task: Any,
+        result: Any,
+        *,
+        reason: BaseException | str,
+        recovery_error: BaseException | None = None,
+        retries: int = 0,
+    ) -> dict[str, Any]:
+        task_name = str(getattr(task, "name", "unknown"))
+        reason_text = str(reason).strip() or "unknown infrastructure failure"
+        recovery_text = ""
+        if recovery_error is not None:
+            recovery_text = "".join(
+                traceback.format_exception(
+                    type(recovery_error),
+                    recovery_error,
+                    recovery_error.__traceback__,
+                )
+            ).strip()
+        detail = reason_text
+        if recovery_text:
+            detail = f"{detail}\n\nRecovery failure:\n{recovery_text}"
+
+        if not isinstance(result, dict):
+            factory = getattr(suite_utils, "_create_failed_result", None)
+            if callable(factory):
+                result = factory(
+                    task_name,
+                    str(getattr(task, "goal", "")),
+                    detail,
+                    0.0,
+                )
+            else:
+                result = {
+                    "goal": str(getattr(task, "goal", "")),
+                    "task_template": task_name,
+                    "episode_data": float("nan"),
+                    "is_successful": float("nan"),
+                    "run_time": 0.0,
+                    "episode_length": float("nan"),
+                    "exception_info": detail,
+                    "aux_data": None,
+                }
+        elif recovery_text:
+            existing = str(result.get("exception_info") or reason_text).strip()
+            result["exception_info"] = (
+                f"{existing}\n\nRecovery failure:\n{recovery_text}"
+            )
+
+        aux_data = result.get("aux_data")
+        aux_data = dict(aux_data) if isinstance(aux_data, dict) else {}
+        aux_data.update(
+            {
+                "infrastructure_failure_skipped": True,
+                "infrastructure_recovery_attempts": retries,
+            }
+        )
+        result["aux_data"] = aux_data
+
+        # 尽力清理当前实例并回桌面；任何清理故障都只记日志，不再升级到训练层。
+        tear_down = getattr(task, "tear_down", None)
+        if callable(tear_down):
+            try:
+                tear_down(environment)
+            except Exception:
+                logging.warning(
+                    "跳过 task %s 后的 tear_down 失败；继续后续任务。",
+                    task_name,
+                    exc_info=True,
+                )
+        try:
+            _adb_command(config, "shell", "input", "keyevent", "KEYCODE_HOME")
+            _refresh_environment(environment)
+        except Exception:
+            logging.warning(
+                "跳过 task %s 后无法恢复到桌面；下一 task 会再次探活。",
+                task_name,
+                exc_info=True,
+            )
+
+        logging.error(
+            "ANDROIDWORLD_TASK_SKIPPED: task=%s 在恢复/重试后仍不可用；"
+            "已跳过该 task，训练与后续任务继续。retries=%d\n%s",
+            task_name,
+            retries,
+            detail,
+        )
+        return result
 
     def guarded_run_task(*args: Any, **kwargs: Any) -> Any:
         task = args[0] if args else kwargs.get("task")
@@ -842,7 +974,17 @@ def recover_infrastructure_failures(
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
-            recover_or_raise(task_name, exc)
+            probe_traceback = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            recovery_error = recover_or_raise(task_name, probe_traceback)
+            if recovery_error is not None:
+                return mark_task_skipped(
+                    task,
+                    None,
+                    reason=probe_traceback,
+                    recovery_error=recovery_error,
+                )
 
         result = original_run_task(*args, **kwargs)
         retries = 0
@@ -872,7 +1014,17 @@ def recover_infrastructure_failures(
                 continue
             if retries >= attempts:
                 break
-            recover_or_raise(task_name, str(result.get("exception_info", "")))
+            recovery_error = recover_or_raise(
+                task_name, str(result.get("exception_info", ""))
+            )
+            if recovery_error is not None:
+                return mark_task_skipped(
+                    task,
+                    result,
+                    reason=str(result.get("exception_info", "")),
+                    recovery_error=recovery_error,
+                    retries=retries,
+                )
             retries += 1
             logging.warning(
                 "AndroidWorld 环境已恢复，重新执行当前 task: %s (%d/%d)",
@@ -885,6 +1037,13 @@ def recover_infrastructure_failures(
         if is_infrastructure_failure(result) and not is_permission_controller_interruption(
             result
         ):
+            if continue_on_infrastructure_failure:
+                return mark_task_skipped(
+                    task,
+                    result,
+                    reason=str(result.get("exception_info", "")),
+                    retries=retries,
+                )
             raise AndroidWorldInfrastructureError(
                 f"AndroidWorld task {task_name} 在恢复并重试后仍发生基础设施故障；"
                 "停止当前评测，避免继续空跑。"

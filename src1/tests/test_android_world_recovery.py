@@ -438,6 +438,16 @@ class AndroidWorldRecoveryTest(unittest.TestCase):
                 }
             )
         )
+        self.assertTrue(
+            is_infrastructure_failure(
+                {
+                    "exception_info": (
+                        "RuntimeError: ADB command failed (1): "
+                        "error: device 'emulator-5554' not found"
+                    )
+                }
+            )
+        )
 
     def test_failed_a11y_task_is_recovered_and_retried(self):
         calls = 0
@@ -487,6 +497,73 @@ class AndroidWorldRecoveryTest(unittest.TestCase):
                     suite_utils, environment, AndroidWorldConfig()
                 ):
                     suite_utils._run_task(task, None, environment, False)
+
+    def test_training_mode_skips_task_after_retry_and_logs_full_error(self):
+        calls = 0
+
+        def run_task(*args, **kwargs):
+            nonlocal calls
+            del args, kwargs
+            calls += 1
+            return {
+                "task_template": "BrokenTask",
+                "exception_info": "Traceback: Could not get a11y tree.",
+                "aux_data": None,
+            }
+
+        suite_utils = types.SimpleNamespace(_run_task=run_task)
+        environment = types.SimpleNamespace(controller=_Controller())
+        task = types.SimpleNamespace(name="BrokenTask", tear_down=mock.Mock())
+
+        with mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery.recover_android_world_environment"
+        ), mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery._adb_command", return_value=""
+        ), self.assertLogs(level="ERROR") as captured:
+            with recover_infrastructure_failures(
+                suite_utils,
+                environment,
+                AndroidWorldConfig(),
+                continue_on_infrastructure_failure=True,
+            ):
+                result = suite_utils._run_task(task, None, environment, False)
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(result["aux_data"]["infrastructure_failure_skipped"])
+        self.assertEqual(result["aux_data"]["infrastructure_recovery_attempts"], 1)
+        self.assertIn("BrokenTask", "\n".join(captured.output))
+        self.assertIn("Could not get a11y tree", "\n".join(captured.output))
+
+    def test_training_mode_skips_task_when_recovery_cannot_find_device(self):
+        suite_utils = types.SimpleNamespace(
+            _run_task=lambda *args, **kwargs: {
+                "task_template": "MissingDeviceTask",
+                "exception_info": "Could not get a11y tree.",
+                "aux_data": None,
+            }
+        )
+        environment = types.SimpleNamespace(controller=_Controller())
+        task = types.SimpleNamespace(name="MissingDeviceTask", tear_down=mock.Mock())
+
+        with mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery.recover_android_world_environment",
+            side_effect=RuntimeError("error: device 'emulator-5554' not found"),
+        ), mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery._adb_command",
+            side_effect=RuntimeError("error: device 'emulator-5554' not found"),
+        ), self.assertLogs(level="ERROR") as captured:
+            with recover_infrastructure_failures(
+                suite_utils,
+                environment,
+                AndroidWorldConfig(),
+                continue_on_infrastructure_failure=True,
+            ):
+                result = suite_utils._run_task(task, None, environment, False)
+
+        self.assertTrue(result["aux_data"]["infrastructure_failure_skipped"])
+        log_text = "\n".join(captured.output)
+        self.assertIn("MissingDeviceTask", log_text)
+        self.assertIn("emulator-5554", log_text)
 
     def test_soft_recovery_restores_network_and_refreshes_controller(self):
         controller = _Controller()
@@ -552,6 +629,20 @@ class AndroidWorldRecoveryTest(unittest.TestCase):
         self.assertIn(("shell", "getprop", "sys.boot_completed"), issued)
         self.assertEqual(controller.refreshes, 2)
 
+    def test_missing_adb_device_does_not_attempt_impossible_guest_reboot(self):
+        environment = types.SimpleNamespace(controller=_Controller())
+        config = AndroidWorldConfig(console_port=5554)
+
+        with mock.patch(
+            "src1.pmtskill_v2.evaluation.recovery._adb_command",
+            side_effect=RuntimeError("error: device 'emulator-5554' not found"),
+        ) as adb:
+            with self.assertRaisesRegex(RuntimeError, "已从 ADB 消失"):
+                recover_android_world_environment(environment, config)
+
+        self.assertEqual(adb.call_count, 1)
+        self.assertEqual(adb.call_args.args[1:], ("get-state",))
+
     def test_zero_valid_episodes_is_not_accepted_as_real_score(self):
         with self.assertRaisesRegex(
             AndroidWorldInfrastructureError, "未产生任何有效 episode"
@@ -560,6 +651,16 @@ class AndroidWorldRecoveryTest(unittest.TestCase):
                 [{"exception_info": "Could not get a11y tree."}],
                 expected_episodes=1,
             )
+
+    def test_training_mode_allows_zero_valid_episodes_without_fake_score(self):
+        with self.assertLogs(level="ERROR") as captured:
+            ensure_valid_evaluation_episodes(
+                [{"exception_info": "Could not get a11y tree."}],
+                expected_episodes=1,
+                allow_infrastructure_failures=True,
+            )
+
+        self.assertIn("训练将继续", "\n".join(captured.output))
 
 
 if __name__ == "__main__":

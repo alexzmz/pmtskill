@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src1.pmtskill_v2.cli import (
     _training_evaluation_output_dir,
@@ -37,6 +37,7 @@ from src1.pmtskill_v2.offline.trainer import (
     staged_training_job,
 )
 from src1.pmtskill_v2.offline.training_workflow import (
+    AndroidWorldTrainingStageEvaluator,
     TrainingEvaluationRecorder,
     TrainingEvaluationOptions,
     TrainingEvaluationWorkflow,
@@ -182,6 +183,83 @@ class _InterruptedEvaluator(_FakeEvaluator):
 
 
 class TrainingEvaluationTest(unittest.TestCase):
+    def test_training_stage_enables_non_fatal_android_world_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "evaluation"
+            output_dir.mkdir()
+            summary_path = output_dir / "summary.json"
+            report_path = output_dir / "report.md"
+            traces_path = output_dir / "traces.jsonl"
+            artifacts = EvaluationArtifacts(
+                output_dir,
+                summary_path,
+                report_path,
+                traces_path,
+                {"episodes_evaluated": 1},
+            )
+            with patch(
+                "src1.pmtskill_v2.evaluation.android_world."
+                "AndroidWorldStandaloneEvaluator.run",
+                return_value=artifacts,
+            ) as run:
+                result = AndroidWorldTrainingStageEvaluator(
+                    _config(root), Mock()
+                ).run(
+                    profile=_config(root).models[0],
+                    use_skills=False,
+                    tasks=("TaskA",),
+                    combinations=1,
+                    seed=42,
+                    family="android_world",
+                    max_steps=30,
+                    include_candidate_skills=False,
+                    output_dir=output_dir,
+                )
+
+            self.assertIs(result, artifacts)
+            self.assertTrue(
+                run.call_args.kwargs["continue_on_infrastructure_failure"]
+            )
+
+    def test_training_stage_converts_missing_emulator_into_unavailable_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "evaluation"
+            with patch(
+                "src1.pmtskill_v2.evaluation.android_world."
+                "AndroidWorldStandaloneEvaluator.run",
+                side_effect=RuntimeError(
+                    "error: device 'emulator-5554' not found"
+                ),
+            ), patch(
+                "src1.pmtskill_v2.evaluation.reporter.render_capability_plot",
+                return_value={},
+            ), self.assertLogs(level="ERROR") as captured:
+                artifacts = AndroidWorldTrainingStageEvaluator(
+                    _config(root), Mock()
+                ).run(
+                    profile=_config(root).models[0],
+                    use_skills=False,
+                    tasks=("TaskA", "TaskB"),
+                    combinations=1,
+                    seed=42,
+                    family="android_world",
+                    max_steps=30,
+                    include_candidate_skills=False,
+                    output_dir=output_dir,
+                )
+
+            self.assertEqual(artifacts.summary["episodes_evaluated"], 0)
+            self.assertEqual(
+                artifacts.summary["infrastructure_skipped_tasks"],
+                ["TaskA", "TaskB"],
+            )
+            self.assertIn(
+                "ANDROIDWORLD_EVALUATION_STAGE_SKIPPED",
+                "\n".join(captured.output),
+            )
+
     def test_training_comparison_reports_final_capability_distribution(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -607,6 +685,87 @@ class TrainingEvaluationTest(unittest.TestCase):
             self.assertTrue(resumed.early_stopped)
             self.assertEqual(resumed_trainer.jobs, [])
             self.assertEqual(resumed_evaluator.calls, [])
+
+    def test_unavailable_evaluation_does_not_trigger_early_stopping(self):
+        class TemporarilyUnavailableEvaluator(_FakeEvaluator):
+            def run(self, **kwargs):
+                profile = kwargs["profile"]
+                use_skills = kwargs["use_skills"]
+                if (
+                    profile.adapter
+                    and Path(profile.adapter).name == "checkpoint-10"
+                    and not use_skills
+                ):
+                    output_dir = Path(kwargs["output_dir"])
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    summary = {
+                        "evaluation_available": False,
+                        "episodes_evaluated": 0,
+                        "successes": 0,
+                        "success_rate_micro": 0.0,
+                        "success_rate_macro": 0.0,
+                        "average_steps": 0.0,
+                        "infrastructure_skipped_tasks": ["TaskA"],
+                    }
+                    summary_path = output_dir / "summary.json"
+                    report_path = output_dir / "report.md"
+                    traces_path = output_dir / "traces.jsonl"
+                    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+                    report_path.write_text("unavailable", encoding="utf-8")
+                    traces_path.write_text("", encoding="utf-8")
+                    return EvaluationArtifacts(
+                        output_dir,
+                        summary_path,
+                        report_path,
+                        traces_path,
+                        summary,
+                    )
+                return super().run(**kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            trainer = _FakeTrainer()
+            job = AdapterJob("all", root / "train.jsonl", None, root / "unused")
+            job.train_dataset.write_text(
+                json.dumps({"messages": []}) + "\n", encoding="utf-8"
+            )
+
+            result = TrainingEvaluationWorkflow(
+                config,
+                object(),
+                trainer,
+                deployment=_FakeDeployment(config.models[0]),
+                evaluator=TemporarilyUnavailableEvaluator(),
+            ).run(
+                job,
+                TrainingEvaluationOptions(
+                    output_dir=root / "run",
+                    tasks=("TaskA",),
+                    full_evaluation=False,
+                    early_stopping_enabled=True,
+                    early_stopping_patience=1,
+                    every_epochs=1,
+                    checkpoint_every_epochs=0,
+                ),
+            )
+
+            self.assertFalse(result.early_stopped)
+            self.assertEqual(len(trainer.jobs), 2)
+            history = json.loads(result.history_json.read_text(encoding="utf-8"))
+            epoch_one = next(
+                row
+                for row in history["stages"]
+                if row["label"] == "epoch_001_standalone"
+            )
+            self.assertFalse(epoch_one["evaluation_available"])
+            self.assertNotIn(
+                1.0,
+                [
+                    float(row["epoch"])
+                    for row in history["early_stopping"]["observations"]
+                ],
+            )
 
     def test_without_full_evaluation_still_runs_standalone_early_stop_probes(self):
         with tempfile.TemporaryDirectory() as directory:

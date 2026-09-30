@@ -25,7 +25,7 @@ from ..evaluation.capabilities import (
     render_capability_plot,
 )
 from ..evaluation.deployment import MSSwiftEvaluationDeployment
-from ..evaluation.reporter import EvaluationArtifacts
+from ..evaluation.reporter import EvaluationArtifacts, write_evaluation_report
 from ..skills.store import SkillStore
 from .trainer import (
     AdapterJob,
@@ -334,28 +334,85 @@ class AndroidWorldTrainingStageEvaluator:
             AndroidWorldStandaloneEvaluator,
         )
 
-        if use_skills:
-            return AndroidWorldOnlineEvaluator(self.config, self.store).run(
+        try:
+            if use_skills:
+                return AndroidWorldOnlineEvaluator(self.config, self.store).run(
+                    tasks=tasks,
+                    n_task_combinations=combinations,
+                    seed=seed,
+                    family=family,
+                    max_steps=max_steps,
+                    include_candidate_skills=include_candidate_skills,
+                    output_dir=output_dir,
+                    model_profiles=(profile,),
+                    # 训练评测数据不写回技能库，避免测试集反向污染路由统计。
+                    record_traces=False,
+                    continue_on_infrastructure_failure=True,
+                )
+            return AndroidWorldStandaloneEvaluator(self.config).run(
+                profile=profile,
                 tasks=tasks,
                 n_task_combinations=combinations,
                 seed=seed,
                 family=family,
                 max_steps=max_steps,
-                include_candidate_skills=include_candidate_skills,
                 output_dir=output_dir,
-                model_profiles=(profile,),
-                # 训练评测数据不写回技能库，避免测试集反向污染路由统计。
-                record_traces=False,
+                continue_on_infrastructure_failure=True,
             )
-        return AndroidWorldStandaloneEvaluator(self.config).run(
-            profile=profile,
-            tasks=tasks,
-            n_task_combinations=combinations,
-            seed=seed,
-            family=family,
-            max_steps=max_steps,
-            output_dir=output_dir,
-        )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            # load_and_setup_env 可能在逐 task wrapper 安装前就失败。只吞掉明确的
+            # Android/ADB 基础设施故障，模型、数据和代码错误仍正常抛出。
+            from ..evaluation.recovery import (
+                AndroidWorldInfrastructureError,
+                is_infrastructure_failure,
+            )
+
+            error_traceback = traceback.format_exc()
+            infrastructure_failure = isinstance(
+                exc, AndroidWorldInfrastructureError
+            ) or is_infrastructure_failure({"exception_info": error_traceback})
+            if not infrastructure_failure:
+                raise
+            logging.error(
+                "ANDROIDWORLD_EVALUATION_STAGE_SKIPPED: 训练评测环境初始化/收尾失败；"
+                "本评测阶段记为 unavailable，训练继续。mode=%s tasks=%s\n%s",
+                "skills" if use_skills else "standalone",
+                ",".join(tasks),
+                error_traceback,
+            )
+            episodes = [
+                {
+                    "goal": "",
+                    "task_template": task_name,
+                    "episode_data": float("nan"),
+                    "is_successful": float("nan"),
+                    "run_time": 0.0,
+                    "episode_length": float("nan"),
+                    "exception_info": error_traceback,
+                    "aux_data": {
+                        "infrastructure_failure_skipped": True,
+                        "evaluation_stage_unavailable": True,
+                    },
+                }
+                for task_name in tasks
+            ]
+            return write_evaluation_report(
+                output_dir,
+                episodes,
+                [],
+                metadata={
+                    "evaluation_mode": (
+                        "training_skills" if use_skills else "training_standalone"
+                    ),
+                    "evaluation_available": False,
+                    "infrastructure_error": str(exc),
+                    "tasks": list(tasks),
+                    "family": family,
+                    "max_steps": max_steps,
+                },
+            )
 
 
 class TrainingEvaluationRecorder:
@@ -524,6 +581,12 @@ class TrainingEvaluationRecorder:
             "checkpoint": str(checkpoint) if checkpoint else None,
             "is_final_checkpoint": final_checkpoint,
             "episodes": summary.get("episodes_evaluated", 0),
+            "evaluation_available": bool(
+                summary.get(
+                    "evaluation_available",
+                    summary.get("episodes_evaluated", 0) > 0,
+                )
+            ),
             "successes": summary.get("successes", 0),
             "micro_sr": summary.get("success_rate_micro", 0.0),
             "macro_sr": summary.get("success_rate_macro", 0.0),
@@ -540,6 +603,9 @@ class TrainingEvaluationRecorder:
                 "capability_unclassified_tasks", []
             ),
             "capability_plot": summary.get("capability_plot"),
+            "infrastructure_skipped_tasks": summary.get(
+                "infrastructure_skipped_tasks", []
+            ),
         }
         self.state["stages"].append(row)
         self.flush()
@@ -572,11 +638,26 @@ class TrainingEvaluationRecorder:
             (row for row in reversed(rows) if row["label"] == "final_skills"),
             None,
         )
-        baseline_sr = float(baseline["micro_sr"]) if baseline else None
+        baseline_sr = (
+            float(baseline["micro_sr"])
+            if baseline and baseline.get("evaluation_available", True)
+            else None
+        )
         if baseline_sr is not None:
             for row in rows:
-                row["gain_over_baseline"] = float(row["micro_sr"]) - baseline_sr
-        best = max(checkpoint_rows, key=lambda row: float(row["micro_sr"]), default=None)
+                row["gain_over_baseline"] = (
+                    float(row["micro_sr"]) - baseline_sr
+                    if row.get("evaluation_available", True)
+                    else None
+                )
+        available_checkpoints = [
+            row for row in checkpoint_rows if row.get("evaluation_available", True)
+        ]
+        best = max(
+            available_checkpoints,
+            key=lambda row: float(row["micro_sr"]),
+            default=None,
+        )
         return {
             "baseline_standalone": baseline,
             "baseline_skills": baseline_skills,
@@ -593,6 +674,7 @@ class TrainingEvaluationRecorder:
             "epoch",
             "is_final_checkpoint",
             "episodes",
+            "evaluation_available",
             "successes",
             "micro_sr",
             "macro_sr",
@@ -643,19 +725,22 @@ class TrainingEvaluationRecorder:
         lines.extend(
             (
                 "",
-                "| 阶段 | 模式 | Epoch | 成功/有效 | Micro SR | Macro SR | 相对裸基座 |",
-            "|---|---|---:|---:|---:|---:|---:|",
+                "| 阶段 | 模式 | Epoch | 状态 | 成功/有效 | Micro SR | Macro SR | 相对裸基座 |",
+            "|---|---|---:|---|---:|---:|---:|---:|",
             )
         )
         for row in self.state["stages"]:
             gain = row.get("gain_over_baseline")
             gain_text = "—" if gain is None else f"{float(gain):+.2%}"
             mode = "模型+技能库" if row["mode"] == "skills" else "裸模型"
+            available = row.get("evaluation_available", True)
+            micro_text = f"{float(row['micro_sr']):.2%}" if available else "N/A"
+            macro_text = f"{float(row['macro_sr']):.2%}" if available else "N/A"
             lines.append(
                 f"| {row['label']} | {mode} | {row['epoch']:g} | "
+                f"{'可用' if available else '基础设施不可用'} | "
                 f"{row['successes']}/{row['episodes']} | "
-                f"{float(row['micro_sr']):.2%} | "
-                f"{float(row['macro_sr']):.2%} | {gain_text} |"
+                f"{micro_text} | {macro_text} | {gain_text} |"
             )
 
         capability_rows = [
@@ -1086,6 +1171,10 @@ class TrainingEvaluationWorkflow:
             label = str(row.get("label", ""))
             if label != "baseline_standalone" and float(row.get("epoch", 0)) <= 0:
                 continue
+            if not row.get(
+                "evaluation_available", int(row.get("episodes", 0)) > 0
+            ):
+                continue
             monitor.observe(
                 epoch=float(row.get("epoch", 0)),
                 micro_sr=float(row.get("micro_sr", 0)),
@@ -1174,7 +1263,11 @@ class TrainingEvaluationWorkflow:
                             epoch=0.0,
                             checkpoint=None,
                         )
-                        if options.early_stopping_enabled and not use_skills:
+                        if (
+                            options.early_stopping_enabled
+                            and not use_skills
+                            and row.get("evaluation_available", False)
+                        ):
                             monitor.observe(
                                 epoch=0.0,
                                 micro_sr=float(row["micro_sr"]),
@@ -1281,7 +1374,12 @@ class TrainingEvaluationWorkflow:
                                     checkpoint=checkpoint,
                                     final_checkpoint=stage.final,
                                 )
-                                if options.early_stopping_enabled:
+                                if (
+                                    options.early_stopping_enabled
+                                    and standalone_row.get(
+                                        "evaluation_available", False
+                                    )
+                                ):
                                     monitor.observe(
                                         epoch=target_epoch,
                                         micro_sr=float(standalone_row["micro_sr"]),

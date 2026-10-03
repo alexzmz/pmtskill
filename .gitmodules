@@ -7,3 +7,6 @@
 [submodule "libs/ms-swift"]
 	path = libs/ms-swift
 	url = git@github.com:alexzmz/ms-swift.git
+[submodule "libs/V-Droid"]
+	path = libs/V-Droid
+	url = https://github.com/V-Droid-Agent/V-Droid.git

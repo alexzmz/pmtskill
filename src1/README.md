@@ -43,6 +43,8 @@
 ```text
 src1/
 ├── config.example.toml             # 唯一运行配置入口
+├── baseline_vdroid/                 # 隔离的固定模型 V-Droid baseline
+│   └── config.example.toml          # V-Droid 专用配置入口
 ├── resources/primitives.json       # 26 个原语，可扩展
 ├── pmtskill_v2/
 │   ├── core/                        # 数据契约、配置、原子 IO
@@ -532,7 +534,7 @@ python -m src1 --config src1/config.local.toml evaluate-pmtskill \
 --routing-maximum-candidates 32
 ```
 
-三种接口还共同支持 `--base-model-path`、`--deploy-host`、`--deploy-port`、
+三种 PORTS 接口还共同支持 `--base-model-path`、`--deploy-host`、`--deploy-port`、
 `--cuda-visible-devices`、`--infer-backend`、`--max-model-len`、
 `--gpu-memory-utilization`、`--max-new-tokens`、`--max-steps`、
 `--deploy-extra-arg` 和 `--dry-run`。`--max-steps` 默认 30，并会写入评测报告元数据。
@@ -542,6 +544,30 @@ python -m src1 --config src1/config.local.toml evaluate-pmtskill \
 为避免基准测试反向污染技能统计，后两种接口默认不把 trace 写回 SQLite；确实要交给
 backend 维护时显式增加 `--record-traces`。候选 polished skill 默认不参与正式评测，
 灰度验证时增加 `--include-candidates`。
+
+### 6.4 V-Droid baseline：固定 verifier + 原生候选动作评分
+
+V-Droid 使用 `libs/V-Droid` 自带的 AndroidWorld fork，在独立 worker 中运行，避免和
+PORTS 当前 `libs/android_world` 的 Python 模块互相污染。它固定使用一个 verifier，
+枚举当前 UI 的候选动作并批量评分，选择最高分动作；工作记忆和缺失动作参数由一个固定
+assistant 模型处理。该路径不读取技能数据库，不执行模型/adapter 切换，也不做技能适配。
+
+```bash
+cp src1/baseline_vdroid/config.example.toml \
+  src1/baseline_vdroid/config.local.toml
+
+python -m src1 \
+  --config src1/baseline_vdroid/config.local.toml \
+  evaluate-vdroid \
+  --tasks ContactsAddContact SimpleCalendarAddOneEvent \
+  --combinations 5 --seed 42 --max-steps 30
+```
+
+建议先加 `--dry-run` 检查 V-Droid 源码、依赖、固定模型和 worker 命令。为了与 PORTS
+形成可复现的配对比较，两次实验应显式传入相同的 `--tasks`、`--combinations`、
+`--seed` 和 `--max-steps`。输出仍包含 `summary.json`、`report.md`、`traces.jsonl`、
+七维能力图和 checkpoints；额外记录每次 verifier 决策的候选动作数量、被选动作分数和
+动作补全次数。
 
 每次评测目录包含：
 
@@ -554,7 +580,7 @@ backend 维护时显式增加 `--record-traces`。候选 polished skill 默认�
 此外每次 CLI 都会在 `[paths].log_dir` 下生成独立目录，其中 `runtime.log` 保存部署输出、
 warning/error/traceback，`result.json` 和 `result.md` 保存最终指标及完整 adapter 解析结果。
 
-### 6.4 模型×技能的无 LLM 配对标定
+### 6.5 模型×技能的无 LLM 配对标定
 
 普通评测只观察路由器实际选中的技能，不能完整回答“某个 adapter 是否支持某个技能”。
 `calibrate-skills` 借鉴 SKVM bench 的 `no-skill` 与 `original/custom-skill` condition：

@@ -1,0 +1,53 @@
+# V-Droid baseline configuration. Relative paths are resolved from this file.
+# Copy to config.local.toml before running on the Linux evaluation server.
+
+[paths]
+repo_root = "../.."
+v_droid_root = "../../libs/V-Droid"
+output_dir = "../runtime/vdroid_evaluations"
+log_dir = "../runtime/logs"
+
+[android_world]
+adb_path = "adb"
+console_port = 5554
+grpc_port = 8554
+device_name = "emulator-5554"
+emulator_setup = false
+freeze_datetime = true
+verify_api_level = true
+# Keep this equal to the PORTS evaluation setting.
+wait_after_action_seconds = 1.0
+
+[vdroid]
+# One fixed verifier is used for all tasks and actions. There is no model pool,
+# adapter switching, PORTS skill lookup, or online skill adaptation.
+model_id = "vdroid-8b-0323"
+base_model = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
+# Upstream code resolves this as the Hugging Face repo V-Droid/V-Droid-8B-0323.
+verifier_adapter = "V-Droid-8B-0323"
+num_actors = 1
+search_iterations = 1
+# llm is the paper's full working-memory path; rule and skip are ablations.
+summary_mode = "llm"
+# cuda_visible_devices = "0"
+
+[assistant]
+# Fixed model used only for working-memory summaries and incomplete action fields.
+service = "openai"
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+# api_version = "2024-10-21"
+
+[evaluation]
+family = "android_world"
+# Empty means all tasks. Use exactly the same explicit list as evaluate-pmtskill
+# for the cleanest paired comparison.
+tasks = []
+# task_count = 30
+combinations = 1
+seed = 42
+max_steps = 30
+fixed_task_seed = false
+store_screenshots = false
+

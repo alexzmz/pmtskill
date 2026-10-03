@@ -46,6 +46,9 @@ from .skills.compiler import LLMRawSkillCompiler, compile_imported_raw_skills
 from .skills.store import SkillStore
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.example.toml"
+DEFAULT_VDROID_CONFIG = (
+    Path(__file__).resolve().parents[1] / "baseline_vdroid" / "config.example.toml"
+)
 
 
 def _print(value: Any) -> None:
@@ -79,6 +82,13 @@ def _resolve_log_root(args: argparse.Namespace) -> Path:
 
     if args.log_dir:
         return Path(args.log_dir).expanduser().resolve()
+    if getattr(args, "command", None) == "evaluate-vdroid":
+        try:
+            from ..baseline_vdroid.config import load_vdroid_config
+
+            return load_vdroid_config(_vdroid_config_path(args)).paths.log_dir
+        except Exception:
+            return (DEFAULT_CONFIG.parent / "runtime" / "logs").resolve()
     try:
         return load_config(args.config).paths.log_dir
     except Exception:
@@ -92,6 +102,15 @@ def _tasks(values: Sequence[str] | None) -> list[str] | None:
     for value in values:
         result.extend(part.strip() for part in value.split(",") if part.strip())
     return result or None
+
+
+def _vdroid_config_path(args: argparse.Namespace) -> Path:
+    """Use the baseline config by default without changing other commands."""
+
+    configured = Path(args.config).expanduser().resolve()
+    if configured == DEFAULT_CONFIG.resolve():
+        return DEFAULT_VDROID_CONFIG.resolve()
+    return configured
 
 
 def _open(config_path: str) -> tuple[ProjectConfig, SkillStore]:
@@ -1221,6 +1240,56 @@ def _dry_evaluation_result(mode: str, deployment, bindings, args) -> int:
     return 0
 
 
+def command_evaluate_vdroid(args: argparse.Namespace) -> int:
+    """Run native V-Droid as a fixed-model, no-skill AndroidWorld baseline."""
+
+    from ..baseline_vdroid.config import load_vdroid_config
+    from ..baseline_vdroid.evaluator import (
+        VDroidBaselineEvaluator,
+        VDroidRunOptions,
+        apply_cli_overrides,
+    )
+
+    config = load_vdroid_config(_vdroid_config_path(args))
+    options = apply_cli_overrides(
+        VDroidRunOptions.from_config(config),
+        tasks=_tasks(args.tasks),
+        task_count=args.task_count,
+        combinations=args.combinations,
+        seed=args.seed,
+        family=args.family,
+        max_steps=args.max_steps,
+        fixed_task_seed=args.fixed_task_seed,
+        output_dir=(
+            Path(args.output_dir).expanduser().resolve()
+            if args.output_dir
+            else None
+        ),
+        model_id=args.model_id,
+        base_model=args.base_model,
+        verifier_adapter=args.verifier_adapter,
+        assistant_service=args.assistant_service,
+        assistant_model=args.assistant_model,
+        assistant_base_url=args.assistant_base_url,
+        assistant_api_key_env=args.assistant_api_key_env,
+        assistant_api_version=args.assistant_api_version,
+        summary_mode=args.summary_mode,
+        num_actors=args.num_actors,
+        search_iterations=args.search_iterations,
+        cuda_visible_devices=args.cuda_visible_devices,
+        store_screenshots=args.store_screenshots,
+        emulator_setup=args.emulator_setup,
+        freeze_datetime=args.freeze_datetime,
+    )
+    evaluator = VDroidBaselineEvaluator(config, options)
+    if args.dry_run:
+        _print(evaluator.dry_run())
+        return 0
+    config.ensure_output_dirs()
+    _print(evaluator.run())
+    return 0
+
+
 def command_evaluate_standalone(args: argparse.Namespace) -> int:
     """接口一：单 adapter 裸模型 + 原生 M3A，不读取或注入技能。"""
 
@@ -1969,6 +2038,79 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--goal", required=True)
     plan.add_argument("--include-candidates", action="store_true")
     plan.set_defaults(handler=command_plan)
+
+    vdroid = subparsers.add_parser(
+        "evaluate-vdroid",
+        help="固定 verifier、无技能适配的原生 V-Droid AndroidWorld baseline",
+    )
+    vdroid.add_argument("--tasks", nargs="*", help="任务名；默认读取 TOML，留空为全部")
+    vdroid.add_argument(
+        "--task-count",
+        type=int,
+        help="未指定任务时按 seed 抽样；覆盖 [evaluation].task_count",
+    )
+    vdroid.add_argument("--combinations", type=int, help="每任务参数组合数")
+    vdroid.add_argument("--seed", type=int, help="任务与参数随机种子")
+    vdroid.add_argument("--family", help="V-Droid AndroidWorld family")
+    vdroid.add_argument(
+        "--max-steps",
+        type=int,
+        help="每个 episode 的统一硬步数上限；应与 PORTS 相同",
+    )
+    vdroid.add_argument("--output-dir", help="本次 summary/report/traces/checkpoints 目录")
+    vdroid.add_argument("--model-id", help="报告中的固定 V-Droid verifier ID")
+    vdroid.add_argument("--base-model", help="固定 verifier 的 Llama 基座或本地路径")
+    vdroid.add_argument(
+        "--verifier-adapter",
+        help="V-Droid verifier adapter 短名称，默认 V-Droid-8B-0323",
+    )
+    vdroid.add_argument(
+        "--assistant-service",
+        choices=["openai", "trapi", "azure_openai"],
+        help="工作记忆/动作补全使用的固定服务",
+    )
+    vdroid.add_argument("--assistant-model", help="工作记忆/动作补全固定模型")
+    vdroid.add_argument("--assistant-base-url", help="固定 assistant API endpoint")
+    vdroid.add_argument("--assistant-api-key-env", help="只填写 API key 环境变量名")
+    vdroid.add_argument("--assistant-api-version")
+    vdroid.add_argument(
+        "--summary-mode",
+        choices=["llm", "rule", "skip"],
+        help="V-Droid working memory 模式；llm 为论文完整路径",
+    )
+    vdroid.add_argument("--num-actors", type=int, help="并行 verifier actor/GPU 数")
+    vdroid.add_argument("--search-iterations", type=int, help="V-Droid 搜索轮数")
+    vdroid.add_argument("--cuda-visible-devices", help="V-Droid 使用的物理 GPU")
+    vdroid.add_argument(
+        "--fixed-task-seed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="不同组合是否使用相同 task seed",
+    )
+    vdroid.add_argument(
+        "--store-screenshots",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否保留 V-Droid 搜索截图；默认关闭以控制磁盘占用",
+    )
+    vdroid.add_argument(
+        "--emulator-setup",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否执行一次性 emulator app setup",
+    )
+    vdroid.add_argument(
+        "--freeze-datetime",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否使用 AndroidWorld 固定日期",
+    )
+    vdroid.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只解析配置与 worker 命令，不加载 CUDA 或连接 emulator",
+    )
+    vdroid.set_defaults(handler=command_evaluate_vdroid)
 
     standalone = subparsers.add_parser(
         "evaluate-standalone",

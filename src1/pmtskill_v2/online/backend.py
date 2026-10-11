@@ -129,7 +129,7 @@ class SkillOptimizationBackend:
         )
         compile_summary = None
         compiler_model_id = self.config.maintenance.raw_skill_compiler_model_id
-        if compiler_model_id and self.config.maintenance.admission_policy != "success_once":
+        if compiler_model_id and self.config.maintenance.admission_policy == "calibrated":
             client = OpenAICompatibleVLClient(self.config.model(compiler_model_id))
             compiler = LLMRawSkillCompiler(client, load_primitives())
             compile_summary = compile_imported_raw_skills(
@@ -138,7 +138,9 @@ class SkillOptimizationBackend:
                 limit=self.config.maintenance.raw_skill_compile_batch_size,
             )
         pending_traces = self.store.list_traces(processed=False)
-        profile_updates = self._update_model_profiles(pending_traces)
+        # 片段统计使用 episode 结果，不把它冒充每个原语的独立能力真值。
+        profile_updates = ({} if self.config.maintenance.admission_policy == "evidence_based"
+                           else self._update_model_profiles(pending_traces))
         maintenance = self.maintainer.run_cycle()
         report_path = self.config.paths.state_dir / "reports" / "maintenance_latest.json"
         result = BackendCycleResult(

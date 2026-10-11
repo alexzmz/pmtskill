@@ -107,6 +107,29 @@ class RoutingConfig:
 
 
 @dataclasses.dataclass(slots=True)
+class EvidenceMiningConfig:
+    """分层经验准入；这些阈值不是学生模型的标定门槛。"""
+
+    l1_min_successes: int = 4
+    l1_min_tasks: int = 2
+    l1_min_success_rate: float = 0.75
+    l1_min_wilson_lower: float = 0.40
+    l2_min_successes: int = 3
+    l2_min_tasks: int = 2
+    l2_min_success_rate: float = 0.85
+    l2_min_wilson_lower: float = 0.40
+    l3_min_successes: int = 2
+    l3_min_success_rate: float = 0.85
+    l3_min_wilson_lower: float = 0.30
+    l3_min_goal_variants: int = 2
+    l3_min_shared_fraction: float = 0.60
+    subflow_min_actions: int = 2
+    subflow_max_actions: int = 4
+    max_active_l2: int = 60
+    prompt_max_chars: int = 1200
+
+
+@dataclasses.dataclass(slots=True)
 class MaintenanceConfig:
     minimum_support: int = 5
     minimum_candidate_trials: int = 10
@@ -122,6 +145,7 @@ class MaintenanceConfig:
     admission_policy: str = "calibrated"
     build_hierarchy: bool = False
     hierarchy_block_size: int = 3
+    mining: EvidenceMiningConfig = dataclasses.field(default_factory=EvidenceMiningConfig)
 
 
 @dataclasses.dataclass(slots=True)
@@ -343,9 +367,24 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
     if training_evaluation.max_new_tokens <= 0:
         raise ValueError("training_evaluation.max_new_tokens 必须是正整数")
     routing = RoutingConfig(**_section(raw, "routing"))
-    maintenance = MaintenanceConfig(**_section(raw, "maintenance"))
-    if maintenance.admission_policy not in {"calibrated", "success_once"}:
-        raise ValueError("maintenance.admission_policy 必须为 calibrated 或 success_once")
+    maintenance_raw = _section(raw, "maintenance")
+    mining_raw = maintenance_raw.pop("mining", {})
+    if not isinstance(mining_raw, dict):
+        raise ValueError("[maintenance.mining] 必须是表")
+    mining = EvidenceMiningConfig(**mining_raw)
+    maintenance = MaintenanceConfig(**maintenance_raw, mining=mining)
+    if maintenance.admission_policy not in {"calibrated", "success_once", "evidence_based"}:
+        raise ValueError("maintenance.admission_policy 必须为 calibrated / success_once / evidence_based")
+    for name, value in dataclasses.asdict(mining).items():
+        if name.endswith(("success_rate", "wilson_lower", "shared_fraction")):
+            if isinstance(value, bool) or not isinstance(value, (float, int)) or not 0 <= value <= 1:
+                raise ValueError(f"maintenance.mining.{name} 必须在 [0,1]")
+        elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"maintenance.mining.{name} 必须为正整数")
+    if mining.subflow_min_actions < 2 or mining.subflow_max_actions < mining.subflow_min_actions:
+        raise ValueError("子流程长度需要 2 <= subflow_min_actions <= subflow_max_actions")
+    if mining.prompt_max_chars < 400:
+        raise ValueError("maintenance.mining.prompt_max_chars 必须 >= 400")
     if maintenance.hierarchy_block_size < 2:
         raise ValueError("maintenance.hierarchy_block_size 必须 >= 2")
     if maintenance.minimum_support <= 0:

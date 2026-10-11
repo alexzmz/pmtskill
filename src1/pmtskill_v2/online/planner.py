@@ -13,6 +13,7 @@ from typing import Any, Protocol, Sequence
 
 from ..core.models import PrimitiveSpec, SkillRecord, SkillStatus, SkillTopology
 from ..inference.vlm import VLModelClient
+from ..skills.goal_schema import abstract_payload, goal_intent, goal_shape
 
 
 @dataclass(slots=True)
@@ -218,6 +219,7 @@ def retrieve_task_skill(goal: str, skills: Sequence[SkillRecord], *, include_can
     def terms(text: str) -> set[str]:
         # 食谱等目标在首行给出操作/应用，其后是实例数据表，不能让表内容淹没检索。
         text = text.splitlines()[0] if text.splitlines() else text
+        text = abstract_payload(text)
         # 参数化模板已将换行压成空格；表头仍可识别，表中数据不用于检索。
         text = re.split(r"\s+\w+\|\w+\|", text, maxsplit=1)[0]
         payload = re.search(r"\b(?:message|text|subject|body)\s*:", text, re.I)
@@ -229,11 +231,20 @@ def retrieve_task_skill(goal: str, skills: Sequence[SkillRecord], *, include_can
         return _terms(text)
 
     query = terms(goal)
+    query_shape = goal_shape(goal)
+    query_intent = goal_intent(goal)
     ranked: list[tuple[float, int, str, SkillRecord]] = []
     for skill in skills:
         if skill.kind != "polished" or skill.metadata.get("hierarchy_role") != "task":
             continue
         if skill.status != SkillStatus.ACTIVE and not (include_candidates and skill.status == SkillStatus.CANDIDATE):
+            continue
+        known_intents = skill.metadata.get("goal_intents", ())
+        if query_intent and known_intents and query_intent not in known_intents:
+            continue
+        known_shapes = skill.metadata.get("goal_shapes", ())
+        if query_shape and any(known_shapes) and query_shape not in known_shapes:
+            # 单对象流程不能因首行相同而误匹配到批量任务；只读 goal，不使用 task ID。
             continue
         best = 0.0
         for template in skill.metadata.get("goal_templates", ()):

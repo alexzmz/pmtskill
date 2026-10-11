@@ -557,13 +557,18 @@ class SkillMaintainer:
         # 会按当前配置过滤旧窗口，processed 仍只表示本轮新消费数量。
         hierarchy: dict[str, Any] = {}
         if self.config.build_hierarchy:
-            from .hierarchy import build_hierarchical_library
+            if self.config.admission_policy == "evidence_based":
+                from .evidence_miner import build_evidence_library
 
-            created, hierarchy = build_hierarchical_library(self.store, self.config)
+                created, hierarchy = build_evidence_library(self.store, self.config.mining)
+            else:
+                from .hierarchy import build_hierarchical_library
+
+                created, hierarchy = build_hierarchical_library(self.store, self.config)
             subsequences_found = int(hierarchy["polished_skills"])
         else:
-            if self.config.admission_policy == "success_once":
-                raise ValueError("success_once 需要 build_hierarchy=true 或 --hierarchical")
+            if self.config.admission_policy in {"success_once", "evidence_based"}:
+                raise ValueError("经验准入需要 build_hierarchy=true 或 --hierarchical")
             created, subsequences_found = self.discover_candidates(self.store.list_traces())
         model_pair_updates = self.reconcile_calibrations()
         promoted, rolled_back = self.promote_and_rollback()

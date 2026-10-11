@@ -606,6 +606,7 @@ class SkillStore:
 
         方向固定为“高层/新生成技能 ``parent`` → 来源或组成技能 ``child``”。
         ``derived_from_raw`` 和 ``composes_polished`` 因而可以共存且语义明确。
+        ``related_raw`` 仅表示分类先验，允许零执行证据，不得伪造一次成功。
         返回值表示是否首次创建该关系。
         """
 
@@ -665,7 +666,7 @@ class SkillStore:
                     parent_skill_id,
                     child_skill_id,
                     relation,
-                    max(1, int(evidence_count)),
+                    max(0 if relation == "related_raw" else 1, int(evidence_count)),
                     json.dumps(dict(detail or {}), ensure_ascii=False),
                     utc_now(),
                 ),

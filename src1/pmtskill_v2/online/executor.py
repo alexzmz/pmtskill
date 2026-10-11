@@ -212,6 +212,39 @@ class RoutedVLWrapper:
                 return step
         return self.plan.steps[-1]
 
+    def _stepwise_guidance(self, step: RouteStep, skill: SkillRecord) -> tuple[str, int]:
+        """新挖掘库逐步注入；即使路由到 L1/L2，也使用 L3 的对应位置绑定。
+
+        调用次数仅是软进度提示，不代表 GUI 动作已成功；以当前截图和 goal 为准。
+        """
+        assert self.plan is not None
+        offset = 0
+        for planned_step in self.plan.steps:
+            if planned_step is step:
+                break
+            previous = self.skills.get(planned_step.skill_id or "")
+            offset += max(1, int(previous.metadata.get("operation_count", 1))) if previous and previous.metadata.get("hierarchy_role") else 1
+        local_stage = max(0, self.action_call_index - offset)
+        root = self.skills.get(self.plan.metadata.get("task_skill_id", ""))
+        binding = root if root and root.metadata.get("compiler") == "evidence-hierarchy-v2" else skill
+        instructions = binding.metadata.get("instructions", [])
+        stage = min(self.action_call_index if binding is root else local_stage, max(0, len(instructions) - 1))
+        primitives = binding.metadata.get("leaf_primitive_ids", [])
+        current_primitive = primitives[stage] if primitives else "inspect current UI"
+        from ..skills.evidence_miner import GUARD
+
+        header = (
+            "\n\nPMT-Skill guidance (evidence-based; not student-calibrated):\n"
+            f"Skill: {skill.name[:100]}\nCurrent primitive: {current_primitive}\n"
+            f"Approximate stage: {stage + 1}/{max(1, len(instructions))}. Check the live UI; progress is advisory.\n"
+            + GUARD + "\n"
+        )
+        limit = max(400, int(skill.metadata.get("prompt_max_chars", 1200)))
+        upcoming = instructions[stage:stage + 3] or ["Inspect the live UI and verify the current goal."]
+        budget = max(20, (limit - len(header) - 45) // len(upcoming))
+        guidance = header + "\n".join(f"{stage + i + 1}. {str(text)[:budget]}" for i, text in enumerate(upcoming))
+        return guidance[:limit], stage
+
     def predict_mm(
         self, text_prompt: str, images: list[Any]
     ) -> tuple[str, bool | None, dict[str, Any] | None]:
@@ -224,14 +257,21 @@ class RoutedVLWrapper:
         )
         skill = self.skills.get(route_step.skill_id or "")
         augmented = text_prompt
+        stage_index = None
+        guidance_chars = 0
         if not is_summary:
-            augmented += (
-                "\n\nPMT-Skill 路由约束：\n"
-                f"- 当前原语：{', '.join(route_step.primitive_ids)}\n"
-                f"- 当前技能：{skill.name if skill else 'primitive fallback'}\n"
-                f"- 技能说明：{skill.body[:3000] if skill else '按原语完成一个可靠动作。'}\n"
-                "以上约束不能改变 AndroidWorld 要求的 Reason/Action 输出格式。"
-            )
+            if skill and skill.metadata.get("prompt_mode") == "stepwise":
+                guidance, stage_index = self._stepwise_guidance(route_step, skill)
+            else:
+                guidance = (
+                    "\n\nPMT-Skill 路由约束：\n"
+                    f"- 当前原语：{', '.join(route_step.primitive_ids)}\n"
+                    f"- 当前技能：{skill.name if skill else 'primitive fallback'}\n"
+                    f"- 技能说明：{skill.body[:3000] if skill else '按原语完成一个可靠动作。'}\n"
+                    "以上约束不能改变 AndroidWorld 要求的 Reason/Action 输出格式。"
+                )
+            augmented += guidance
+            guidance_chars = len(guidance)
         client = self.model_pool.client(route_step.model_id)
         output, safe, raw = client.predict_mm(augmented, images)  # type: ignore[attr-defined]
         route_metadata = {
@@ -239,6 +279,8 @@ class RoutedVLWrapper:
             "skill_id": route_step.skill_id,
             "primitive_ids": list(route_step.primitive_ids),
             "is_summary": is_summary,
+            "guidance_chars": guidance_chars,
+            "skill_stage_index": stage_index,
         }
         if raw is not None:
             raw = dict(raw)

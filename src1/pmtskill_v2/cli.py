@@ -661,6 +661,8 @@ def _resume_evaluation_tasks(run_dir: Path) -> list[str] | None:
 
 def command_maintain(args: argparse.Namespace) -> int:
     config = load_config(args.config)
+    if args.success_once and args.evidence_based:
+        raise ValueError("--success-once 与 --evidence-based 不能同时使用")
     if args.source_database:
         config.paths.skill_library_db = Path(args.source_database).expanduser().resolve()
         if not config.paths.database.is_file():
@@ -676,6 +678,9 @@ def command_maintain(args: argparse.Namespace) -> int:
     if args.success_once:
         config.maintenance.admission_policy = "success_once"
         config.maintenance.build_hierarchy = True
+    if args.evidence_based:
+        config.maintenance.admission_policy = "evidence_based"
+        config.maintenance.build_hierarchy = True
     if args.hierarchical:
         config.maintenance.build_hierarchy = True
     config.ensure_runtime_dirs()
@@ -689,11 +694,16 @@ def command_maintain(args: argparse.Namespace) -> int:
         payload = result.to_dict()
         payload["skill_database"] = str(store.database.resolve())
         if result.maintenance_report.hierarchy:
-            from .skills.hierarchy import export_hierarchical_library
-
             directory = (Path(args.output_dir).expanduser().resolve() if args.output_dir
                          else config.paths.state_dir / "reports" / "hierarchical_library")
-            export_hierarchical_library(store, directory, result.maintenance_report.hierarchy)
+            if config.maintenance.admission_policy == "evidence_based":
+                from .skills.evidence_miner import export_evidence_library
+
+                export_evidence_library(store, directory, result.maintenance_report.hierarchy)
+            else:
+                from .skills.hierarchy import export_hierarchical_library
+
+                export_hierarchical_library(store, directory, result.maintenance_report.hierarchy)
             payload["library_report_dir"] = str(directory)
         _print(payload)
         cycles += 1
@@ -2014,6 +2024,7 @@ def build_parser() -> argparse.ArgumentParser:
     maintain.add_argument("--skip-import", action="store_true", help="仅使用现有 raw，不同步上游 SKILL.md")
     maintain.add_argument("--hierarchical", action="store_true", help="从成功示范生成 L1 操作 / L2 子流程 / L3 任务")
     maintain.add_argument("--success-once", action="store_true", help="覆盖优先：一个有效成功 episode 即准入 active 分层库；不是学生模型标定")
+    maintain.add_argument("--evidence-based", action="store_true", help="语义去重、分层支持度/成功率/复用门槛；失败轨迹参与分母")
     maintain.set_defaults(handler=command_maintain)
 
     compile_skills = subparsers.add_parser(

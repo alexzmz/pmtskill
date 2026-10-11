@@ -819,6 +819,7 @@ class AndroidWorldOnlineEvaluator:
                         planner_id=decomposition.planner_id,
                         include_candidates=include_candidate_skills,
                     )
+                    self.latest_plan.metadata["task_skill_id"] = decomposition.task_skill_id
                     routed_wrapper.set_plan(self.latest_plan)
                     self.current_goal = goal
                 return compact_m3a_step_result(super().step(goal))

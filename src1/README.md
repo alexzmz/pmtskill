@@ -134,8 +134,8 @@ python -m src1 --config src1/config.local.toml compile-skills \
 
 也可在 `[maintenance]` 中设置
 `raw_skill_compiler_model_id = "teacher-glm-vl"`，之后每次 `maintain` 自动编译一批。
-只有编译器明确批准的 raw skill 才进入规划候选；polished skill 还需真实 trial
-才能 `active`。
+只有编译器明确批准的 raw skill 才进入规划候选；默认 `calibrated` 模式中的 polished
+skill 还需真实 trial 才能 `active`。下面的经验准入是显式选择的在线实验模式，不是模型标定。
 
 ## 4. 离线监督蒸馏
 
@@ -773,7 +773,66 @@ python -m src1 --config src1/config.local.toml maintain \
 9. 把本轮结果写到 `runtime/reports/maintenance_latest.json`。
 
 生产环境可以把 `TemplateSkillCompiler` 换成云端 LLM compiler。无论编译器多强，
-候选技能都不会绕过 AndroidWorld trial 自动晋升，避免技能库被错误经验污染。
+默认 calibrated 模式中的候选技能不会绕过 AndroidWorld trial 自动晋升。
+
+### 7.1 从现有 raw + 教师轨迹生成分层实验库
+
+推荐用 `--evidence-based` 替代宽松的 `--success-once`。它不调用云模型，不需要 API key；
+基于数据库中的真实 Action、环境最终结果和 raw 分类先验挖掘，不能凭 raw 文本伪造成功。
+
+```bash
+python -m src1 --config src1/config.local_all.toml maintain \
+  --source-database /data/skill_library.sqlite3 \
+  --output-database /data/skill_library_evidence.sqlite3 \
+  --output-dir /data/skill_library_evidence_report \
+  --skip-import --evidence-based
+```
+
+`--output-database` 必须是新路径，保留源库全部 raw/trace 内容；省略它则维护源库。
+重复维护不会重复增加同一技能。已做模型配对标定的状态不会被经验规则强行重置；
+未标定的旧 success-once 库技能会被停用，防止绕过新门槛。
+
+| 层级 | 默认经验准入 | 去重与复用约束 |
+|---|---|---|
+| L1 操作族 | ≥4 成功、≥2 任务类、观察比例 ≥75%、Wilson 下界 ≥0.40 | 实际动作 + 语义角色；Save/Delete、姓名/电话字段分开 |
+| L2 子流程 | ≥3 成功、≥2 任务类、观察比例 ≥85%、Wilson 下界 ≥0.40 | 同 app 的连续 2–4 步；相同证据的冗余短窗口淘汰；最多 60 个 active |
+| L3 完整任务 | ≥2 成功、任务观察比例 ≥85%、Wilson 下界 ≥0.30 | 每类任务一条代表路线；参数化任务 ≥2 个不同 goal；与其它成功 episode 的序列一致性 ≥60%（不含自己投票） |
+
+L1/L2 要求跨任务复用，L3 要求完整任务和参数泛化证据，所以不能只按层级机械增加
+样本门槛。每个任务目前通常只有两次采集；2/2 的 Wilson 下界约 0.34，绝不等于
+已经证明真实 SR 很高。样本固定 seed、非独立同分布，下界仅作不确定性提示。
+
+所有结构有效的失败都会进入分母；空动作/环境异常不算模型失败。相同
+`task+goal+suite_seed+instance+teacher` 合并为一个保守 episode 身份组；混合成功/失败
+计失败，缺身份字段则不合并。L1/L2 的比例是包含片段的 **整集结果**，没有独立片段
+真值，不能叫片段 SR；也不写入学生能力、在线自然流量统计或模型×技能配对标定。
+
+raw 只作领域归类，`related_raw` 的执行 evidence_count=0；只有真实 collection_source
+引用才算 derived_from_raw。库中 candidate 保留不准入原因，默认在线不会使用。
+active L3 可以组合 candidate 子组件：父技能有特定任务证据，不代表该操作族在所有任务中都可靠。
+
+生成目录含 coverage.json/md、skill_evidence.csv（成功/失败/支持任务/原因）、
+raw_catalog.json、mining_rules.json、skills.jsonl 和 hierarchy.json。阈值在
+`[maintenance.mining]` 修改，参考 config.example.toml。规则是可复核的有限语义分类，
+不是 LLM 语义理解；无法识别的动作不会被补成虚假的完整路径。
+
+```bash
+python -m src1.pmtskill_v2.skills.library_audit \
+  --source /data/original.sqlite3 --library /data/skill_library_evidence.sqlite3 \
+  --output /data/skill_library_evidence_report/validation.json
+
+python -m src1 --config src1/config.local_all.toml evaluate-pmtskill \
+  --adapter-paths /data/your_adapter_run \
+  --skill-database /data/skill_library_evidence.sqlite3 \
+  --combinations 2 --seed 123 --max-steps 25
+```
+
+审计要求静态数据库、已合并 WAL，只检查结构、检索、路由及假客户端提示，不测 SR。
+在线仅注入当前及后两步，默认最多 1200 字符；当前位置是软提示而非动作成功真值。
+输入参数从当前 goal 绑定，不回放原文本、答案、坐标或 UI 索引。单对象/批量任务
+根据 goal 输入形状区分，操作意图不能互相替代；相同 goal 的不同 evaluator 别名
+可能选中另一同语义路线，审计中明确列出，不通过 task ID/真值人为保证命中。
+请用未参与采集的参数/seed 测学生 SR，并同时报告裸模型与适配技能的配对差异。
 
 ## 8. 更新模型能力画像
 

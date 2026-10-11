@@ -119,15 +119,17 @@ class SkillOptimizationBackend:
             updates[model_id] = len(primitives)
         return updates
 
-    def run_cycle(self) -> BackendCycleResult:
+    def run_cycle(self, *, sync_raw_skills: bool = True) -> BackendCycleResult:
         """同步 SKVM 上游、挖掘候选、晋升/回滚并输出审计报告。"""
 
-        import_summary = import_skvm_skills(
-            self.config.paths.skvm_skills_root, self.store
+        import_summary = (
+            import_skvm_skills(self.config.paths.skvm_skills_root, self.store)
+            if sync_raw_skills
+            else ImportSummary(root=str(self.config.paths.skvm_skills_root), namespace="skvm")
         )
         compile_summary = None
         compiler_model_id = self.config.maintenance.raw_skill_compiler_model_id
-        if compiler_model_id:
+        if compiler_model_id and self.config.maintenance.admission_policy != "success_once":
             client = OpenAICompatibleVLClient(self.config.model(compiler_model_id))
             compiler = LLMRawSkillCompiler(client, load_primitives())
             compile_summary = compile_imported_raw_skills(

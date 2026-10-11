@@ -98,6 +98,11 @@ minimum_capability = 0.05
 maximum_candidates_per_position = 32
 
 [maintenance]
+# 覆盖优先实验可设 admission_policy="success_once", build_hierarchy=true。
+# 一条有效成功示范即可 active；不代表学生模型配对标定，不影响默认严格准入。
+admission_policy = "calibrated"
+build_hierarchy = false
+hierarchy_block_size = 3
 # 同一序列的证据会跨多个 maintain 周期累计；不是单轮必须达到 5 条。
 # excellent 轨迹提供成功 support，failed 仅提供失败风险；成功但路径质量不足的
 # candidate 和基础设施异常/空动作 rejected 都不参与挖掘。

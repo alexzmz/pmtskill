@@ -202,8 +202,15 @@ class RoutedVLWrapper:
     def _route_step(self) -> RouteStep:
         if self.plan is None or not self.plan.steps:
             raise RuntimeError("RoutedVLWrapper 尚未设置执行计划")
-        index = min(self.action_call_index, len(self.plan.steps) - 1)
-        return self.plan.steps[index]
+        offset = 0
+        for step in self.plan.steps:
+            skill = self.skills.get(step.skill_id or "")
+            # 一个层级子流程包含多个真实 GUI 动作，不应每调用一次就跳过整个子流程。
+            budget = max(1, int(skill.metadata.get("operation_count", 1))) if skill and skill.metadata.get("hierarchy_role") else 1
+            offset += budget
+            if self.action_call_index < offset:
+                return step
+        return self.plan.steps[-1]
 
     def predict_mm(
         self, text_prompt: str, images: list[Any]

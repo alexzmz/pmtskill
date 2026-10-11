@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Protocol
 
 from ..core.config import MaintenanceConfig
@@ -68,6 +68,7 @@ class MaintenanceReport:
     promoted: list[str]
     rolled_back: list[str]
     model_pair_updates: list[dict[str, Any]]
+    hierarchy: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -77,6 +78,7 @@ class MaintenanceReport:
             "promoted": self.promoted,
             "rolled_back": self.rolled_back,
             "model_pair_updates": self.model_pair_updates,
+            "hierarchy": self.hierarchy,
         }
 
 
@@ -553,9 +555,16 @@ class SkillMaintainer:
         traces = self.store.list_traces(processed=False)
         # 对全库重跑幂等 extractor，允许用户调整子序列长度后补出历史证据；聚合阶段
         # 会按当前配置过滤旧窗口，processed 仍只表示本轮新消费数量。
-        created, subsequences_found = self.discover_candidates(
-            self.store.list_traces()
-        )
+        hierarchy: dict[str, Any] = {}
+        if self.config.build_hierarchy:
+            from .hierarchy import build_hierarchical_library
+
+            created, hierarchy = build_hierarchical_library(self.store, self.config)
+            subsequences_found = int(hierarchy["polished_skills"])
+        else:
+            if self.config.admission_policy == "success_once":
+                raise ValueError("success_once 需要 build_hierarchy=true 或 --hierarchical")
+            created, subsequences_found = self.discover_candidates(self.store.list_traces())
         model_pair_updates = self.reconcile_calibrations()
         promoted, rolled_back = self.promote_and_rollback()
         self.store.mark_traces_processed([trace.trace_id for trace in traces])
@@ -566,6 +575,7 @@ class SkillMaintainer:
             promoted=promoted,
             rolled_back=rolled_back,
             model_pair_updates=model_pair_updates,
+            hierarchy=hierarchy,
         )
         self.store.log_maintenance_event("maintenance_cycle", None, report.to_dict())
         return report

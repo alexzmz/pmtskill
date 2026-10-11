@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, Sequence
 
-from ..core.models import PrimitiveSpec, SkillRecord, SkillTopology
+from ..core.models import PrimitiveSpec, SkillRecord, SkillStatus, SkillTopology
 from ..inference.vlm import VLModelClient
 
 
@@ -24,6 +24,7 @@ class TaskDecomposition:
     extra_primitives: tuple[str, ...] = ()
     reasoning: str = ""
     planner_id: str = "unknown"
+    task_skill_id: str | None = None
 
 
 class SkillTopologyPlanner(Protocol):
@@ -197,7 +198,76 @@ class PlannerPipeline:
         self.generator = generator
 
     def plan(
-        self, goal: str, raw_skills: Sequence[SkillRecord]
+        self, goal: str, raw_skills: Sequence[SkillRecord],
+        polished_skills: Sequence[SkillRecord] = (), *, include_candidates: bool = False,
     ) -> tuple[TaskDecomposition, SkillTopology]:
+        skill = retrieve_task_skill(goal, polished_skills, include_candidates=include_candidates)
+        if skill:
+            return TaskDecomposition(
+                goal=goal, raw_skill_ids=(), task_skill_id=skill.skill_id,
+                reasoning="从成功示范检索分层任务技能；使用当前任务参数。",
+                planner_id="hierarchical-task-retrieval-v1",
+            ), skill.topology
         decomposition = self.planner.decompose(goal, raw_skills)
         return decomposition, self.generator.expand(decomposition, raw_skills)
+
+
+def retrieve_task_skill(goal: str, skills: Sequence[SkillRecord], *, include_candidates: bool = False) -> SkillRecord | None:
+    """只按用户目标检索，不读取评测 task ID、真值或当前 episode 的答案。"""
+
+    def terms(text: str) -> set[str]:
+        # 食谱等目标在首行给出操作/应用，其后是实例数据表，不能让表内容淹没检索。
+        text = text.splitlines()[0] if text.splitlines() else text
+        # 参数化模板已将换行压成空格；表头仍可识别，表中数据不用于检索。
+        text = re.split(r"\s+\w+\|\w+\|", text, maxsplit=1)[0]
+        payload = re.search(r"\b(?:message|text|subject|body)\s*:", text, re.I)
+        if payload:
+            app_suffix = re.search(r"\s+in\s+(.+)$", text[payload.end():], re.I)
+            text = text[:payload.end()] + (" in " + app_suffix.group(1) if app_suffix else "")
+        text = re.sub(r"['\"]([^'\"\n]+)['\"]", " ", text)
+        text = re.sub(r"<[^>]+>|\b\d+(?:[-:/.,h]\d+)*\b", " ", text)
+        return _terms(text)
+
+    query = terms(goal)
+    ranked: list[tuple[float, int, str, SkillRecord]] = []
+    for skill in skills:
+        if skill.kind != "polished" or skill.metadata.get("hierarchy_role") != "task":
+            continue
+        if skill.status != SkillStatus.ACTIVE and not (include_candidates and skill.status == SkillStatus.CANDIDATE):
+            continue
+        best = 0.0
+        for template in skill.metadata.get("goal_templates", ()):
+            canonical = terms(str(template))
+            overlap = len(query & canonical)
+            if overlap >= min(3, len(canonical)) and canonical:
+                best = max(best, 2 * overlap / max(1, len(query) + len(canonical)))
+        if best >= 0.55:
+            ranked.append((-best, int(skill.metadata.get("operation_count", 1)), skill.skill_id, skill))
+    ranked.sort(key=lambda item: item[:3])
+    return ranked[0][3] if ranked else None
+
+
+def scope_hierarchical_skills(skills: Sequence[SkillRecord], task_skill_id: str | None) -> list[SkillRecord]:
+    """相同原语但语义不同的任务组件不可交叉注入（例如 Save 与 Delete）。"""
+
+    selected = next((skill for skill in skills if skill.skill_id == task_skill_id), None)
+    if not selected:
+        # 未检索到可信任务：用原有路由，不把别的任务示范当作通用技能。
+        return [skill for skill in skills if not skill.metadata.get("hierarchy_role")]
+    by_id = {skill.skill_id: skill for skill in skills}
+    positions: dict[str, set[int]] = {selected.skill_id: {0}}
+    pending = [(selected, 0)]
+    while pending:
+        current, base = pending.pop()
+        lengths = current.metadata.get("operation_primitive_lengths", ())
+        for child in current.metadata.get("components", ()):
+            child_id = child["skill_id"]
+            if child_id not in by_id:
+                continue
+            offset = base + sum(lengths[:child["start"]])
+            if offset not in positions.setdefault(child_id, set()):
+                positions[child_id].add(offset)
+                pending.append((by_id[child_id], offset))
+    return [replace(skill, metadata={**skill.metadata, "routing_positions": sorted(positions[skill.skill_id])})
+            if skill.skill_id in positions else skill
+            for skill in skills if skill.skill_id in positions or not skill.metadata.get("hierarchy_role")]

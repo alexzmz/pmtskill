@@ -86,6 +86,9 @@ class DynamicProgrammingRouter:
         for skill in skills:
             if skill.skill_id in banned or skill.kind != "polished" or skill.status not in allowed_status:
                 continue
+            positions = skill.metadata.get("routing_positions")
+            if positions is not None and position not in positions:
+                continue
             covered = skill.topology.primitive_sequence()
             if not covered:
                 continue

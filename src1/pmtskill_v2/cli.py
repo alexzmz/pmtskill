@@ -34,6 +34,7 @@ from .online.planner import (
     KeywordSkillPlanner,
     PlannerPipeline,
     PrimitiveTopologyGenerator,
+    scope_hierarchical_skills,
 )
 from .online.router import DynamicProgrammingRouter
 from .skills.importer import (
@@ -659,12 +660,42 @@ def _resume_evaluation_tasks(run_dir: Path) -> list[str] | None:
 
 
 def command_maintain(args: argparse.Namespace) -> int:
-    config, store = _open(args.config)
+    config = load_config(args.config)
+    if args.source_database:
+        config.paths.skill_library_db = Path(args.source_database).expanduser().resolve()
+        if not config.paths.database.is_file():
+            raise FileNotFoundError(f"技能库不存在: {config.paths.database}")
+    if args.output_database:
+        if args.watch:
+            raise ValueError("--output-database 为一次性导出，不能与 --watch 同用")
+        from .skills.hierarchy import copy_skill_database
+
+        output = Path(args.output_database).expanduser().resolve()
+        copy_skill_database(config.paths.database, output)
+        config.paths.skill_library_db = output
+    if args.success_once:
+        config.maintenance.admission_policy = "success_once"
+        config.maintenance.build_hierarchy = True
+    if args.hierarchical:
+        config.maintenance.build_hierarchy = True
+    config.ensure_runtime_dirs()
+    store = SkillStore(config.paths.database)
+    store.initialize()
+    store.sync_primitive_catalog(load_primitives())
     backend = SkillOptimizationBackend(config, store)
     cycles = 0
     while True:
-        result = backend.run_cycle()
-        _print(result.to_dict())
+        result = backend.run_cycle(sync_raw_skills=not args.skip_import)
+        payload = result.to_dict()
+        payload["skill_database"] = str(store.database.resolve())
+        if result.maintenance_report.hierarchy:
+            from .skills.hierarchy import export_hierarchical_library
+
+            directory = (Path(args.output_dir).expanduser().resolve() if args.output_dir
+                         else config.paths.state_dir / "reports" / "hierarchical_library")
+            export_hierarchical_library(store, directory, result.maintenance_report.hierarchy)
+            payload["library_report_dir"] = str(directory)
+        _print(payload)
         cycles += 1
         if not args.watch or (args.max_cycles and cycles >= args.max_cycles):
             break
@@ -995,11 +1026,12 @@ def command_profile(args: argparse.Namespace) -> int:
 def command_plan(args: argparse.Namespace) -> int:
     config, store = _open(args.config)
     raw = relevant_raw_skills(store.list_skills(kind="raw"))
+    polished = store.list_skills(kind="polished")
     decomposition, topology = PlannerPipeline(
         KeywordSkillPlanner(), PrimitiveTopologyGenerator()
-    ).plan(args.goal, raw)
+    ).plan(args.goal, raw, polished, include_candidates=args.include_candidates)
     profiles = store.list_model_profiles() or list(config.models)
-    polished = store.list_skills(kind="polished")
+    polished = scope_hierarchical_skills(polished, decomposition.task_skill_id)
     plan = DynamicProgrammingRouter(config.routing, store).route(
         args.goal,
         topology,
@@ -1012,6 +1044,7 @@ def command_plan(args: argparse.Namespace) -> int:
         {
             "decomposition": {
                 "raw_skill_ids": decomposition.raw_skill_ids,
+                "task_skill_id": decomposition.task_skill_id,
                 "extra_primitives": decomposition.extra_primitives,
                 "reasoning": decomposition.reasoning,
             },
@@ -1975,6 +2008,12 @@ def build_parser() -> argparse.ArgumentParser:
     maintain.add_argument(
         "--max-cycles", type=int, default=0, help="watch 最多循环次数；0 表示持续运行"
     )
+    maintain.add_argument("--source-database", help="读取现有 SQLite，覆盖配置中的数据库路径")
+    maintain.add_argument("--output-database", help="先 backup 到新的 SQLite 再维护；保留原库，拒绝覆盖")
+    maintain.add_argument("--output-dir", help="分层技能清单、层级图和任务覆盖报告目录")
+    maintain.add_argument("--skip-import", action="store_true", help="仅使用现有 raw，不同步上游 SKILL.md")
+    maintain.add_argument("--hierarchical", action="store_true", help="从成功示范生成 L1 操作 / L2 子流程 / L3 任务")
+    maintain.add_argument("--success-once", action="store_true", help="覆盖优先：一个有效成功 episode 即准入 active 分层库；不是学生模型标定")
     maintain.set_defaults(handler=command_maintain)
 
     compile_skills = subparsers.add_parser(

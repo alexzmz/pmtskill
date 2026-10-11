@@ -36,6 +36,7 @@ from ..online.planner import (
     LLMSkillPlanner,
     PlannerPipeline,
     PrimitiveTopologyGenerator,
+    scope_hierarchical_skills,
 )
 from ..online.router import DynamicProgrammingRouter
 from ..skills.importer import relevant_raw_skills
@@ -806,12 +807,15 @@ class AndroidWorldOnlineEvaluator:
 
             def step(self, goal: str):
                 if self.current_goal != goal:
-                    decomposition, topology = planner_pipeline.plan(goal, raw_skills)
+                    decomposition, topology = planner_pipeline.plan(
+                        goal, raw_skills, polished,
+                        include_candidates=include_candidate_skills,
+                    )
                     self.latest_plan = router.route(
                         goal,
                         topology,
                         profiles,
-                        polished,
+                        scope_hierarchical_skills(polished, decomposition.task_skill_id),
                         planner_id=decomposition.planner_id,
                         include_candidates=include_candidate_skills,
                     )
@@ -896,6 +900,14 @@ class AndroidWorldOnlineEvaluator:
                     profile.model_id: dict(profile.metadata) for profile in profiles
                 },
                 "skill_database": str(self.store.database.resolve()),
+                "skill_admission_policies": sorted({
+                    str(skill.metadata.get("admission_policy", "calibrated"))
+                    for skill in polished
+                }),
+                "teacher_success_admitted_skills": sum(
+                    skill.metadata.get("admission_policy") == "success_once"
+                    for skill in polished
+                ),
                 "record_traces": record_traces,
                 "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,

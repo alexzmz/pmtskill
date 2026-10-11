@@ -118,6 +118,10 @@ class MaintenanceConfig:
     # 配置后 backend 会逐批让云模型把 SKVM raw skill 编译成 Android 原语拓扑。
     raw_skill_compiler_model_id: str | None = None
     raw_skill_compile_batch_size: int = 8
+    # success_once 是覆盖优先实验库，不代表任何学生模型已经通过配对标定。
+    admission_policy: str = "calibrated"
+    build_hierarchy: bool = False
+    hierarchy_block_size: int = 3
 
 
 @dataclasses.dataclass(slots=True)
@@ -340,6 +344,10 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         raise ValueError("training_evaluation.max_new_tokens 必须是正整数")
     routing = RoutingConfig(**_section(raw, "routing"))
     maintenance = MaintenanceConfig(**_section(raw, "maintenance"))
+    if maintenance.admission_policy not in {"calibrated", "success_once"}:
+        raise ValueError("maintenance.admission_policy 必须为 calibrated 或 success_once")
+    if maintenance.hierarchy_block_size < 2:
+        raise ValueError("maintenance.hierarchy_block_size 必须 >= 2")
     if maintenance.minimum_support <= 0:
         raise ValueError("maintenance.minimum_support 必须是正整数")
     if maintenance.minimum_candidate_trials <= 0:

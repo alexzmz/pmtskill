@@ -1,6 +1,7 @@
 *.zip
 *.tar
 *.gz
+*deprecated*
 
 # submodule
 Android/

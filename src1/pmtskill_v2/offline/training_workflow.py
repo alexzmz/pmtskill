@@ -593,7 +593,7 @@ class TrainingEvaluationRecorder:
             "average_steps": summary.get("average_steps", 0.0),
             "summary_json": str(artifacts.summary_json),
             "report_markdown": str(artifacts.report_markdown),
-            "traces_jsonl": str(artifacts.traces_jsonl),
+            "traces_jsonl": str(artifacts.traces_jsonl) if artifacts.traces_jsonl else None,
             "artifact_dir": str(artifacts.output_dir),
             # 在训练总报告中保留每阶段七维能力，避免只能逐目录翻 report.md。
             "capability_distribution": summary.get(

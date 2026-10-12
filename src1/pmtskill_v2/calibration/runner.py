@@ -94,6 +94,7 @@ class AndroidWorldSkillConditionRunner:
             family=family,
             max_steps=max_steps,
             output_dir=output_dir,
+            resume=True,
         )
         return SkillConditionResult(
             condition="no-skill",
@@ -124,6 +125,7 @@ class AndroidWorldSkillConditionRunner:
             family=family,
             max_steps=max_steps,
             output_dir=output_dir,
+            resume=True,
         )
         return SkillConditionResult(
             condition="forced-skill",

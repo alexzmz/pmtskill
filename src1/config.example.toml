@@ -48,6 +48,15 @@ permission_controller_settle_seconds = 0.5
 recovery_timeout_seconds = 180.0
 recovery_poll_seconds = 2.0
 
+[evaluation]
+# false 不写 traces.jsonl/完整 episode pickle/SQLite 轨迹，改存轻量结果 JSON。
+# SR、能力分布、路由统计和实例级 resume 仍保留。CLI --no-store-trajectories 可覆盖。
+store_trajectories = true
+# 独立 evaluate-standalone / evaluate-simple-skills / evaluate-pmtskill 的实例级续跑。
+# 开启后必须通过 --output-dir 固定到原运行目录；--resume / --no-resume 可覆盖。
+# 真正的任务失败也算已完成；异常/基础设施失败下次重试，不偏置最终 SR。
+resume = false
+
 [training_evaluation]
 deploy_port = 8002
 deploy_host = "127.0.0.1"

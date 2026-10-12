@@ -162,13 +162,19 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
     # These imports must happen only after the V-Droid root is first on sys.path.
     import ray
-    from android_world import checkpointer as checkpointer_lib
     from android_world import registry, suite_utils
     from android_world.agents import vdroid
     from android_world.env import env_launcher
 
-    from src1.baseline_vdroid.reporting import write_vdroid_report
+    from src1.baseline_vdroid.reporting import compact_vdroid_result_for_storage, write_vdroid_report
     from src1.pmtskill_v2.core.io import write_json_atomic
+    from src1.pmtskill_v2.evaluation.resume import EvaluationProgress, vdroid_resume_specification
+
+    progress = EvaluationProgress(
+        output_dir, vdroid_resume_specification(request), resume=bool(request.get("resume", False)),
+        store_trajectories=bool(request.get("store_trajectories", True)),
+        result_compactor=lambda episode: compact_vdroid_result_for_storage(episode, model_id=str(model["model_id"])),
+    )
 
     _instrument_vdroid_agent(
         vdroid.VDroidAgent, max_steps=int(request["max_steps"])
@@ -220,16 +226,17 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
         checkpoint_dir = output_dir / "checkpoints"
         checkpointer = _CompactCheckpointer(
-            checkpointer_lib.IncrementalCheckpointer(str(checkpoint_dir))
+            progress
         )
-        suite_utils.run(
-            suite,
-            agent,
-            checkpointer=checkpointer,
-            demo_mode=False,
-            save_name=output_dir.name,
-        )
-        episodes = checkpointer.load()
+        with progress.watch(suite_utils, suite):
+            suite_utils.run(
+                suite,
+                agent,
+                checkpointer=checkpointer,
+                demo_mode=False,
+                save_name=output_dir.name,
+            )
+        episodes = progress.episodes()
         metadata = {
             "evaluation_mode": "vdroid",
             "report_title": "V-Droid AndroidWorld Baseline",
@@ -253,18 +260,20 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             "dynamic_model_routing": False,
             "adapter_switching": False,
             "episode_storage": "compact_vdroid_without_screenshots_or_tree",
+            "resume": progress.metadata(),
         }
         artifacts = write_vdroid_report(
             output_dir,
             episodes,
             metadata=metadata,
+            store_trajectories=bool(request.get("store_trajectories", True)),
         )
         result = {
             "evaluation_mode": "vdroid",
             "summary": artifacts.summary,
             "summary_json": str(artifacts.summary_json),
             "report_markdown": str(artifacts.report_markdown),
-            "traces_jsonl": str(artifacts.traces_jsonl),
+            "traces_jsonl": str(artifacts.traces_jsonl) if artifacts.traces_jsonl else None,
             "checkpoint_dir": str(checkpoint_dir),
             "skill_database": None,
             "adapters": [],

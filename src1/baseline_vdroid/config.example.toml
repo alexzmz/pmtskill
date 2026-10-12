@@ -40,6 +40,9 @@ api_key_env = "OPENAI_API_KEY"
 # api_version = "2024-10-21"
 
 [evaluation]
+store_trajectories = true
+# Resume the same explicit --output-dir; complete failures are also retained.
+resume = false
 family = "android_world"
 # Empty means all tasks. Use exactly the same explicit list as evaluate-pmtskill
 # for the cleanest paired comparison.

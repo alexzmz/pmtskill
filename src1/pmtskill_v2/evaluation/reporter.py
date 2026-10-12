@@ -22,6 +22,7 @@ from .capabilities import (
 
 
 LOGGER = logging.getLogger(__name__)
+STORED_SUMMARY_KEY = "_evaluation_storage_summary"
 
 
 @dataclass(slots=True)
@@ -29,7 +30,7 @@ class EvaluationArtifacts:
     output_dir: Path
     summary_json: Path
     report_markdown: Path
-    traces_jsonl: Path
+    traces_jsonl: Path | None
     summary: dict[str, Any]
     # 标定流程需要逐实例配对；普通评测调用者可以忽略该字段。
     episodes: tuple[dict[str, Any], ...] = ()
@@ -157,6 +158,10 @@ def summarize_episodes(
             finite_float_value(_episode_field(episode, "run_time", default=0.0))
         )
         if not successful:
+            stored_summary = episode.get(STORED_SUMMARY_KEY)
+            if isinstance(stored_summary, Mapping):
+                failure_reasons.update(stored_summary.get("failure_reasons", {}))
+                continue
             raw_episode_data = _episode_field(episode, "episode_data", default={})
             episode_data = normalize_episode_data(raw_episode_data)
             outputs = episode_step_values(episode_data.get("action_output"))
@@ -184,6 +189,12 @@ def summarize_episodes(
     skill_usage: collections.Counter[str] = collections.Counter()
     switch_counts: list[int] = []
     for trace in trace_list:
+        stored_summary = trace.metadata.get(STORED_SUMMARY_KEY)
+        if isinstance(stored_summary, Mapping):
+            model_usage.update(stored_summary.get("model_usage", {}))
+            skill_usage.update(stored_summary.get("skill_usage", {}))
+            switch_counts.extend(stored_summary.get("switch_counts", []))
+            continue
         previous: str | None = None
         switches = 0
         for event in trace.events:
@@ -221,6 +232,44 @@ def summarize_episodes(
     }
 
 
+def compact_result_for_storage(
+    episode: dict[str, Any], traces: list[ExecutionTrace],
+) -> dict[str, Any]:
+    """保留结果与聚合统计，不保存动作、prompt、响应、截图或完整轨迹。"""
+
+    summary = summarize_episodes([episode], traces)
+    stored = episode.get(STORED_SUMMARY_KEY)
+    switch_counts = (
+        list(stored.get("switch_counts", [])) if isinstance(stored, Mapping)
+        else [sum(first.model_id != second.model_id
+                  for first, second in zip(trace.events, trace.events[1:])) for trace in traces]
+    )
+    result = {key: episode.get(key) for key in (
+        "goal", "task_template", "task_name", "instance_id", "task_seed", "agent_name",
+        "is_successful", "episode_length", "run_time", "finish_dtime", "exception_info",
+        "_evaluation_resume", "_evaluation_attempt_id",
+    ) if key in episode}
+    aux = episode.get("aux_data")
+    result["aux_data"] = {key: value for key, value in aux.items() if key in {
+        "infrastructure_failure_skipped", "infrastructure_recovery_attempts",
+        "permission_controller_restarts", "permission_controller_dialogs_dismissed",
+        "permission_controller_model_delegations", "collector_termination_reason", "collector_step_limit",
+    }} if isinstance(aux, Mapping) else None
+    result["episode_data"] = {}
+    result["_evaluation_episode_data_valid"] = episode.get(
+        "_evaluation_episode_data_valid", episode_data_is_usable(episode.get("episode_data")),
+    )
+    result[STORED_SUMMARY_KEY] = {
+        "model_usage": summary["model_usage"], "skill_usage": summary["skill_usage"],
+        "switch_counts": switch_counts, "failure_reasons": summary["failure_reasons"],
+    }
+    # 异常 reward/长度常为 NaN；轻量 JSON 使用 null，恢复时仍视为不可复用。
+    for key, value in result.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            result[key] = None
+    return result
+
+
 def _markdown(summary: dict[str, Any]) -> str:
     metadata = summary.get("metadata", {})
     lines = [
@@ -250,8 +299,17 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"- 组合数 / seed：`{metadata.get('n_task_combinations', 1)}` / "
         f"`{metadata.get('seed', 42)}`",
         f"- 每个 episode 步数上限：`{metadata.get('max_steps', 30)}`",
+        f"- 完整轨迹存储：`{metadata.get('store_trajectories', True)}`",
     ]
     skipped_tasks = summary.get("infrastructure_skipped_tasks", [])
+    resume = metadata.get("resume")
+    if isinstance(resume, Mapping):
+        lines.extend((
+            f"- 断点续跑：`{resume.get('enabled', False)}`；复用已完成实例 "
+            f"`{resume.get('episodes_skipped', 0)}`，本次执行 "
+            f"`{resume.get('episodes_executed', 0)}`",
+            f"- 实例进度：`{resume.get('progress_json')}`",
+        ))
     if skipped_tasks:
         lines.extend(
             (
@@ -360,16 +418,17 @@ def write_evaluation_report(
     traces: list[ExecutionTrace],
     *,
     metadata: dict[str, Any] | None = None,
+    store_trajectories: bool = True,
 ) -> EvaluationArtifacts:
     """同时写机器可读 JSON/JSONL 与人工可读 Markdown。"""
 
     target = Path(output_dir).resolve()
     target.mkdir(parents=True, exist_ok=True)
     summary = summarize_episodes(episodes, traces)
-    summary["metadata"] = metadata or {}
+    summary["metadata"] = {**(metadata or {}), "store_trajectories": store_trajectories}
     summary_path = target / "summary.json"
     markdown_path = target / "report.md"
-    traces_path = target / "traces.jsonl"
+    traces_path = target / "traces.jsonl" if store_trajectories else None
     plot_title = str(
         (metadata or {}).get("model_id")
         or (metadata or {}).get("served_model")
@@ -385,7 +444,8 @@ def write_evaluation_report(
         LOGGER.warning("七维能力图生成失败: %s", exc, exc_info=True)
         summary["capability_plot_error"] = str(exc)
     write_json_atomic(summary_path, summary)
-    write_jsonl(traces_path, (trace.to_dict() for trace in traces))
+    if traces_path is not None:
+        write_jsonl(traces_path, (trace.to_dict() for trace in traces))
     markdown_path.write_text(_markdown(summary), encoding="utf-8")
     return EvaluationArtifacts(
         target,

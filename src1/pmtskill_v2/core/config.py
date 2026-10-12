@@ -171,6 +171,14 @@ class AndroidWorldConfig:
 
 
 @dataclasses.dataclass(slots=True)
+class EvaluationConfig:
+    """独立 evaluate 命令的恢复策略；不会隐式改变训练期评测。"""
+
+    resume: bool = False
+    store_trajectories: bool = True
+
+
+@dataclasses.dataclass(slots=True)
 class ProjectConfig:
     """整套离线/在线系统配置。"""
 
@@ -182,6 +190,7 @@ class ProjectConfig:
     maintenance: MaintenanceConfig
     android_world: AndroidWorldConfig
     models: tuple[ModelProfile, ...]
+    evaluation: EvaluationConfig = dataclasses.field(default_factory=EvaluationConfig)
 
     def model(self, model_id: str) -> ModelProfile:
         for profile in self.models:
@@ -423,6 +432,13 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
     models = tuple(ModelProfile.from_dict(item) for item in model_items)
     if not models:
         raise ValueError("至少需要配置一个 [[models]]")
+    evaluation_raw = _section(raw, "evaluation")
+    resume = evaluation_raw.get("resume", False)
+    if not isinstance(resume, bool):
+        raise ValueError("evaluation.resume 必须是布尔值")
+    store_trajectories = evaluation_raw.get("store_trajectories", True)
+    if not isinstance(store_trajectories, bool):
+        raise ValueError("evaluation.store_trajectories 必须是布尔值")
 
     return ProjectConfig(
         config_path=config_path,
@@ -433,4 +449,5 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         maintenance=maintenance,
         android_world=android_world,
         models=models,
+        evaluation=EvaluationConfig(resume=resume, store_trajectories=store_trajectories),
     )

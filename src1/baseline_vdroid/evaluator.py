@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ..pmtskill_v2.core.io import write_json_atomic
+from ..pmtskill_v2.evaluation.resume import (
+    validate_evaluation_directory,
+    validate_resume_output,
+    vdroid_resume_specification,
+)
 from .config import VDroidBaselineConfig
 
 
@@ -43,6 +48,8 @@ class VDroidRunOptions:
     store_screenshots: bool = False
     emulator_setup: bool = False
     freeze_datetime: bool = True
+    resume: bool = False
+    store_trajectories: bool = True
 
     @classmethod
     def from_config(cls, config: VDroidBaselineConfig) -> "VDroidRunOptions":
@@ -69,9 +76,12 @@ class VDroidRunOptions:
             store_screenshots=config.evaluation.store_screenshots,
             emulator_setup=config.device.emulator_setup,
             freeze_datetime=config.device.freeze_datetime,
+            resume=config.evaluation.resume,
+            store_trajectories=config.evaluation.store_trajectories,
         )
 
     def validate(self) -> None:
+        validate_resume_output(self.resume, self.output_dir)
         if self.task_count is not None and self.task_count <= 0:
             raise ValueError("--task-count must be positive")
         if self.combinations <= 0:
@@ -126,6 +136,8 @@ class VDroidBaselineEvaluator:
             "repo_root": str(self.config.paths.repo_root),
             "v_droid_root": str(self.config.paths.v_droid_root),
             "output_dir": str(target),
+            "resume": o.resume,
+            "store_trajectories": o.store_trajectories,
             "tasks": list(o.tasks),
             "task_count": o.task_count,
             "combinations": o.combinations,
@@ -159,7 +171,7 @@ class VDroidBaselineEvaluator:
                 "verify_api_level": d.verify_api_level,
                 "wait_after_action_seconds": d.wait_after_action_seconds,
             },
-            "store_screenshots": o.store_screenshots,
+            "store_screenshots": o.store_screenshots and o.store_trajectories,
             "isolation": {
                 "skill_store": False,
                 "skill_adaptation": False,
@@ -192,9 +204,13 @@ class VDroidBaselineEvaluator:
 
     def run(self) -> dict[str, Any]:
         target = self.target_dir()
+        request = self.request(target)
+        validate_evaluation_directory(
+            target, vdroid_resume_specification(request), resume=self.options.resume,
+        )
         target.mkdir(parents=True, exist_ok=True)
         request_path = target / "resolved_request.json"
-        write_json_atomic(request_path, self.request(target))
+        write_json_atomic(request_path, request)
         env = os.environ.copy()
         if self.options.cuda_visible_devices is not None:
             env["CUDA_VISIBLE_DEVICES"] = self.options.cuda_visible_devices

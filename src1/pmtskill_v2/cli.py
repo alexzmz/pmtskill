@@ -1256,7 +1256,9 @@ def _evaluation_result(
     }
 
 
-def _dry_evaluation_result(mode: str, deployment, bindings, args) -> int:
+def _dry_evaluation_result(
+    mode: str, deployment, bindings, args, *, resume: bool, store_trajectories: bool,
+) -> int:
     _print(
         {
             "dry_run": True,
@@ -1278,6 +1280,8 @@ def _dry_evaluation_result(mode: str, deployment, bindings, args) -> int:
             "family": args.family,
             "max_steps": args.max_steps,
             "output_dir": args.output_dir,
+            "resume": resume,
+            "store_trajectories": store_trajectories,
         }
     )
     return 0
@@ -1323,6 +1327,8 @@ def command_evaluate_vdroid(args: argparse.Namespace) -> int:
         store_screenshots=args.store_screenshots,
         emulator_setup=args.emulator_setup,
         freeze_datetime=args.freeze_datetime,
+        resume=args.resume,
+        store_trajectories=args.store_trajectories,
     )
     evaluator = VDroidBaselineEvaluator(config, options)
     if args.dry_run:
@@ -1339,6 +1345,8 @@ def command_evaluate_standalone(args: argparse.Namespace) -> int:
     from .evaluation.android_world import AndroidWorldStandaloneEvaluator
 
     config = load_config(args.config)
+    resume = _evaluation_resume(config, args)
+    store_trajectories = _evaluation_store_trajectories(config, args)
     config.ensure_runtime_dirs()
     deployment, bindings = _adapter_deployment(
         config,
@@ -1348,7 +1356,8 @@ def command_evaluate_standalone(args: argparse.Namespace) -> int:
         [args.model_id] if args.model_id else None,
     )
     if args.dry_run:
-        return _dry_evaluation_result("standalone", deployment, bindings, args)
+        return _dry_evaluation_result("standalone", deployment, bindings, args,
+                                      resume=resume, store_trajectories=store_trajectories)
     tasks = _evaluation_tasks(config, args)
     with deployment.activate_adapters() as profiles:
         artifacts = AndroidWorldStandaloneEvaluator(config).run(
@@ -1359,6 +1368,8 @@ def command_evaluate_standalone(args: argparse.Namespace) -> int:
             family=args.family,
             max_steps=args.max_steps,
             output_dir=args.output_dir,
+            resume=resume,
+            store_trajectories=store_trajectories,
         )
     _print(
         _evaluation_result(
@@ -1377,6 +1388,8 @@ def command_evaluate_simple_skills(args: argparse.Namespace) -> int:
     from .evaluation.android_world import AndroidWorldSimpleSkillEvaluator
 
     config = load_config(args.config)
+    resume = _evaluation_resume(config, args)
+    store_trajectories = _evaluation_store_trajectories(config, args)
     config.ensure_runtime_dirs()
     store = _open_evaluation_skill_store(config, args.skill_database)
     deployment, bindings = _adapter_deployment(
@@ -1387,7 +1400,8 @@ def command_evaluate_simple_skills(args: argparse.Namespace) -> int:
         [args.model_id] if args.model_id else None,
     )
     if args.dry_run:
-        return _dry_evaluation_result("simple_skills", deployment, bindings, args)
+        return _dry_evaluation_result("simple_skills", deployment, bindings, args,
+                                      resume=resume, store_trajectories=store_trajectories)
     tasks = _evaluation_tasks(config, args)
     with deployment.activate_adapters() as profiles:
         artifacts = AndroidWorldSimpleSkillEvaluator(config, store).run(
@@ -1400,6 +1414,8 @@ def command_evaluate_simple_skills(args: argparse.Namespace) -> int:
             include_candidate_skills=args.include_candidates,
             output_dir=args.output_dir,
             record_traces=args.record_traces,
+            resume=resume,
+            store_trajectories=store_trajectories,
         )
     _print(
         _evaluation_result(
@@ -1418,6 +1434,8 @@ def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
     from .evaluation.android_world import AndroidWorldOnlineEvaluator
 
     config = load_config(args.config)
+    resume = _evaluation_resume(config, args)
+    store_trajectories = _evaluation_store_trajectories(config, args)
     config.ensure_runtime_dirs()
     store = _open_evaluation_skill_store(config, args.skill_database)
     route_overrides = {
@@ -1461,7 +1479,8 @@ def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
         args.adapter_model_ids,
     )
     if args.dry_run:
-        return _dry_evaluation_result("pmtskill_online", deployment, bindings, args)
+        return _dry_evaluation_result("pmtskill_online", deployment, bindings, args,
+                                      resume=resume, store_trajectories=store_trajectories)
     tasks = _evaluation_tasks(config, args)
     with deployment.activate_adapters() as profiles:
         artifacts = AndroidWorldOnlineEvaluator(config, store).run(
@@ -1475,6 +1494,8 @@ def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
             output_dir=args.output_dir,
             model_profiles=profiles,
             record_traces=args.record_traces,
+            resume=resume,
+            store_trajectories=store_trajectories,
         )
     _print(
         _evaluation_result(
@@ -1607,7 +1628,36 @@ def command_calibrate_skills(args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_common_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
+def _evaluation_resume(config: ProjectConfig, args: argparse.Namespace) -> bool:
+    from .evaluation.resume import validate_resume_output
+
+    enabled = config.evaluation.resume if args.resume is None else args.resume
+    validate_resume_output(enabled, args.output_dir)
+    return enabled
+
+
+def _add_evaluation_resume_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--resume", action=argparse.BooleanOptionalAction, default=None,
+        help="跳过同一 output-dir 已正常完成的任务实例；覆盖 [evaluation].resume，需保持实验配置相同",
+    )
+
+
+def _evaluation_store_trajectories(config: ProjectConfig, args: argparse.Namespace) -> bool:
+    return (config.evaluation.store_trajectories
+            if args.store_trajectories is None else args.store_trajectories)
+
+
+def _add_evaluation_storage_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--store-trajectories", action=argparse.BooleanOptionalAction, default=None,
+        help="保存完整评测轨迹（默认开启）；--no-store-trajectories 只保存报告和轻量续跑结果，并关闭 SQLite 轨迹回写",
+    )
+
+
+def _add_common_evaluation_arguments(
+    parser: argparse.ArgumentParser, *, include_resume: bool = True, include_storage: bool = True,
+) -> None:
     """三种评测共享的任务选择、部署资源和输出参数。"""
 
     parser.add_argument("--tasks", nargs="*", help="任务名；默认全部")
@@ -1626,6 +1676,10 @@ def _add_common_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
         help="每个 episode 的步数上限；默认 30",
     )
     parser.add_argument("--output-dir", help="summary/report/traces/checkpoints 输出目录")
+    if include_resume:
+        _add_evaluation_resume_argument(parser)
+    if include_storage:
+        _add_evaluation_storage_argument(parser)
     parser.add_argument("--base-model-path", help="覆盖 adapter_config 中记录的基座模型")
     parser.add_argument(
         "--require-training-state",
@@ -2108,6 +2162,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个 episode 的统一硬步数上限；应与 PORTS 相同",
     )
     vdroid.add_argument("--output-dir", help="本次 summary/report/traces/checkpoints 目录")
+    _add_evaluation_resume_argument(vdroid)
+    _add_evaluation_storage_argument(vdroid)
     vdroid.add_argument("--model-id", help="报告中的固定 V-Droid verifier ID")
     vdroid.add_argument("--base-model", help="固定 verifier 的 Llama 基座或本地路径")
     vdroid.add_argument(
@@ -2276,7 +2332,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="标定后立即更新模型专属状态与技能全局生命周期（默认启用）",
     )
-    _add_common_evaluation_arguments(calibrate)
+    _add_common_evaluation_arguments(calibrate, include_resume=False, include_storage=False)
     calibrate.set_defaults(handler=command_calibrate_skills)
     return parser
 

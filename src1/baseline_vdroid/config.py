@@ -69,6 +69,8 @@ class VDroidEvaluationConfig:
     max_steps: int = 30
     fixed_task_seed: bool = False
     store_screenshots: bool = False
+    resume: bool = False
+    store_trajectories: bool = True
 
 
 @dataclasses.dataclass(slots=True)
@@ -116,6 +118,10 @@ class VDroidBaselineConfig:
             raise ValueError("evaluation.combinations must be positive")
         if self.evaluation.max_steps <= 0:
             raise ValueError("evaluation.max_steps must be positive")
+        if not isinstance(self.evaluation.resume, bool):
+            raise ValueError("evaluation.resume must be a boolean")
+        if not isinstance(self.evaluation.store_trajectories, bool):
+            raise ValueError("evaluation.store_trajectories must be a boolean")
 
 
 def _section(raw: Mapping[str, Any], name: str) -> dict[str, Any]:
@@ -167,6 +173,8 @@ def load_vdroid_config(path: str | os.PathLike[str]) -> VDroidBaselineConfig:
         max_steps=int(evaluation_raw.get("max_steps", 30)),
         fixed_task_seed=bool(evaluation_raw.get("fixed_task_seed", False)),
         store_screenshots=bool(evaluation_raw.get("store_screenshots", False)),
+        resume=evaluation_raw.get("resume", False),
+        store_trajectories=evaluation_raw.get("store_trajectories", True),
     )
     config = VDroidBaselineConfig(
         config_path=config_path,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import dataclasses
 import logging
 import random
 import uuid
@@ -42,8 +43,18 @@ from ..online.router import DynamicProgrammingRouter
 from ..skills.importer import relevant_raw_skills
 from ..skills.store import SkillStore
 from .compaction import compact_m3a_step_result
+from .resume import (
+    EvaluationProgress,
+    fingerprint,
+    model_resume_identity,
+    routing_statistics_identity,
+    skills_resume_identity,
+    validate_resume_output,
+)
 from .reporter import (
+    STORED_SUMMARY_KEY,
     EvaluationArtifacts,
+    compact_result_for_storage,
     episode_data_is_usable,
     episode_step_values,
     finite_float_value,
@@ -58,6 +69,47 @@ from .recovery import (
 
 
 DEFAULT_EVALUATION_MAX_STEPS = 30
+
+
+def _evaluation_progress(
+    target: Path, config: ProjectConfig, *, mode: str, profiles: Sequence[ModelProfile],
+    tasks: Sequence[str] | None, combinations: int, seed: int, family: str,
+    max_steps: int, resume: bool, skills: Sequence[SkillRecord] = (),
+    store: SkillStore | None = None, extra: Mapping[str, Any] | None = None,
+    store_trajectories: bool = True,
+) -> EvaluationProgress:
+    specification = {
+        "mode": mode,
+        "models": [model_resume_identity(profile) for profile in profiles],
+        "tasks": list(tasks) if tasks else "all",
+        "combinations": combinations, "seed": seed, "family": family,
+        "max_steps": max_steps, "android_world": dataclasses.asdict(config.android_world),
+        "harness_root": str(config.paths.android_world_root.resolve()),
+        "skills": skills_resume_identity(skills),
+        "skill_database": str(store.database.resolve()) if store else None,
+        **dict(extra or {}),
+    }
+    return EvaluationProgress(
+        target, specification, resume=resume, store_trajectories=store_trajectories,
+        result_compactor=lambda episode: compact_result_for_storage(episode, episodes_to_traces([episode])),
+    )
+
+
+def _run_evaluation_suite(
+    suite_utils: Any, suite: Any, agent: Any, environment: Any,
+    config: ProjectConfig, progress: EvaluationProgress, *, max_steps: int,
+    continue_on_infrastructure_failure: bool = False,
+) -> list[dict[str, Any]]:
+    with recover_infrastructure_failures(
+        suite_utils, environment, config.android_world,
+        continue_on_infrastructure_failure=continue_on_infrastructure_failure,
+    ):
+        with progress.watch(suite_utils, suite):
+            return suite_utils.run(
+                suite, agent, checkpointer=progress, demo_mode=False,
+                return_full_episode_data=True, max_n_steps_override=max_steps,
+                stop_on_task_success=config.android_world.stop_on_task_success,
+            )
 
 
 def _evaluation_max_steps(value: int) -> int:
@@ -273,6 +325,7 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
                 duration_ms=finite_float_value(episode.get("run_time")) * 1000,
                 metadata={
                     "source": "android_world_m3a",
+                    **({STORED_SUMMARY_KEY: episode[STORED_SUMMARY_KEY]} if STORED_SUMMARY_KEY in episode else {}),
                     "episode_data_valid": episode_data_is_usable(raw_episode_data),
                     "had_exception": bool(episode.get("exception_info")),
                     "instance_id": episode.get("instance_id"),
@@ -349,10 +402,12 @@ class AndroidWorldStandaloneEvaluator:
         max_steps: int = DEFAULT_EVALUATION_MAX_STEPS,
         output_dir: str | Path | None = None,
         continue_on_infrastructure_failure: bool = False,
+        resume: bool = False,
+        store_trajectories: bool = True,
     ) -> EvaluationArtifacts:
         max_steps = _evaluation_max_steps(max_steps)
+        validate_resume_output(resume, output_dir)
         bootstrap_android_world(self.config.paths.android_world_root)
-        from android_world import checkpointer as checkpointer_lib
         from android_world import registry, suite_utils
         from android_world.agents import m3a
         from android_world.env import env_launcher
@@ -363,7 +418,13 @@ class AndroidWorldStandaloneEvaluator:
             / "evaluations"
             / f"standalone_{run_stamp}_{uuid.uuid4().hex[:8]}"
         )
-        checkpoint_dir = target / "checkpoints"
+        progress = _evaluation_progress(
+            target, self.config, mode="standalone", profiles=[profile], tasks=tasks,
+            combinations=n_task_combinations, seed=seed, family=family,
+            max_steps=max_steps, resume=resume,
+            store_trajectories=store_trajectories,
+            extra={"continue_on_infrastructure_failure": continue_on_infrastructure_failure},
+        )
         model = OpenAICompatibleVLClient(profile)
 
         class MemoryBoundedM3A(m3a.M3A):
@@ -395,25 +456,11 @@ class AndroidWorldStandaloneEvaluator:
                     self.config.android_world.wait_after_action_seconds
                 ),
             )
-            with recover_infrastructure_failures(
-                suite_utils,
-                environment,
-                self.config.android_world,
-                continue_on_infrastructure_failure=(
-                    continue_on_infrastructure_failure
-                ),
-            ):
-                episodes = suite_utils.run(
-                    suite,
-                    agent,
-                    checkpointer=checkpointer_lib.IncrementalCheckpointer(
-                        str(checkpoint_dir)
-                    ),
-                    demo_mode=False,
-                    return_full_episode_data=True,
-                    max_n_steps_override=max_steps,
-                    stop_on_task_success=self.config.android_world.stop_on_task_success,
-                )
+            episodes = _run_evaluation_suite(
+                suite_utils, suite, agent, environment, self.config, progress,
+                max_steps=max_steps,
+                continue_on_infrastructure_failure=continue_on_infrastructure_failure,
+            )
             ensure_valid_evaluation_episodes(
                 episodes,
                 expected_episodes=sum(len(instances) for instances in suite.values()),
@@ -430,6 +477,7 @@ class AndroidWorldStandaloneEvaluator:
             target,
             episodes,
             traces,
+            store_trajectories=store_trajectories,
             metadata={
                 "evaluation_mode": "standalone",
                 "model_id": profile.model_id,
@@ -446,6 +494,7 @@ class AndroidWorldStandaloneEvaluator:
                 "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
                 "episode_storage": "compact_without_screenshots",
+                "resume": progress.metadata(),
             },
         )
 
@@ -487,10 +536,13 @@ class AndroidWorldSimpleSkillEvaluator:
         include_candidate_skills: bool = False,
         output_dir: str | Path | None = None,
         record_traces: bool = False,
+        resume: bool = False,
+        store_trajectories: bool = True,
     ) -> EvaluationArtifacts:
+        record_traces = record_traces and store_trajectories
         max_steps = _evaluation_max_steps(max_steps)
+        validate_resume_output(resume, output_dir)
         bootstrap_android_world(self.config.paths.android_world_root)
-        from android_world import checkpointer as checkpointer_lib
         from android_world import registry, suite_utils
         from android_world.agents import m3a
         from android_world.env import env_launcher
@@ -505,7 +557,14 @@ class AndroidWorldSimpleSkillEvaluator:
             / "evaluations"
             / f"simple_skill_{run_stamp}_{uuid.uuid4().hex[:8]}"
         )
-        checkpoint_dir = target / "checkpoints"
+        progress = _evaluation_progress(
+            target, self.config, mode="simple-skills", profiles=[profile], tasks=tasks,
+            combinations=n_task_combinations, seed=seed, family=family,
+            max_steps=max_steps, resume=resume, skills=skills, store=self.store,
+            store_trajectories=store_trajectories,
+            extra={"include_candidate_skills": include_candidate_skills,
+                   "record_traces": record_traces},
+        )
         self_outer = self
 
         class SimpleSkillM3A(m3a.M3A):
@@ -546,20 +605,10 @@ class AndroidWorldSimpleSkillEvaluator:
                 env=environment,
             )
             suite.suite_family = family
-            with recover_infrastructure_failures(
-                suite_utils, environment, self.config.android_world
-            ):
-                episodes = suite_utils.run(
-                    suite,
-                    SimpleSkillM3A(environment),
-                    checkpointer=checkpointer_lib.IncrementalCheckpointer(
-                        str(checkpoint_dir)
-                    ),
-                    demo_mode=False,
-                    return_full_episode_data=True,
-                    max_n_steps_override=max_steps,
-                    stop_on_task_success=self.config.android_world.stop_on_task_success,
-                )
+            episodes = _run_evaluation_suite(
+                suite_utils, suite, SimpleSkillM3A(environment), environment,
+                self.config, progress, max_steps=max_steps,
+            )
             ensure_valid_evaluation_episodes(
                 episodes,
                 expected_episodes=sum(len(instances) for instances in suite.values()),
@@ -568,13 +617,18 @@ class AndroidWorldSimpleSkillEvaluator:
             environment.close()
 
         traces = episodes_to_traces(episodes)
+        for trace, episode in zip(traces, episodes):
+            trace.trace_id = progress.trace_id(episode)
         if record_traces:
             for trace in traces:
-                self.store.append_trace(trace)
+                self.store.append_trace(
+                    trace, update_skill_metrics=not trace.metadata.get("had_exception", False),
+                )
         return write_evaluation_report(
             target,
             episodes,
             traces,
+            store_trajectories=store_trajectories,
             metadata={
                 "evaluation_mode": "single_model_with_simple_skill_retrieval",
                 "model_id": profile.model_id,
@@ -594,6 +648,7 @@ class AndroidWorldSimpleSkillEvaluator:
                 "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
                 "episode_storage": "compact_without_screenshots",
+                "resume": progress.metadata(),
             },
         )
 
@@ -621,10 +676,12 @@ class AndroidWorldForcedSkillEvaluator:
         family: str = "android_world",
         max_steps: int = DEFAULT_EVALUATION_MAX_STEPS,
         output_dir: str | Path | None = None,
+        resume: bool = False,
+        store_trajectories: bool = True,
     ) -> EvaluationArtifacts:
         max_steps = _evaluation_max_steps(max_steps)
+        validate_resume_output(resume, output_dir)
         bootstrap_android_world(self.config.paths.android_world_root)
-        from android_world import checkpointer as checkpointer_lib
         from android_world import registry, suite_utils
         from android_world.agents import m3a
         from android_world.env import env_launcher
@@ -638,7 +695,12 @@ class AndroidWorldForcedSkillEvaluator:
             / "evaluations"
             / f"forced_skill_{run_stamp}_{uuid.uuid4().hex[:8]}"
         )
-        checkpoint_dir = target / "checkpoints"
+        progress = _evaluation_progress(
+            target, self.config, mode="forced-skill", profiles=[profile], tasks=tasks,
+            combinations=n_task_combinations, seed=seed, family=family,
+            max_steps=max_steps, resume=resume, skills=[skill], store=self.store,
+            store_trajectories=store_trajectories,
+        )
         self_outer = self
 
         class ForcedSkillM3A(m3a.M3A):
@@ -674,22 +736,10 @@ class AndroidWorldForcedSkillEvaluator:
                 env=environment,
             )
             suite.suite_family = family
-            with recover_infrastructure_failures(
-                suite_utils, environment, self.config.android_world
-            ):
-                episodes = suite_utils.run(
-                    suite,
-                    ForcedSkillM3A(environment),
-                    checkpointer=checkpointer_lib.IncrementalCheckpointer(
-                        str(checkpoint_dir)
-                    ),
-                    demo_mode=False,
-                    return_full_episode_data=True,
-                    max_n_steps_override=max_steps,
-                    stop_on_task_success=(
-                        self.config.android_world.stop_on_task_success
-                    ),
-                )
+            episodes = _run_evaluation_suite(
+                suite_utils, suite, ForcedSkillM3A(environment), environment,
+                self.config, progress, max_steps=max_steps,
+            )
             ensure_valid_evaluation_episodes(
                 episodes,
                 expected_episodes=sum(len(instances) for instances in suite.values()),
@@ -702,6 +752,7 @@ class AndroidWorldForcedSkillEvaluator:
             target,
             episodes,
             traces,
+            store_trajectories=store_trajectories,
             metadata={
                 "evaluation_mode": "skvm_forced_skill_calibration",
                 "calibration_protocol": "skvm-paired-android-world-v1",
@@ -723,6 +774,7 @@ class AndroidWorldForcedSkillEvaluator:
                     self.config.android_world.stop_on_task_success
                 ),
                 "episode_storage": "compact_without_screenshots",
+                "resume": progress.metadata(),
             },
         )
 
@@ -764,10 +816,13 @@ class AndroidWorldOnlineEvaluator:
         model_profiles: Sequence[ModelProfile] | None = None,
         record_traces: bool = True,
         continue_on_infrastructure_failure: bool = False,
+        resume: bool = False,
+        store_trajectories: bool = True,
     ) -> EvaluationArtifacts:
+        record_traces = record_traces and store_trajectories
         max_steps = _evaluation_max_steps(max_steps)
+        validate_resume_output(resume, output_dir)
         bootstrap_android_world(self.config.paths.android_world_root)
-        from android_world import checkpointer as checkpointer_lib
         from android_world import registry, suite_utils
         from android_world.agents import m3a
         from android_world.env import env_launcher
@@ -831,7 +886,30 @@ class AndroidWorldOnlineEvaluator:
             / "evaluations"
             / f"pmtskill_online_{run_stamp}_{uuid.uuid4().hex[:8]}"
         )
-        checkpoint_dir = target / "checkpoints"
+        planner_profile = (
+            next((profile for profile in profiles if profile.model_id == planner_model_id), None)
+            or self.config.model(planner_model_id)
+        ) if planner_model_id else None
+        progress = _evaluation_progress(
+            target, self.config, mode="pmtskill", profiles=profiles, tasks=tasks,
+            combinations=n_task_combinations, seed=seed, family=family,
+            max_steps=max_steps, resume=resume, skills=[*raw_skills, *polished], store=self.store,
+            store_trajectories=store_trajectories,
+            extra={
+                "routing": dataclasses.asdict(self.config.routing),
+                "planner_model": model_resume_identity(planner_profile) if planner_profile else None,
+                "include_candidate_skills": include_candidate_skills,
+                "record_traces": record_traces,
+                "continue_on_infrastructure_failure": continue_on_infrastructure_failure,
+                "routing_statistics": routing_statistics_identity(
+                    self.store.database, include_online_metrics=not record_traces,
+                ),
+                "skill_model_statuses": fingerprint([
+                    {key: value for key, value in row.items() if key != "updated_at"}
+                    for row in self.store.list_skill_model_statuses()
+                ]),
+            },
+        )
         environment = env_launcher.load_and_setup_env(
             console_port=self.config.android_world.console_port,
             emulator_setup=self.config.android_world.emulator_setup,
@@ -848,23 +926,11 @@ class AndroidWorldOnlineEvaluator:
             )
             suite.suite_family = family
             agent = DynamicRoutingM3A(environment)
-            with recover_infrastructure_failures(
-                suite_utils,
-                environment,
-                self.config.android_world,
-                continue_on_infrastructure_failure=(
-                    continue_on_infrastructure_failure
-                ),
-            ):
-                episodes = suite_utils.run(
-                    suite,
-                    agent,
-                    checkpointer=checkpointer_lib.IncrementalCheckpointer(str(checkpoint_dir)),
-                    demo_mode=False,
-                    return_full_episode_data=True,
-                    max_n_steps_override=max_steps,
-                    stop_on_task_success=self.config.android_world.stop_on_task_success,
-                )
+            episodes = _run_evaluation_suite(
+                suite_utils, suite, agent, environment, self.config, progress,
+                max_steps=max_steps,
+                continue_on_infrastructure_failure=continue_on_infrastructure_failure,
+            )
             ensure_valid_evaluation_episodes(
                 episodes,
                 expected_episodes=sum(len(instances) for instances in suite.values()),
@@ -877,13 +943,18 @@ class AndroidWorldOnlineEvaluator:
             )
 
         traces = episodes_to_traces(episodes)
+        for trace, episode in zip(traces, episodes):
+            trace.trace_id = progress.trace_id(episode)
         if record_traces:
             for trace in traces:
-                self.store.append_trace(trace)
+                self.store.append_trace(
+                    trace, update_skill_metrics=not trace.metadata.get("had_exception", False),
+                )
         return write_evaluation_report(
             target,
             episodes,
             traces,
+            store_trajectories=store_trajectories,
             metadata={
                 "family": family,
                 "tasks": list(tasks) if tasks else "all",
@@ -913,5 +984,6 @@ class AndroidWorldOnlineEvaluator:
                 "max_steps": max_steps,
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
                 "episode_storage": "compact_without_screenshots",
+                "resume": progress.metadata(),
             },
         )

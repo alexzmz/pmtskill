@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import statistics
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -11,7 +10,9 @@ from typing import Any
 from ..pmtskill_v2.core.io import write_json_atomic
 from ..pmtskill_v2.core.models import ExecutionTrace, TraceEvent
 from ..pmtskill_v2.evaluation.reporter import (
+    STORED_SUMMARY_KEY,
     EvaluationArtifacts,
+    compact_result_for_storage,
     episode_step_values,
     finite_float_value,
     normalize_episode_data,
@@ -79,6 +80,7 @@ def episodes_to_vdroid_traces(
                 duration_ms=finite_float_value(episode.get("run_time")) * 1000,
                 metadata={
                     "source": "vdroid_native_android_world",
+                    **({STORED_SUMMARY_KEY: episode[STORED_SUMMARY_KEY]} if STORED_SUMMARY_KEY in episode else {}),
                     "baseline": "vdroid",
                     "fixed_model_id": model_id,
                     "model_switching": False,
@@ -96,7 +98,18 @@ def summarize_vdroid_runtime(episodes: Sequence[dict[str, Any]]) -> dict[str, An
     selected_scores: list[float] = []
     completed_actions = 0
     decisions = 0
+    stored_candidates = 0
+    stored_score_sum = 0.0
+    stored_score_count = 0
     for episode in episodes:
+        stored = episode.get("_evaluation_vdroid_summary")
+        if isinstance(stored, Mapping):
+            decisions += int(stored["decision_count"])
+            stored_candidates += int(stored["candidate_actions_verified"])
+            completed_actions += int(stored["action_completion_calls"])
+            stored_score_sum += float(stored["score_sum"])
+            stored_score_count += int(stored["score_count"])
+            continue
         data = normalize_episode_data(episode.get("episode_data", {}))
         for raw in episode_step_values(data.get("_vdroid")):
             if not isinstance(raw, Mapping):
@@ -111,12 +124,13 @@ def summarize_vdroid_runtime(episodes: Sequence[dict[str, Any]]) -> dict[str, An
             completed_actions += int(bool(raw.get("action_completed", False)))
     return {
         "decision_count": decisions,
-        "candidate_actions_verified": sum(candidate_counts),
+        "candidate_actions_verified": sum(candidate_counts) + stored_candidates,
         "average_candidates_per_decision": (
-            statistics.fmean(candidate_counts) if candidate_counts else 0.0
+            (sum(candidate_counts) + stored_candidates) / decisions if decisions else 0.0
         ),
         "average_selected_verifier_score": (
-            statistics.fmean(selected_scores) if selected_scores else None
+            (sum(selected_scores) + stored_score_sum) / (len(selected_scores) + stored_score_count)
+            if selected_scores or stored_score_count else None
         ),
         "action_completion_calls": completed_actions,
         "model_switches": 0,
@@ -124,11 +138,31 @@ def summarize_vdroid_runtime(episodes: Sequence[dict[str, Any]]) -> dict[str, An
     }
 
 
+def compact_vdroid_result_for_storage(episode: dict[str, Any], *, model_id: str) -> dict[str, Any]:
+    result = compact_result_for_storage(episode, episodes_to_vdroid_traces([episode], model_id=model_id))
+    stored = episode.get("_evaluation_vdroid_summary")
+    if isinstance(stored, Mapping):
+        result["_evaluation_vdroid_summary"] = dict(stored)
+    else:
+        stats = summarize_vdroid_runtime([episode])
+        rows = episode_step_values(normalize_episode_data(episode.get("episode_data", {})).get("_vdroid"))
+        scores = [finite_float_value(row["selected_score"]) for row in rows
+                  if isinstance(row, Mapping) and row.get("selected_score") is not None]
+        result["_evaluation_vdroid_summary"] = {
+            "decision_count": stats["decision_count"],
+            "candidate_actions_verified": stats["candidate_actions_verified"],
+            "action_completion_calls": stats["action_completion_calls"],
+            "score_sum": sum(scores), "score_count": len(scores),
+        }
+    return result
+
+
 def write_vdroid_report(
     output_dir: str | Path,
     episodes: list[dict[str, Any]],
     *,
     metadata: dict[str, Any],
+    store_trajectories: bool = True,
 ) -> EvaluationArtifacts:
     model_id = str(metadata["model_id"])
     traces = episodes_to_vdroid_traces(episodes, model_id=model_id)
@@ -137,6 +171,7 @@ def write_vdroid_report(
         episodes,
         traces,
         metadata=metadata,
+        store_trajectories=store_trajectories,
     )
     vdroid_metrics = summarize_vdroid_runtime(episodes)
     artifacts.summary["vdroid"] = vdroid_metrics

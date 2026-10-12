@@ -545,6 +545,65 @@ python -m src1 --config src1/config.local.toml evaluate-pmtskill \
 backend 维护时显式增加 `--record-traces`。候选 polished skill 默认不参与正式评测，
 灰度验证时增加 `--include-candidates`。
 
+#### 关闭完整轨迹存储
+
+四个独立 `evaluate-*` 模式（含 `evaluate` 别名）可以在原命令后加
+`--no-store-trajectories`，或在各自 TOML 中设置：
+
+```toml
+[evaluation]
+store_trajectories = false
+```
+
+默认 true，`--store-trajectories` / `--no-store-trajectories` 优先于 TOML。
+关闭后不生成 `traces.jsonl`、完整 episode `.pkl.gz`，也不向 SQLite 回写轨迹（即使
+同时传入 `--record-traces`）。仅保存报告、能力图、manifest、progress 和
+`checkpoints/<task>_<instance>.json` 轻量结果，包含任务结果、步数、耗时、聚合模型/
+技能使用与失败分类，不包含动作序列、prompt、响应、截图或完整状态。
+与 `--resume` 兼容，恢复后的 SR、路由统计及 V-Droid verifier 指标保持一致。
+
+这与原有 `--no-record-traces` 不同，后者只关闭 SQLite 回写。关闭存储不会自动删除
+以前已保存的轨迹文件；可在已有完整 checkpoint 的运行中改用轻量存储，但已经仅
+存轻量结果的运行不能重新开启完整轨迹恢复（原始步骤无法补回），需要新目录。
+该开关控制评测产物，不会关闭必要的 CLI 错误/运行日志。训练、采集和配对标定的
+原有轨迹策略不因独立评测配置变化而自动改变。
+
+#### 实例级断点续跑
+
+`evaluate-standalone`、`evaluate-simple-skills`、`evaluate-pmtskill`（含 `evaluate`
+别名）以及 `evaluate-vdroid` 均支持 `--resume` / `--no-resume`。也可在各自 TOML 中
+设置 `[evaluation] resume = true`；默认 false，CLI 优先。开启时必须固定同一个
+`--output-dir`，不能使用每次自动生成的新目录，例如：
+
+```bash
+python -m src1 --config src1/config.local_all.toml evaluate-pmtskill \
+  --adapter-paths ./src1/runtime/checkpoints/adapter_control01 \
+                  ./src1/runtime/checkpoints/adapter_create02 \
+  --skill-database ./deliverables/skill_library_evidence_v2/skill_library.sqlite3 \
+  --combinations 5 --seed 42 --max-steps 25 \
+  --output-dir ./src1/runtime/evaluations/pmtskill_seed42 --resume
+```
+
+首次执行也可加 `--resume`，不存在记录就从头开始；中断后原样重跑同一命令即可。
+每个任务参数实例结束后原子保存 `checkpoints/<task>_<instance>.pkl.gz`，并更新
+`progress.json`（关闭完整轨迹时使用轻量 `.json` checkpoint），其中列出已完成
+实例、成功/失败结果和需要重试的异常实例。
+恢复按任务名、instance_id、goal 与完整参数指纹核对，绝不是“某个任务成功过一次就
+跳过这个任务的全部组合”。正常完成的失败 episode 同样复用，避免反复重测失败任务
+造成 SR 虚高；异常、基础设施不可用及损坏/未完成的 checkpoint 会重试。
+
+`evaluation_manifest.json` 固定模型/checkpoint（含本地 LoRA 权重哈希）、技能定义与
+状态、任务范围、seed、组合数、步数上限和路由参数；不兼容时拒绝混用，需新建输出
+目录。最终报告合并本次与原先完整轨迹，不重复计数；`--record-traces` 也使用稳定
+attempt ID 防止重复累计 SQLite 统计。报告 metadata.resume 记录复用/本次执行数量。
+默认不回写轨迹时也校验路由统计，避免中断期间重新标定或 backend 更新造成结果混用；
+显式 `--record-traces` 是可变在线统计实验，允许该模式自身的在线统计回写。
+`--no-resume` 不会清空或覆盖已有评测，重新测试请使用新目录。
+
+更新前没有 `evaluation_manifest.json` 的旧目录无法可靠验证原模型/技能版本，因此
+不会自动信任并复用，旧结果保持原样。实例恢复不续接 emulator 中间状态：被中断的
+episode 从第 0 步重跑。不要让两个进程同时写同一输出目录。
+
 ### 6.4 V-Droid baseline：固定 verifier + 原生候选动作评分
 
 V-Droid 使用 `libs/V-Droid` 自带的 AndroidWorld fork，在独立 worker 中运行，避免和
@@ -620,7 +679,12 @@ python -m src1 --config src1/config.local.toml calibrate-skills \
 
 同一 adapter 的裸模型 baseline 只执行一次，之后被多个技能 condition 复用。显式使用
 同一 `--output-dir` 时默认从 `condition-result.json` 恢复已经完成的 condition；使用
-`--no-resume` 可拒绝复用。输出目录包含：
+`--no-resume` 可拒绝复用。
+
+未完成的 condition 现在也会使用同一目录下的实例 checkpoint 续跑，不再因
+`return_full_episode_data=True` 与 AndroidWorld 原生恢复互斥而重跑已完成实例。
+
+输出目录包含：
 
 - `summary.json`：每个模型版本×技能版本的绝对 SR、裸模型 SR、uplift、Wilson 下界；
 - `model_skill_matrix.csv`：方便绘图和路由分析的矩阵；

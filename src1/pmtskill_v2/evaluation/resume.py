@@ -102,7 +102,11 @@ def routing_statistics_identity(database: Path, *, include_online_metrics: bool)
             "SELECT skill_id, model_id, successes, trials, latency_sum_ms FROM skill_metrics "
             "ORDER BY skill_id, model_id"
         ).fetchall() if include_online_metrics else "mutable-trace-recording"
-    return fingerprint({"calibration": calibration, "online": online})
+        estimates = connection.execute(
+            "SELECT skill_version_id, model_variant_id, estimate_json FROM skill_model_estimates "
+            "ORDER BY skill_version_id, model_variant_id"
+        ).fetchall()
+    return fingerprint({"calibration": calibration, "online": online, "estimates": estimates})
 
 
 def validate_resume_output(resume: bool, output_dir: Any) -> None:

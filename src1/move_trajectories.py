@@ -12,7 +12,7 @@ OUTPUT_ROOT = Path("/home/zmz/Workspace/gui/src1/runtime/trajectories_classes")
 
 
 # 仅保留旧目录口径用于人工核对历史数据；当前复制逻辑只使用上方从
-# evaluation.capabilities 导入的七维 TASK_CLASSES。
+# evaluation.capabilities 导入的三类 TASK_CLASSES。
 _LEGACY_TASK_CLASSES: dict[str, set[str]] = {
     # 系统控制、Clock、简单设备操作
     "os": {

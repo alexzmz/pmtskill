@@ -202,6 +202,24 @@ class AdapterDeploymentBinding:
     checkpoint: ResolvedAdapterCheckpoint
     template_profile: ModelProfile
 
+    def profile(self, *, base_model_path: str, base_url: str = "http://offline.invalid/v1") -> ModelProfile:
+        """在线/离线共用相同的实际 checkpoint 身份，不把服务端口当成版本。"""
+        checkpoint = self.checkpoint
+        return dataclasses.replace(
+            self.template_profile, model_id=self.model_id, served_model=self.model_id,
+            base_url=base_url, adapter=None, api_key_env=None, enabled=True,
+            metadata={
+                **self.template_profile.metadata, "base_model_path": base_model_path,
+                "evaluation_checkpoint": str(checkpoint.checkpoint_dir),
+                "adapter_input_path": str(checkpoint.input_path),
+                "adapter_run_dir": str(checkpoint.run_dir) if checkpoint.run_dir else None,
+                "adapter_epoch_dir": str(checkpoint.epoch_dir) if checkpoint.epoch_dir else None,
+                "adapter_selection": checkpoint.selection, "lora_rank": checkpoint.lora_rank,
+                "optimizer_state": str(checkpoint.optimizer_state),
+                "scheduler_state": str(checkpoint.scheduler_state),
+            },
+        )
+
 
 class MSSwiftAdapterDeployment(MSSwiftEvaluationDeployment):
     """在一个 ms-swift OpenAI 服务中加载一个或多个命名 LoRA adapter。"""
@@ -329,40 +347,8 @@ class MSSwiftAdapterDeployment(MSSwiftEvaluationDeployment):
         endpoint = (
             f"http://{self.settings.deploy_host}:{self.settings.deploy_port}/v1"
         )
-        return tuple(
-            dataclasses.replace(
-                binding.template_profile,
-                model_id=binding.model_id,
-                served_model=binding.model_id,
-                base_url=endpoint,
-                adapter=None,
-                api_key_env=None,
-                enabled=True,
-                metadata={
-                    **binding.template_profile.metadata,
-                    "base_model_path": self.base_model_path,
-                    "evaluation_checkpoint": str(
-                        binding.checkpoint.checkpoint_dir
-                    ),
-                    "adapter_input_path": str(binding.checkpoint.input_path),
-                    "adapter_run_dir": (
-                        str(binding.checkpoint.run_dir)
-                        if binding.checkpoint.run_dir is not None
-                        else None
-                    ),
-                    "adapter_epoch_dir": (
-                        str(binding.checkpoint.epoch_dir)
-                        if binding.checkpoint.epoch_dir is not None
-                        else None
-                    ),
-                    "adapter_selection": binding.checkpoint.selection,
-                    "lora_rank": binding.checkpoint.lora_rank,
-                    "optimizer_state": str(binding.checkpoint.optimizer_state),
-                    "scheduler_state": str(binding.checkpoint.scheduler_state),
-                },
-            )
-            for binding in self.bindings
-        )
+        return tuple(binding.profile(base_model_path=self.base_model_path, base_url=endpoint)
+                     for binding in self.bindings)
 
     @contextlib.contextmanager
     def activate_adapters(self) -> Iterator[tuple[ModelProfile, ...]]:

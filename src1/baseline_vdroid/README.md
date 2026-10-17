@@ -7,7 +7,7 @@ planner, dynamic-programming router, model pool, or online skill adaptation.
 The worker process loads V-Droid's vendored AndroidWorld fork in isolation. The
 only shared contract with PORTS is the evaluation protocol and output schema:
 task list, combinations, seed, maximum steps, Micro/Macro SR, per-task results,
-seven capability scores, traces, and checkpoints.
+three capability scores (Reasoning, Coordination, Manipulation), traces, and checkpoints.
 
 ```bash
 cp src1/baseline_vdroid/config.example.toml \

@@ -315,13 +315,13 @@ class TrainingEvaluationTest(unittest.TestCase):
                 )
 
             markdown = recorder.comparison_markdown.read_text(encoding="utf-8")
-            self.assertIn("## 各阶段七维能力变化", markdown)
-            self.assertIn("## 训练后裸模型七维能力", markdown)
-            self.assertIn("| Control | 1/1 |", markdown)
+            self.assertIn("## 各阶段三类能力变化", markdown)
+            self.assertIn("## 训练后裸模型三类能力", markdown)
+            self.assertIn("| Manipulation | 1/1 |", markdown)
             self.assertIn("capability_distribution_final_standalone.png", markdown)
             history = json.loads(recorder.history_json.read_text(encoding="utf-8"))
             self.assertEqual(
-                history["stages"][0]["capability_distribution"]["control"][
+                history["stages"][0]["capability_distribution"]["manipulation"][
                     "score"
                 ],
                 100.0,

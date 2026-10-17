@@ -1,4 +1,4 @@
-"""AndroidWorld 七维能力分类、统计与可视化。
+"""AndroidWorld 三类能力分类、统计与可视化。
 
 本模块是评测和训练报告共享的唯一能力分类来源。能力分数使用该类中实际参与
 评测的全部有效 episode 的 micro success rate，并转换到 ``[0, 100]``。
@@ -17,28 +17,20 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 CAPABILITY_ORDER = (
-    "control",
-    "create",
-    "edit",
-    "delete",
-    "query",
-    "cross_app",
-    "interactive",
+    "reasoning",
+    "coordination",
+    "manipulation",
 )
 
 CAPABILITY_LABELS = {
-    "control": "Control",
-    "create": "Create",
-    "edit": "Edit",
-    "delete": "Delete",
-    "query": "Query",
-    "cross_app": "Cross-App",
-    "interactive": "Interactive",
+    "reasoning": "Reasoning",
+    "coordination": "Coordination",
+    "manipulation": "Manipulation",
 }
 
-# 与论文实验口径一致的七类任务。使用 frozenset 防止报告运行时意外修改分类。
+# 严格采用用户的三类清单；未知任务保留 unclassified，不根据名称猜测。
 TASK_CLASSES: dict[str, frozenset[str]] = {
-    "control": frozenset(
+    "manipulation": frozenset(
         {
             "AudioRecorderRecordAudio",
             "AudioRecorderRecordAudioWithFileName",
@@ -60,73 +52,40 @@ TASK_CLASSES: dict[str, frozenset[str]] = {
             "SystemWifiTurnOffVerify",
             "SystemWifiTurnOn",
             "SystemWifiTurnOnVerify",
-            "TurnOffWifiAndTurnOnBluetooth",
-            "TurnOnWifiAndOpenApp",
-        }
-    ),
-    "create": frozenset(
-        {
             "ContactsAddContact",
             "ContactsNewContactDraft",
-            "ExpenseAddMultiple",
             "ExpenseAddSingle",
             "MarkorCreateFolder",
             "MarkorCreateNote",
-            "RecipeAddMultipleRecipes",
             "RecipeAddSingleRecipe",
-            "RetroCreatePlaylist",
-            "RetroSavePlaylist",
-            "SimpleCalendarAddOneEvent",
-            "SimpleCalendarAddOneEventInTwoWeeks",
-            "SimpleCalendarAddOneEventRelativeDay",
-            "SimpleCalendarAddOneEventTomorrow",
-            "SimpleCalendarAddRepeatingEvent",
-            "SimpleDrawProCreateDrawing",
             "SimpleSmsReply",
             "SimpleSmsReplyMostRecent",
             "SimpleSmsResend",
             "SimpleSmsSend",
-            "VlcCreatePlaylist",
-            "VlcCreateTwoPlaylists",
-        }
-    ),
-    "edit": frozenset(
-        {
             "FilesMoveFile",
             "MarkorAddNoteHeader",
             "MarkorChangeNoteContent",
             "MarkorEditNote",
-            "MarkorMergeNotes",
-            "MarkorMoveNote",
             "SystemCopyToClipboard",
-        }
-    ),
-    "delete": frozenset(
-        {
-            "ExpenseDeleteDuplicates",
-            "ExpenseDeleteDuplicates2",
-            "ExpenseDeleteMultiple",
-            "ExpenseDeleteMultiple2",
             "ExpenseDeleteSingle",
             "FilesDeleteFile",
-            "MarkorDeleteAllNotes",
             "MarkorDeleteNewestNote",
             "MarkorDeleteNote",
-            "RecipeDeleteDuplicateRecipes",
-            "RecipeDeleteDuplicateRecipes2",
-            "RecipeDeleteDuplicateRecipes3",
-            "RecipeDeleteMultipleRecipes",
-            "RecipeDeleteMultipleRecipesWithConstraint",
-            "RecipeDeleteMultipleRecipesWithNoise",
             "RecipeDeleteSingleRecipe",
-            "RecipeDeleteSingleWithRecipeWithNoise",
             "SimpleCalendarDeleteEvents",
             "SimpleCalendarDeleteEventsOnRelativeDay",
             "SimpleCalendarDeleteOneEvent",
         }
     ),
-    "query": frozenset(
+    "reasoning": frozenset(
         {
+            "ExpenseDeleteDuplicates", "ExpenseDeleteDuplicates2",
+            "RecipeDeleteDuplicateRecipes", "RecipeDeleteDuplicateRecipes2",
+            "RecipeDeleteDuplicateRecipes3", "RecipeDeleteMultipleRecipesWithConstraint",
+            "RecipeDeleteMultipleRecipesWithNoise", "BrowserMultiply",
+            "SimpleCalendarAddOneEvent", "SimpleCalendarAddOneEventInTwoWeeks",
+            "SimpleCalendarAddOneEventRelativeDay", "SimpleCalendarAddOneEventTomorrow",
+            "SimpleCalendarAddRepeatingEvent",
             "NotesIsTodo",
             "NotesMeetingAttendeeCount",
             "NotesRecipeIngredientCount",
@@ -156,8 +115,15 @@ TASK_CLASSES: dict[str, frozenset[str]] = {
             "TasksIncompleteTasksOnDate",
         }
     ),
-    "cross_app": frozenset(
+    "coordination": frozenset(
         {
+            "BrowserDraw", "BrowserMaze", "OsmAndFavorite", "OsmAndMarker", "OsmAndTrack",
+            "ExpenseAddMultiple", "ExpenseDeleteMultiple", "ExpenseDeleteMultiple2",
+            "RecipeAddMultipleRecipes", "RecipeDeleteMultipleRecipes",
+            "RecipeDeleteSingleWithRecipeWithNoise", "MarkorDeleteAllNotes", "MarkorMergeNotes",
+            "TurnOffWifiAndTurnOnBluetooth", "TurnOnWifiAndOpenApp", "VlcCreateTwoPlaylists",
+            "VlcCreatePlaylist", "RetroSavePlaylist", "RetroCreatePlaylist",
+            "SimpleDrawProCreateDrawing", "MarkorMoveNote",
             "ExpenseAddMultipleFromGallery",
             "ExpenseAddMultipleFromMarkor",
             "MarkorCreateNoteAndSms",
@@ -172,17 +138,8 @@ TASK_CLASSES: dict[str, frozenset[str]] = {
             "SimpleSmsSendReceivedAddress",
         }
     ),
-    "interactive": frozenset(
-        {
-            "BrowserDraw",
-            "BrowserMaze",
-            "BrowserMultiply",
-            "OsmAndFavorite",
-            "OsmAndMarker",
-            "OsmAndTrack",
-        }
-    ),
 }
+TASK_CLASSES = {category: TASK_CLASSES[category] for category in CAPABILITY_ORDER}
 
 
 def build_task_to_capability() -> dict[str, str]:
@@ -207,7 +164,7 @@ TASK_TO_CAPABILITY = build_task_to_capability()
 def summarize_capabilities(
     per_task: Mapping[str, Mapping[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """由每任务统计汇总七维能力分数。
+    """由每任务统计汇总三类能力分数。
 
     ``per_task`` 的行需包含 ``successes`` 和 ``episodes``。返回值中的
     ``score``、``task_coverage_percent`` 均采用 ``[0, 100]`` 标度。
@@ -375,7 +332,7 @@ def render_capability_plot(
         fig.savefig(pdf_path, format="pdf", bbox_inches="tight", pad_inches=0.1)
         plt.close(fig)
 
-    LOGGER.info("已生成七维能力图: %s, %s", png_path, pdf_path)
+    LOGGER.info("已生成三类能力图: %s, %s", png_path, pdf_path)
     return {"png": png_path.name, "pdf": pdf_path.name}
 
 
@@ -394,7 +351,7 @@ def format_capability_score(value: Any) -> str:
 def capability_table_lines(
     capability_distribution: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
-    """生成可嵌入任意 Markdown 报告的七维能力表。"""
+    """生成可嵌入任意 Markdown 报告的三类能力表。"""
 
     lines = [
         "| 能力 | 成功/有效 episode | 已测/定义任务 | 任务覆盖率 | 能力分数 [0,100] |",

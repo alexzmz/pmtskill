@@ -302,6 +302,8 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"- 完整轨迹存储：`{metadata.get('store_trajectories', True)}`",
     ]
     skipped_tasks = summary.get("infrastructure_skipped_tasks", [])
+    if metadata.get("use_skill_estimates"):
+        lines.append("- 技能评分优先使用实测证据；缺失时可使用离线估计先验，估计分数不是实测 SR。")
     resume = metadata.get("resume")
     if isinstance(resume, Mapping):
         lines.extend((
@@ -356,7 +358,7 @@ def _markdown(summary: dict[str, Any]) -> str:
         lines.extend(
             (
                 "",
-                "## 七维能力分布",
+                "## 三类能力分布",
                 "",
                 "能力分数为该能力下已评测有效 episode 的 Micro SR × 100；"
                 "未抽样到的能力显示为 `N/A`，不按失败计。",
@@ -369,13 +371,13 @@ def _markdown(summary: dict[str, Any]) -> str:
             lines.extend(
                 (
                     "",
-                    "- 未归入七维能力的任务："
+                    "- 未归入三类能力的任务："
                     + ", ".join(f"`{task}`" for task in unclassified),
                 )
             )
         plot = summary.get("capability_plot", {})
         if isinstance(plot, Mapping) and plot.get("png"):
-            lines.extend(("", f"![七维能力分布]({plot['png']})"))
+            lines.extend(("", f"![三类能力分布]({plot['png']})"))
         elif summary.get("capability_plot_error"):
             lines.extend(
                 (
@@ -441,7 +443,7 @@ def write_evaluation_report(
             title=f"Capability Distribution of {plot_title}",
         )
     except Exception as exc:  # 绘图失败不应丢失耗时很长的 AndroidWorld 结果。
-        LOGGER.warning("七维能力图生成失败: %s", exc, exc_info=True)
+        LOGGER.warning("三类能力图生成失败: %s", exc, exc_info=True)
         summary["capability_plot_error"] = str(exc)
     write_json_atomic(summary_path, summary)
     if traces_path is not None:

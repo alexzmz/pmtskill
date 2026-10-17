@@ -297,6 +297,7 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
                     "source": route.get("source"),
                     "planner_id": route.get("planner_id"),
                     "skill_version_id": route.get("skill_version_id"),
+                    "skill_score_source": route.get("skill_score_source", "unspecified"),
                     "plan_revision": route.get("current_revision"),
                     "planned_unit": route.get("planned_unit"),
                     "planned_primitive_ids": list(planned_primitives),
@@ -985,5 +986,6 @@ class AndroidWorldOnlineEvaluator:
                 "stop_on_task_success": self.config.android_world.stop_on_task_success,
                 "episode_storage": "compact_without_screenshots",
                 "resume": progress.metadata(),
+                "use_skill_estimates": self.config.routing.use_skill_estimates,
             },
         )

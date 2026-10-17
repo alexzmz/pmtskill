@@ -19,6 +19,7 @@ from ..core.models import (
 )
 from ..skills.store import SkillStore
 from ..skills.identity import model_variant_id, skill_version_id
+from ..evaluation.resume import fingerprint, model_resume_identity
 
 
 class RoutingAlgorithm(Protocol):
@@ -68,6 +69,23 @@ class DynamicProgrammingRouter:
             tuple[str, str], dict[str, object] | None
         ] = {}
         self._skill_has_matrix_cache: dict[str, bool] = {}
+        self._estimate_cache: dict[tuple[str, str], dict | None] = {}
+        self._model_weight_cache: dict[str, str] = {}
+        self._score_sources: dict[tuple[str, str], str] = {}
+
+    def _estimate(self, model: ModelProfile, skill: SkillRecord) -> dict | None:
+        if not self.store or not self.config.use_skill_estimates:
+            return None
+        key = (skill_version_id(skill), model_variant_id(model))
+        if key not in self._estimate_cache:
+            estimate = self.store.skill_model_estimate(skill, model)
+            if estimate is not None:
+                if key[1] not in self._model_weight_cache:
+                    self._model_weight_cache[key[1]] = fingerprint(model_resume_identity(model))
+                if estimate.get("model_weight_fingerprint") != self._model_weight_cache[key[1]]:
+                    estimate = None
+            self._estimate_cache[key] = estimate
+        return self._estimate_cache[key]
 
     def _candidates(
         self,
@@ -127,6 +145,7 @@ class DynamicProgrammingRouter:
                 self._calibration_cache[pair_key] = calibration
             calibration_trials = int(calibration["valid_trials"])
             if calibration_trials:
+                self._score_sources[pair_key] = "observed_calibration"
                 # SKVM-style 配对标定有明确 no-skill 对照，且绑定真实 adapter 版本，
                 # 优先级高于在线自然流量；小样本仍与原语先验平滑混合。
                 weight = min(0.95, calibration_trials / (calibration_trials + 5))
@@ -140,6 +159,7 @@ class DynamicProgrammingRouter:
                 )
                 trials = int(metrics["trials"])
                 if trials:
+                    self._score_sources[pair_key] = "online_observations"
                     weight = min(0.90, trials / (trials + 5))
                     probability = (
                         weight * float(metrics["smoothed_success_rate"])
@@ -147,6 +167,11 @@ class DynamicProgrammingRouter:
                     )
                     if metrics["average_latency_ms"]:
                         latency = float(metrics["average_latency_ms"])
+                else:
+                    estimate = self._estimate(model, candidate.skill)
+                    if estimate is not None:
+                        probability = min(0.999999, max(0.000001, float(estimate["estimated_support_score"])))
+                        self._score_sources[pair_key] = "estimated_not_sr"
         return probability, latency
 
     def _model_skill_allowed(
@@ -171,6 +196,10 @@ class DynamicProgrammingRouter:
                 include_candidates
                 and pair["status"] == SkillStatus.CANDIDATE.value
             )
+        if self._estimate(model, candidate.skill) is not None:
+            # 估计不是已验证 active；仅允许已被上游全局生命周期筛选的技能候选。
+            # 已有当前模型实测状态时，上面的分支始终优先，不能用估计绕过回滚。
+            return True
         # 一旦当前技能版本已有兼容矩阵，未标定的新模型视为 unknown，而不是
         # 沿用其他 adapter 的成功率。灰度模式仍允许探索它。
         if candidate.skill.skill_id not in self._skill_has_matrix_cache:
@@ -283,5 +312,9 @@ class DynamicProgrammingRouter:
             steps=best.steps,
             total_score=best.score,
             planner_id=planner_id,
-            metadata={"algorithm": self.algorithm_id},
+            metadata={"algorithm": self.algorithm_id,
+                      "skill_score_sources": {step.step_id: self._score_sources.get(
+                          (skill_version_id(next(skill for skill in skills if skill.skill_id == step.skill_id)),
+                           model_variant_id(next(model for model in enabled_models if model.model_id == step.model_id))),
+                          "primitive_prior") for step in best.steps if step.skill_id}},
         )

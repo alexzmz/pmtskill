@@ -104,6 +104,8 @@ class RoutingConfig:
     degradation_weight: float = 0.02
     minimum_capability: float = 0.05
     maximum_candidates_per_position: int = 32
+    # 离线估计仅在缺少实测证据时作为先验，不覆盖已观测的模型—技能状态。
+    use_skill_estimates: bool = True
 
 
 @dataclasses.dataclass(slots=True)
@@ -179,6 +181,14 @@ class EvaluationConfig:
 
 
 @dataclasses.dataclass(slots=True)
+class CalibrationConfig:
+    mode: str = "androidworld"
+    offline_scorer: str = "prior"
+    max_samples_per_skill: int = 8
+    max_training_samples: int = 2000
+
+
+@dataclasses.dataclass(slots=True)
 class ProjectConfig:
     """整套离线/在线系统配置。"""
 
@@ -191,6 +201,7 @@ class ProjectConfig:
     android_world: AndroidWorldConfig
     models: tuple[ModelProfile, ...]
     evaluation: EvaluationConfig = dataclasses.field(default_factory=EvaluationConfig)
+    calibration: CalibrationConfig = dataclasses.field(default_factory=CalibrationConfig)
 
     def model(self, model_id: str) -> ModelProfile:
         for profile in self.models:
@@ -439,6 +450,15 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
     store_trajectories = evaluation_raw.get("store_trajectories", True)
     if not isinstance(store_trajectories, bool):
         raise ValueError("evaluation.store_trajectories 必须是布尔值")
+    calibration = CalibrationConfig(**_section(raw, "calibration"))
+    if calibration.mode not in {"androidworld", "offline"}:
+        raise ValueError("calibration.mode 必须是 androidworld 或 offline")
+    if calibration.offline_scorer not in {"prior", "teacher-forcing"}:
+        raise ValueError("calibration.offline_scorer 必须是 prior 或 teacher-forcing")
+    if calibration.max_samples_per_skill <= 0 or calibration.max_training_samples <= 0:
+        raise ValueError("calibration 样本上限必须大于 0")
+    if not isinstance(routing.use_skill_estimates, bool):
+        raise ValueError("routing.use_skill_estimates 必须是布尔值")
 
     return ProjectConfig(
         config_path=config_path,
@@ -450,4 +470,5 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         android_world=android_world,
         models=models,
         evaluation=EvaluationConfig(resume=resume, store_trajectories=store_trajectories),
+        calibration=calibration,
     )

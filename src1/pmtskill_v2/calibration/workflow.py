@@ -24,6 +24,7 @@ from ..evaluation.reporter import (
     normalize_episode_data,
     successful_episode_value,
 )
+from ..evaluation.capabilities import capability_table_lines, summarize_capabilities
 from ..skills.identity import model_variant_id, skill_version_id
 from ..skills.importer import relevant_raw_skills
 from ..skills.store import SkillStore
@@ -192,6 +193,11 @@ def _markdown(summary: Mapping[str, Any]) -> str:
         )
     if not rows:
         lines.append("| （暂无有效标定） | - | 0 | - | - | - | - | - |")
+    for model_id, conditions in summary.get("capability_distributions", {}).items():
+        lines.extend(("", f"## 三类配对任务表现：{model_id}", "",
+                      "按有效模型×技能×任务配对汇总；同一 task 可因不同技能重复计入，不是独立样本数。"))
+        for condition, distribution in conditions.items():
+            lines.extend(("", f"### {condition}", "", *capability_table_lines(distribution)))
     lines.extend(
         (
             "",
@@ -523,6 +529,19 @@ class SkillCalibrationWorkflow:
                     if row["trials_total"]:
                         metrics.append(row)
             trials = self.store.list_calibration_trials(run_id=run_id)
+            distributions = {}
+            for profile in profiles:
+                conditions = {}
+                for condition, key in (("no-skill", "baseline_success"), ("forced-skill", "skill_success")):
+                    task_rows = {}
+                    for trial in trials:
+                        if not trial["valid"] or trial["model_variant_id"] != model_variant_id(profile):
+                            continue
+                        task = task_rows.setdefault(trial["task_name"], {"episodes": 0, "successes": 0})
+                        task["episodes"] += 1
+                        task["successes"] += int(bool(trial[key]))
+                    conditions[condition] = summarize_capabilities(task_rows)[0]
+                distributions[profile.model_id] = conditions
             summary = {
                 "protocol": PROTOCOL_ID,
                 "label_source": "android_world_task_evaluator",
@@ -534,6 +553,7 @@ class SkillCalibrationWorkflow:
                 "valid_trials": sum(bool(row["valid"]) for row in trials),
                 "invalid_trials": sum(not bool(row["valid"]) for row in trials),
                 "model_skill_metrics": metrics,
+                "capability_distributions": distributions,
                 "skipped_pairs": skipped_pairs,
                 "config": current_config,
             }

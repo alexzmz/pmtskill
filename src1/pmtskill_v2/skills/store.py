@@ -356,6 +356,18 @@ class SkillStore:
         CREATE INDEX IF NOT EXISTS idx_skill_model_status_lookup
             ON skill_model_status(skill_id, model_id, status);
 
+        CREATE TABLE IF NOT EXISTS skill_model_estimates (
+            skill_version_id TEXT NOT NULL,
+            model_variant_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            estimate_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(skill_version_id, model_variant_id),
+            FOREIGN KEY(skill_version_id) REFERENCES skill_versions(skill_version_id),
+            FOREIGN KEY(model_variant_id) REFERENCES model_variants(model_variant_id)
+        );
+
         CREATE TABLE IF NOT EXISTS traces (
             trace_id TEXT PRIMARY KEY,
             task_name TEXT NOT NULL,
@@ -1072,6 +1084,29 @@ class SkillStore:
             )
             for row in rows
         ]
+
+    def set_skill_model_estimate(
+        self, skill: SkillRecord, profile: ModelProfile, estimate: Mapping[str, Any], *, register_versions: bool = True,
+    ) -> None:
+        """只保存估计，不产生真实 trial，不修改模型能力或 active 状态。"""
+        version = self.register_skill_version(skill) if register_versions else skill_version_id(skill)
+        variant = self.register_model_variant(profile) if register_versions else model_variant_id(profile)
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO skill_model_estimates VALUES(?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(skill_version_id, model_variant_id) DO UPDATE SET "
+                "estimate_json=excluded.estimate_json, updated_at=excluded.updated_at",
+                (version, variant, skill.skill_id, profile.model_id,
+                 json.dumps(dict(estimate), ensure_ascii=False, allow_nan=False), utc_now()),
+            )
+
+    def skill_model_estimate(self, skill: SkillRecord, profile: ModelProfile) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT estimate_json FROM skill_model_estimates WHERE skill_version_id=? AND model_variant_id=?",
+                (skill_version_id(skill), model_variant_id(profile)),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
 
     def set_skill_model_status(
         self,

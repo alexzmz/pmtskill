@@ -276,6 +276,7 @@ class RoutedVLWrapper:
         output, safe, raw = client.predict_mm(augmented, images)  # type: ignore[attr-defined]
         route_metadata = {
             "model_id": route_step.model_id,
+            "skill_score_source": self.plan.metadata.get("skill_score_sources", {}).get(route_step.step_id, "primitive_prior"),
             "skill_id": route_step.skill_id,
             "primitive_ids": list(route_step.primitive_ids),
             "is_summary": is_summary,

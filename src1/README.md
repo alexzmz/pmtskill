@@ -324,7 +324,7 @@ runtime/checkpoints/<adapter>/training_runs/<time>/
 ├── training_stage_commands.json      # 各累计 epoch 的命令与恢复来源
 ├── history.json                      # SR 历史、早退判定、停止 epoch 和最佳 checkpoint
 ├── history.csv                       # 方便表格/画图的 SR 曲线
-├── comparison.md                     # SR 与七维能力的基座、逐 epoch、最终总览
+├── comparison.md                     # SR 与三类能力的基座、逐 epoch、最终总览
 ├── capability_distribution_final_standalone.{png,pdf} # 训练后裸模型能力图
 ├── checkpoints.json                  # epoch→checkpoint、是否永久保留
 ├── dataset_snapshot/                 # 固定 JSONL、路径修复/坏图过滤报告
@@ -625,14 +625,14 @@ python -m src1 \
 建议先加 `--dry-run` 检查 V-Droid 源码、依赖、固定模型和 worker 命令。为了与 PORTS
 形成可复现的配对比较，两次实验应显式传入相同的 `--tasks`、`--combinations`、
 `--seed` 和 `--max-steps`。输出仍包含 `summary.json`、`report.md`、`traces.jsonl`、
-七维能力图和 checkpoints；额外记录每次 verifier 决策的候选动作数量、被选动作分数和
+三类能力图和 checkpoints；额外记录每次 verifier 决策的候选动作数量、被选动作分数和
 动作补全次数。
 
 每次评测目录包含：
 
 - `summary.json`：完整机器可读指标，含七类能力的成功数、覆盖任务数和 `[0,100]` 分数；
-- `report.md`：评测模式、实际 adapter checkpoint、Micro/Macro SR、七维能力表、每任务 SR、平均步数、模型切换、技能使用、失败分类；
-- `capability_distribution.png/.pdf`：Control、Create、Edit、Delete、Query、Cross-App、Interactive 的极坐标能力图；
+- `report.md`：评测模式、实际 adapter checkpoint、Micro/Macro SR、三类能力表、每任务 SR、平均步数、模型切换、技能使用、失败分类；
+- `capability_distribution.png/.pdf`：Reasoning、Coordination、Manipulation 的极坐标能力图；
 - `traces.jsonl`：backend 可直接消费的轻量轨迹；
 - `checkpoints/*.pkl.gz`：AndroidWorld 原始 episode。
 
@@ -640,6 +640,94 @@ python -m src1 \
 warning/error/traceback，`result.json` 和 `result.md` 保存最终指标及完整 adapter 解析结果。
 
 ### 6.5 模型×技能的无 LLM 配对标定
+
+分类口径统一来自 `evaluation/capabilities.py`：Reasoning 40 个 task、Coordination
+33 个、Manipulation 43 个，共 116 个，无重叠；未知 task 单独报告 unclassified，不
+根据任务名猜测分类。训练比较、独立评测、V-Droid 和标定报告使用同一份映射。
+
+#### 两种模式：保留实测，新增离线估计
+
+`calibrate-skills --mode androidworld` 保留原有 AndroidWorld 配对实测；默认不变。
+`calibrate-skills --mode offline` 不启动模拟器或临时模型服务，独立保存估计矩阵。
+也可通过 `[calibration].mode` 设置默认模式，CLI 优先。
+
+```bash
+# 原有实测：真实任务 SR / uplift，combinations 控制任务参数组合数。
+python -m src1 --config src1/config.local_all.toml calibrate-skills \
+  --mode androidworld \
+  --adapter-paths ./src1/runtime/checkpoints/adapter_control01 \
+  --skill-database ./deliverables/skill_library_evidence_v2/skill_library.sqlite3 \
+  --combinations 10 --seed 123 --max-steps 25 \
+  --output-dir ./src1/runtime/calibrations/androidworld_run
+
+# 最快的离线估计：不运行目标模型，只读取实际训练快照与能力先验。
+python -m src1 --config src1/config.local_all.toml calibrate-skills \
+  --mode offline --offline-scorer prior \
+  --adapter-paths ./src1/runtime/checkpoints/adapter_control01 \
+  --skill-database ./deliverables/skill_library_evidence_v2/skill_library.sqlite3 \
+  --seed 123 --output-dir ./src1/runtime/calibrations/offline_prior
+```
+
+`--adapter-paths` 可沿用原有多 adapter 列表，两个模式使用同一套 checkpoint 解析与
+版本 ID。离线不需要 optimizer/scheduler，纯 adapter 可加 `--no-require-training-state`。
+offline 模式下 `--combinations`、`--max-steps`、`--infer-backend` 和
+`--apply-maintenance` 不生效；`--tasks` 和 `--skill-task-map` 可缩小技能适用范围，
+不支持需要读取 AndroidWorld 注册表的 `--task-count`。
+
+prior 从每个 adapter 解析出的 `training_run/dataset_snapshot/train.jsonl` 自动读取
+真实训练元数据，用固定 seed 最多抽样 2000 行。启发式分数组合：原语能力先验权重
+0.55、动作训练覆盖权重 0.25、适用任务覆盖权重 0.20（缺失项不参与并重新归一），
+再乘以随拓扑长度和分支数下降的复杂度因子。原语使用几何平均先验，不把整段乘积
+当实测 SR；未知原语用 0.5。训练覆盖计数达到 5 后饱和。它只是透明的排序规则，
+不是拟合/校准过的成功概率。继承的 Teacher 模板不会冒充学生模型能力；缺少画像或
+快照会报告 warnings，不能根据 adapter 目录名编造专长。
+
+offline 也可选择更有信息量的已有视觉参考样本评分：
+
+```bash
+python -m src1 --config src1/config.local_all.toml calibrate-skills \
+  --mode offline --offline-scorer teacher-forcing \
+  --adapter-paths ./src1/runtime/checkpoints/adapter_control01 \
+  --skill-database ./deliverables/skill_library_evidence_v2/skill_library.sqlite3 \
+  --offline-dataset ./src1/runtime/dataset/validation.jsonl \
+  --offline-max-samples-per-skill 8 --cuda-visible-devices 1 \
+  --max-model-len 8192 --seed 123 \
+  --output-dir ./src1/runtime/calibrations/offline_likelihood
+```
+
+参考 JSONL 使用本项目 dataset builder 的 `messages`、`images`、`metadata.task_name`、
+`metadata.episode_id` 和 `metadata.episode_outcome="successful"`；图像相对路径以
+JSONL 所在目录为准。该模式使用本地 Transformers/PEFT（不是 vLLM OpenAI 接口），
+按同一个固定视觉参考集比较有/无技能时参考 assistant 响应的平均 token logP，
+prompt/图像 token 不计入 loss。同一 adapter 的裸模型参考评分会复用。同一基座
+只加载一次，多个 LoRA 切换评分；不同基座顺序加载。仅执行前向，不生成 GUI 动作。
+
+所有已找到的 adapter 训练快照的 episode 并集会被排除；若缺少某个训练快照，仍
+不能保证参考数据独立，因此应主动提供真正独立的参考集，并与最终测试集隔离。
+失败/未知结果、缺图、重复参考不参与；没有可用视觉样本或任务交集时明确报错。
+部分技能没有匹配参考时明确记录 prior 回退，不伪造 logP 或 SR。
+长度超限和模板前缀不一致会报错，不静默裁剪参考响应。
+
+teacher-forcing 的分数 = 0.5 × prior分数 + 0.5 × sigmoid(平均 ΔlogP/token)，是
+未经成功率校准的适配排序分数；原始 ΔlogP 与样本量也会报告。它衡量完整参考响应
+（通常含 Reason/Action）的拟合增益，不保证自由执行成功或具备偏离后的恢复能力。
+该后端参考 [Transformers 多模态接口](https://huggingface.co/docs/transformers/main/en/model_doc/qwen3_vl)
+与 [PEFT adapter 接口](https://huggingface.co/docs/peft/main/en/package_reference/peft_model)，
+默认 `trust_remote_code=false`；只有明确需要时才加 `--offline-trust-remote-code`。
+
+离线输出 `summary.json`、`report.md`、`model_skill_estimates.csv`、`estimates.json`
+及 `offline_manifest.json`，`pairs/*.json` 以组合为单位增量保存，避免反复重写整张
+矩阵。SQLite 独立表 `skill_model_estimates` 保存模型/技能版本
+估计，不写 `skill_calibration_trials`、不生成实测 SR、不自动晋升 active。输出目录
+相同且配置/权重/参考图像/已抽样训练元数据一致时，默认复用已完成的组合。
+
+在线路由默认 `[routing].use_skill_estimates=true`：实测配对 > 自然在线观测 > 离线
+估计 > 原语先验。已有当前模型的 candidate/deprecated 状态仍优先，不允许用估计绕过
+回滚；全局 candidate 技能仍需显式 `--include-candidates` 才参与实验。关闭该配置
+即可完全不用估计。报告保留 estimated_not_sr 来源，技能定义或实际权重变化后不复用
+旧估计；正式实验应新建输出目录固定路由输入。
+
+#### AndroidWorld 配对实测细节
 
 普通评测只观察路由器实际选中的技能，不能完整回答“某个 adapter 是否支持某个技能”。
 `calibrate-skills` 借鉴 SKVM bench 的 `no-skill` 与 `original/custom-skill` condition：

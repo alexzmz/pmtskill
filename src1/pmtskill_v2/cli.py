@@ -1165,7 +1165,7 @@ def _evaluation_profile_template(
     profiles.extend(config.models)
     exact = next((item for item in profiles if item.model_id == model_id), None)
     if exact is not None:
-        return exact
+        return dataclasses.replace(exact, metadata={**exact.metadata, "capability_prior_source": "model-specific"})
     fallback_id = config.training_evaluation.model_id
     fallback = next(
         (item for item in profiles if fallback_id and item.model_id == fallback_id),
@@ -1173,21 +1173,22 @@ def _evaluation_profile_template(
     )
     if fallback is None:
         raise ValueError("没有可用于 adapter 的模型能力画像")
-    return dataclasses.replace(fallback, model_id=model_id)
+    return dataclasses.replace(fallback, model_id=model_id, metadata={
+        **fallback.metadata, "capability_prior_source": f"inherited-template:{fallback.model_id}",
+    })
 
 
-def _adapter_deployment(
+def _adapter_bindings(
     config: ProjectConfig,
     store: SkillStore | None,
     args: argparse.Namespace,
     adapter_paths: Sequence[str],
     model_ids: Sequence[str] | None,
 ):
-    """解析 adapter 路径并构造命名 LoRA 部署器。"""
+    """只解析 checkpoint 和画像；离线估计也可使用，不创建部署器。"""
 
     from .evaluation.adapters import (
         AdapterDeploymentBinding,
-        MSSwiftAdapterDeployment,
         adapter_model_id,
         resolve_adapter_checkpoint,
     )
@@ -1222,6 +1223,13 @@ def _adapter_deployment(
         )
         for model_id, checkpoint in zip(ids, resolved)
     )
+    return bindings
+
+
+def _adapter_deployment(config, store, args, adapter_paths, model_ids):
+    from .evaluation.adapters import MSSwiftAdapterDeployment
+
+    bindings = _adapter_bindings(config, store, args, adapter_paths, model_ids)
     deployment = MSSwiftAdapterDeployment(
         config,
         _evaluation_settings(config, args),
@@ -1517,6 +1525,12 @@ def command_calibrate_skills(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.ensure_runtime_dirs()
     store = _open_evaluation_skill_store(config, args.skill_database)
+    mode = args.mode or config.calibration.mode
+    if mode == "offline":
+        return _command_calibrate_offline(config, store, args)
+    if any((args.offline_scorer, args.offline_dataset, args.offline_max_samples_per_skill,
+            args.offline_max_training_samples, args.offline_trust_remote_code)):
+        raise ValueError("使用离线评分参数时必须选择 --mode offline，避免意外启动完整 AndroidWorld 标定")
     deployment, bindings = _adapter_deployment(
         config,
         store,
@@ -1626,6 +1640,76 @@ def command_calibrate_skills(args: argparse.Namespace) -> int:
         }
     )
     return 0
+
+
+def _command_calibrate_offline(config: ProjectConfig, store: SkillStore, args: argparse.Namespace) -> int:
+    """离线路径刻意不创建临时 vLLM 服务、不枚举 AndroidWorld 注册表。"""
+    import os
+    from .calibration.offline import OfflineOptions, run_offline_calibration
+    from .calibration.workflow import CalibrationOptions
+
+    if args.task_count is not None:
+        raise ValueError("offline 模式请用 --tasks 指定范围；不使用依赖 AndroidWorld 注册表的 --task-count")
+    for name in ("offline_max_samples_per_skill", "offline_max_training_samples", "max_model_len"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} 必须大于 0")
+    bindings = _adapter_bindings(config, store, args, args.adapter_paths, args.adapter_model_ids)
+    target = Path(args.output_dir).expanduser().resolve() if args.output_dir else (
+        config.paths.state_dir / "calibrations" / f"offline_{time.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    ).resolve()
+    method = args.offline_scorer or config.calibration.offline_scorer
+    options = OfflineOptions(
+        output_dir=target, scorer=method,
+        dataset=Path(args.offline_dataset).expanduser().resolve() if args.offline_dataset else None,
+        max_samples_per_skill=args.offline_max_samples_per_skill or config.calibration.max_samples_per_skill,
+        max_training_samples=args.offline_max_training_samples or config.calibration.max_training_samples,
+        seed=args.seed, resume=args.resume, base_model_path=args.base_model_path,
+        scorer_settings={"max_length": args.max_model_len or config.training_evaluation.max_model_len,
+                         "max_pixels": config.offline.max_pixels,
+                         "trust_remote_code": args.offline_trust_remote_code} if method == "teacher-forcing" else {},
+    )
+    if method == "teacher-forcing" and options.dataset is None:
+        raise ValueError("teacher-forcing 必须指定 --offline-dataset（保留截图的独立成功参考 JSONL）")
+    selection = CalibrationOptions(
+        output_dir=target, tasks=tuple(_tasks(args.tasks)) if _tasks(args.tasks) else None,
+        skill_ids=tuple(args.skills or ()), skill_kind=args.skill_kind,
+        statuses=tuple(args.skill_statuses), task_map=_load_calibration_task_map(args.skill_task_map),
+        seed=args.seed, resume=args.resume,
+    )
+    if args.dry_run:
+        _print({"dry_run": True, "calibration_mode": "offline", "scorer": method,
+                "starts_model_server": False, "connects_emulator": False,
+                "uses_model_forward": method == "teacher-forcing", "score_is_success_rate": False,
+                "output_dir": target, "dataset": options.dataset,
+                "adapters": [{"model_id": item.model_id, **item.checkpoint.to_dict()} for item in bindings],
+                "max_samples_per_skill": options.max_samples_per_skill,
+                "lifecycle_updates": False})
+        return 0
+    scorer = None
+    previous_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        if method == "teacher-forcing":
+            from .calibration.likelihood import TransformersReferenceScorer
+            gpu = args.cuda_visible_devices or config.training_evaluation.cuda_visible_devices
+            if gpu is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+            scorer = TransformersReferenceScorer(
+                max_length=args.max_model_len or config.training_evaluation.max_model_len,
+                max_pixels=config.offline.max_pixels, trust_remote_code=args.offline_trust_remote_code,
+            )
+        result = run_offline_calibration(store, bindings, selection, options, scorer=scorer)
+        result["ignored_androidworld_arguments"] = ["combinations", "max_steps", "apply_maintenance", "infer_backend"]
+        result["skill_database"] = store.database.resolve()
+        _print(result)
+        return 0
+    finally:
+        if scorer is not None:
+            scorer.close()
+        if previous_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = previous_cuda
 
 
 def _evaluation_resume(config: ProjectConfig, args: argparse.Namespace) -> bool:
@@ -2280,11 +2364,20 @@ def build_parser() -> argparse.ArgumentParser:
         "calibrate-skills",
         help="用 AndroidWorld 真值标定每个 adapter 对每个技能的支持度",
     )
+    calibrate.add_argument("--mode", choices=["androidworld", "offline"],
+                           help="androidworld=原有配对实测；offline=不连接模拟器的适配估计，默认读 [calibration].mode")
+    calibrate.add_argument("--offline-scorer", choices=["prior", "teacher-forcing"],
+                           help="prior 不运行目标模型；teacher-forcing 对已有视觉参考样本做有/无技能前向评分")
+    calibrate.add_argument("--offline-dataset", help="共享、独立、保留图像的成功参考 ms-swift JSONL（teacher-forcing 必填）")
+    calibrate.add_argument("--offline-max-samples-per-skill", type=int)
+    calibrate.add_argument("--offline-max-training-samples", type=int)
+    calibrate.add_argument("--offline-trust-remote-code", action="store_true",
+                           help="显式允许 Transformers 执行模型仓库自定义代码；默认关闭")
     calibrate.add_argument(
         "--adapter-paths",
         nargs="+",
         required=True,
-        help="一个或多个 adapter 顶层目录；在同一服务中顺序标定",
+        help="一个或多个 adapter 顶层目录；androidworld 同服务顺序实测，offline 不启动服务",
     )
     calibrate.add_argument(
         "--adapter-model-ids",
@@ -2324,7 +2417,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="从同一 output-dir 已完成的 condition 恢复（默认启用）",
+        help="从同一 output-dir 已完成的 condition/离线组合恢复（默认启用）",
     )
     calibrate.add_argument(
         "--apply-maintenance",

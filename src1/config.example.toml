@@ -97,6 +97,8 @@ max_new_tokens = 2048
 deploy_extra_args = []
 
 [routing]
+# true: 无实测证据时使用当前模型/技能版本的离线适配估计；不覆盖真实标定或已观测的禁用状态。
+use_skill_estimates = true
 # 总分 = log(成功率) - 延迟惩罚 - 切换惩罚 + polished 奖励 - 降级代价。
 success_weight = 1.0
 latency_weight = 0.0001
@@ -105,6 +107,14 @@ polished_bonus = 0.05
 degradation_weight = 0.02
 minimum_capability = 0.05
 maximum_candidates_per_position = 32
+
+[calibration]
+# 两种主模式：androidworld（原有端到端配对标定）/ offline（无模拟器估计）。
+mode = "androidworld"
+# offline 下 prior 最快（不运行模型）；teacher-forcing 需要 --offline-dataset 与 GPU。
+offline_scorer = "prior"
+max_samples_per_skill = 8
+max_training_samples = 2000
 
 [maintenance]
 # 覆盖优先实验可设 admission_policy="success_once", build_hierarchy=true。

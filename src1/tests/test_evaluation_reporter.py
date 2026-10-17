@@ -20,7 +20,7 @@ from src1.pmtskill_v2.evaluation.reporter import (
 
 
 class EvaluationReporterTest(unittest.TestCase):
-    def test_seven_capability_classes_are_unique_and_complete(self):
+    def test_three_capability_classes_are_unique_and_complete(self):
         self.assertEqual(
             tuple(TASK_CLASSES),
             CAPABILITY_ORDER,
@@ -28,6 +28,12 @@ class EvaluationReporterTest(unittest.TestCase):
         tasks = [task for values in TASK_CLASSES.values() for task in values]
         self.assertEqual(len(tasks), len(set(tasks)))
         self.assertEqual(len(tasks), 116)
+        self.assertEqual(CAPABILITY_ORDER, ("reasoning", "coordination", "manipulation"))
+        self.assertEqual([len(TASK_CLASSES[key]) for key in CAPABILITY_ORDER], [40, 33, 43])
+        self.assertIn("SimpleCalendarAddOneEvent", TASK_CLASSES["reasoning"])
+        self.assertIn("RecipeDeleteMultipleRecipesWithNoise", TASK_CLASSES["reasoning"])
+        self.assertIn("BrowserMaze", TASK_CLASSES["coordination"])
+        self.assertIn("ContactsAddContact", TASK_CLASSES["manipulation"])
 
     def test_capability_score_is_episode_weighted_and_missing_is_na(self):
         distribution, unclassified = summarize_capabilities(
@@ -42,7 +48,7 @@ class EvaluationReporterTest(unittest.TestCase):
                     "episodes": 3,
                     "success_rate": 1.0,
                 },
-                "ContactsAddContact": {
+                "SimpleCalendarAddOneEvent": {
                     "successes": 0,
                     "episodes": 1,
                     "success_rate": 0.0,
@@ -55,11 +61,11 @@ class EvaluationReporterTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(distribution["control"]["successes"], 4)
-        self.assertEqual(distribution["control"]["episodes"], 5)
-        self.assertEqual(distribution["control"]["score"], 80.0)
-        self.assertEqual(distribution["create"]["score"], 0.0)
-        self.assertIsNone(distribution["edit"]["score"])
+        self.assertEqual(distribution["manipulation"]["successes"], 4)
+        self.assertEqual(distribution["manipulation"]["episodes"], 5)
+        self.assertEqual(distribution["manipulation"]["score"], 80.0)
+        self.assertEqual(distribution["reasoning"]["score"], 0.0)
+        self.assertIsNone(distribution["coordination"]["score"])
         self.assertEqual(unclassified, ["FutureAndroidWorldTask"])
 
     def test_nan_reward_is_not_reported_as_success(self):
@@ -186,10 +192,10 @@ class EvaluationReporterTest(unittest.TestCase):
                 metadata={"model_id": "student-vl"},
             )
             markdown = artifacts.report_markdown.read_text(encoding="utf-8")
-            self.assertIn("## 七维能力分布", markdown)
-            self.assertIn("| Interactive | 1/1 |", markdown)
+            self.assertIn("## 三类能力分布", markdown)
+            self.assertIn("| Coordination | 1/1 |", markdown)
             self.assertEqual(
-                artifacts.summary["capability_distribution"]["interactive"][
+                artifacts.summary["capability_distribution"]["coordination"][
                     "score"
                 ],
                 100.0,
@@ -202,7 +208,7 @@ class EvaluationReporterTest(unittest.TestCase):
                 self.assertTrue(
                     (Path(directory) / "capability_distribution.pdf").is_file()
                 )
-                self.assertIn("![七维能力分布]", markdown)
+                self.assertIn("![三类能力分布]", markdown)
             else:
                 self.assertIn("capability_plot_error", artifacts.summary)
 

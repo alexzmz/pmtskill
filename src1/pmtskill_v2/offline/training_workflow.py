@@ -595,7 +595,7 @@ class TrainingEvaluationRecorder:
             "report_markdown": str(artifacts.report_markdown),
             "traces_jsonl": str(artifacts.traces_jsonl) if artifacts.traces_jsonl else None,
             "artifact_dir": str(artifacts.output_dir),
-            # 在训练总报告中保留每阶段七维能力，避免只能逐目录翻 report.md。
+            # 在训练总报告中保留每阶段三类能力，避免只能逐目录翻 report.md。
             "capability_distribution": summary.get(
                 "capability_distribution", {}
             ),
@@ -753,7 +753,7 @@ class TrainingEvaluationRecorder:
             lines.extend(
                 (
                     "",
-                    "## 各阶段七维能力变化",
+                    "## 各阶段三类能力变化",
                     "",
                     "分数为对应能力下已评测有效 episode 的 Micro SR × 100；"
                     "`N/A` 表示本次固定样本未覆盖该能力。",
@@ -808,7 +808,7 @@ class TrainingEvaluationRecorder:
             lines.extend(
                 (
                     "",
-                    "## 训练后裸模型七维能力",
+                    "## 训练后裸模型三类能力",
                     "",
                     f"- 对应阶段：`{final_standalone['label']}`",
                     "- 这里只统计固定评测样本中实际覆盖的任务；覆盖率见下表。",
@@ -835,7 +835,7 @@ class TrainingEvaluationRecorder:
                 lines.extend(
                     (
                         "",
-                        "![训练后裸模型七维能力]"
+                        "![训练后裸模型三类能力]"
                         f"({final_capability_plot['png']})",
                     )
                 )

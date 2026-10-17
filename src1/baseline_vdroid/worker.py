@@ -145,6 +145,35 @@ def _select_tasks(registry_items: Mapping[str, Any], request: Mapping[str, Any])
     return sorted(random.Random(int(request["seed"])).sample(available, count))
 
 
+def _contain_qwen_harness(suite_utils: Any, output_dir: Path) -> None:
+    """Keep upstream per-task logs in the run, and stop on broken emulator UI."""
+    from src1.pmtskill_v2.evaluation.recovery import (
+        AndroidWorldInfrastructureError, is_infrastructure_failure,
+    )
+
+    original_episode = suite_utils.run_episode
+    original_task = suite_utils._run_task
+
+    def run_episode(*args, **kwargs):
+        previous = Path.cwd()
+        try:
+            os.chdir(output_dir)
+            return original_episode(*args, **kwargs)
+        finally:
+            os.chdir(previous)
+
+    def run_task(*args, **kwargs):
+        result = original_task(*args, **kwargs)
+        if is_infrastructure_failure(result):
+            raise AndroidWorldInfrastructureError(
+                "V-Droid-Qwen emulator infrastructure unavailable; stop instead of recording false SR=0: "
+                + str(result.get("exception_info", "")))
+        return result
+
+    suite_utils.run_episode = run_episode
+    suite_utils._run_task = run_task
+
+
 def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
     v_droid_root = Path(str(request["v_droid_root"])).resolve()
     output_dir = Path(str(request["output_dir"])).resolve()
@@ -155,7 +184,8 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
     if model.get("cuda_visible_devices") is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(model["cuda_visible_devices"])
-    _configure_assistant_environment(assistant)
+    if not request.get("qwen_adapter"):
+        _configure_assistant_environment(assistant)
 
     os.chdir(v_droid_root)
     sys.path.insert(0, str(v_droid_root))
@@ -165,6 +195,13 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
     from android_world import registry, suite_utils
     from android_world.agents import vdroid
     from android_world.env import env_launcher
+
+    if request.get("qwen_adapter"):
+        from src1.baseline_vdroid.qwen import install_qwen_backend
+
+        adapted = request["qwen_adapter"]
+        install_qwen_backend(vdroid, ray, adapted["profile"], adapted["score_workers"])
+        _contain_qwen_harness(suite_utils, output_dir)
 
     from src1.baseline_vdroid.reporting import compact_vdroid_result_for_storage, write_vdroid_report
     from src1.pmtskill_v2.core.io import write_json_atomic
@@ -237,8 +274,12 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
                 save_name=output_dir.name,
             )
         episodes = progress.episodes()
+        from src1.pmtskill_v2.evaluation.recovery import ensure_valid_evaluation_episodes
+
+        ensure_valid_evaluation_episodes(
+            episodes, expected_episodes=sum(len(items) for items in suite.values()))
         metadata = {
-            "evaluation_mode": "vdroid",
+            "evaluation_mode": "vdroid_qwen_adapted" if request.get("qwen_adapter") else "vdroid",
             "report_title": "V-Droid AndroidWorld Baseline",
             "protocol": request["protocol"],
             "comparison_protocol": "same-tasks-seed-combinations-and-step-cap",
@@ -262,6 +303,13 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             "episode_storage": "compact_vdroid_without_screenshots_or_tree",
             "resume": progress.metadata(),
         }
+        if request.get("qwen_adapter"):
+            metadata.update({
+                "baseline_variant": "Qwen adaptation, NOT original trained Llama verifier",
+                "verifier_scoring": "normalized Yes/No token log-probabilities, NOT learned value head",
+                "evaluation_checkpoint": model["verifier_adapter"],
+                "auxiliary_model": "same fixed Qwen adapter; no external teacher",
+            })
         artifacts = write_vdroid_report(
             output_dir,
             episodes,
@@ -269,7 +317,7 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             store_trajectories=bool(request.get("store_trajectories", True)),
         )
         result = {
-            "evaluation_mode": "vdroid",
+            "evaluation_mode": metadata["evaluation_mode"],
             "summary": artifacts.summary,
             "summary_json": str(artifacts.summary_json),
             "report_markdown": str(artifacts.report_markdown),

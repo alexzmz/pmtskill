@@ -160,6 +160,11 @@ def vdroid_resume_specification(request: Mapping[str, Any]) -> dict[str, Any]:
     # GPU 编号只影响部署位置，不改变固定 verifier。
     spec["model"] = {key: value for key, value in request["model"].items()
                      if key != "cuda_visible_devices"}
+    if request.get("qwen_adapter"):
+        spec["qwen_adapter"] = {key: value for key, value in request["qwen_adapter"].items()
+                                if key != "profile"}
+        spec["assistant"] = {key: value for key, value in request["assistant"].items()
+                             if key != "base_url"}
     return spec
 
 

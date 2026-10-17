@@ -1436,6 +1436,46 @@ def command_evaluate_simple_skills(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_evaluate_fixed_baseline(args: argparse.Namespace) -> int:
+    """Fixed-adapter SKVM or explicitly adapted Qwen V-Droid baseline."""
+
+    config = load_config(args.config)
+    args.resume = _evaluation_resume(config, args)
+    args.store_trajectories = _evaluation_store_trajectories(config, args)
+    if not args.output_dir:
+        raise ValueError("此 baseline 请显式提供 --output-dir，便于批次续跑")
+    is_skvm = args.command == "evaluate-skvm"
+    store = _open_evaluation_skill_store(config, args.skill_database) if is_skvm else None
+    if is_skvm and args.skvm_profile_instances <= 0:
+        raise ValueError("--skvm-profile-instances 必须为正数")
+    if not is_skvm and (args.vdroid_score_workers <= 0 or args.vdroid_search_iterations <= 0):
+        raise ValueError("V-Droid workers/search-iterations 必须为正数")
+    deployment, bindings = _adapter_deployment(
+        config, store, args, [args.adapter_path], [args.model_id] if args.model_id else None)
+    if args.dry_run:
+        if not is_skvm:
+            from ..baseline_vdroid.qwen import evaluator_for_adapter
+
+            evaluator = evaluator_for_adapter(config, deployment.profiles()[0], args, _tasks(args.tasks))
+            _print(evaluator.dry_run())
+        return _dry_evaluation_result(args.command, deployment, bindings, args,
+                                      resume=args.resume, store_trajectories=args.store_trajectories)
+    config.ensure_runtime_dirs()
+    tasks = _evaluation_tasks(config, args)
+    with deployment.activate_adapters() as profiles:
+        if is_skvm:
+            from ..baseline_skvm.evaluator import run_skvm
+
+            artifacts = run_skvm(config, store, profiles[0], args, tasks)
+            _print(_evaluation_result(mode="skvm", artifacts=artifacts, bindings=bindings,
+                                      skill_database=store.database))
+        else:
+            from ..baseline_vdroid.qwen import evaluator_for_adapter
+
+            _print(evaluator_for_adapter(config, profiles[0], args, tasks).run())
+    return 0
+
+
 def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
     """接口三：多 adapter 模型池 + PMT-Skill 规划、技能和动态路由。"""
 
@@ -2328,6 +2368,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_evaluation_arguments(simple)
     _add_skill_evaluation_arguments(simple)
     simple.set_defaults(handler=command_evaluate_simple_skills)
+
+    for mode in ("skvm", "vdroid-qwen"):
+        baseline = subparsers.add_parser(
+            f"evaluate-{mode}", help=f"固定 adapter 的 {mode} baseline（V-Droid-Qwen 为明确改造版）")
+        baseline.add_argument("--adapter-path", required=True)
+        baseline.add_argument("--model-id")
+        _add_common_evaluation_arguments(baseline)
+        if mode == "skvm":
+            _add_skill_evaluation_arguments(baseline)
+            baseline.add_argument("--skvm-prepare", choices=["auto", "force", "reuse"], default="auto")
+            baseline.add_argument("--skvm-command")
+            baseline.add_argument("--skvm-cache-dir")
+            baseline.add_argument("--skvm-profile-instances", type=int, default=3)
+            baseline.add_argument("--skvm-aot-pass-sets", nargs="+", default=["1", "1,3"])
+        else:
+            baseline.add_argument("--vdroid-root")
+            baseline.add_argument("--vdroid-score-workers", type=int, default=4)
+            baseline.add_argument("--vdroid-search-iterations", type=int, default=1)
+        baseline.set_defaults(handler=command_evaluate_fixed_baseline)
 
     evaluate = subparsers.add_parser(
         "evaluate-pmtskill",

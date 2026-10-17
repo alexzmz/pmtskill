@@ -505,6 +505,19 @@ def write_skvm_evaluation(
         loaded_android = _read_json(android_report_path)
         if isinstance(loaded_android, Mapping):
             android_report = loaded_android
+    elif (run_dir / "summary.json").is_file():
+        # src1 uses the same kernel reporter with the newer M3A result schema.
+        android_report_path = run_dir / "summary.json"
+        current = _read_json(android_report_path)
+        total = int(current.get("episodes_total", 0))
+        evaluated = int(current.get("episodes_evaluated", 0))
+        android_report = {
+            "run": current.get("metadata"),
+            "summary": {"attempted_episodes": total, "scored_episodes": evaluated,
+                        "error_episodes": total - evaluated,
+                        "task_success_rate": current.get("success_rate_micro")
+                        if current.get("evaluation_available") else None},
+        }
 
     validity = _performance_validity(
         android_report, runtime_stats, capability_summary

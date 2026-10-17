@@ -1,6 +1,10 @@
 # PMT-Skill v2：AndroidWorld VL 蒸馏与动态技能路由
 
-本目录是一个与旧 `src` 完全隔离的新框架。它按照 PPT 的思路实现三条闭环：
+五方法串行对比（四个 baseline 固定 control01，PORTS 使用三个 adapter）：见
+[批量评测说明](BATCH_EVALUATION.md)，入口为 `python -m src1.batch_evaluate`。
+
+本目录是新框架，主体与旧 `src` 隔离；`evaluate-skvm` 显式复用旧 runner 的 SKVM
+内核集成代码，但不复用旧 T3A 评测流程。它按照 PPT 的思路实现三条闭环：
 
 1. **离线监督蒸馏**：教师 VL 模型在 AndroidWorld 生成带截图的
    `[Reason-Action-Observation]` 轨迹，学生 VL 模型通过 ms-swift LoRA 学习。

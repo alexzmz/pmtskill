@@ -200,6 +200,16 @@ def write_vdroid_report(
         f"| 被选动作平均 verifier 分数 | {score_text} |\n"
         f"| 动作补全次数 | {vdroid_metrics['action_completion_calls']} |\n"
     )
+    if metadata.get("evaluation_mode") == "vdroid_qwen_adapted":
+        markdown = markdown.replace("# V-Droid AndroidWorld Baseline 评测报告",
+                                    "# V-Droid-Qwen（改造版）AndroidWorld 评测报告", 1)
+        markdown += (
+            "\n## 与原版 V-Droid 的区别\n\n"
+            "保留原生 UI 候选枚举、动作补全、工作记忆与搜索；固定 Qwen adapter "
+            "替代专用 Llama verifier 和 GPT 辅助模型。候选分数是归一化 Yes/No "
+            "token 概率，不是原版训练的 value head，也不是实测 SR。"
+            "不得把此结果标为原论文 V-Droid 的复现结果。\n"
+        )
     artifacts.report_markdown.write_text(markdown, encoding="utf-8")
     return artifacts
 

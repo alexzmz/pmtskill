@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 import dataclasses
+import contextlib
+import functools
+import inspect
 import logging
 import random
 import uuid
@@ -25,7 +28,11 @@ from ..core.models import (
 )
 from ..inference.model_pool import ModelPool
 from ..inference.vlm import OpenAICompatibleVLClient
-from ..offline.collector import bootstrap_android_world
+from ..offline.collector import (
+    _supports_keyword,
+    bootstrap_android_world,
+    enforce_episode_step_limit,
+)
 from ..offline.dataset import infer_action_primitives
 from ..online.executor import (
     ForcedSkillVLWrapper,
@@ -95,21 +102,80 @@ def _evaluation_progress(
     )
 
 
+@contextlib.contextmanager
+def _legacy_task_success_termination(suite_utils: Any):
+    """Supply the missing stop-on-success option without editing AndroidWorld.
+
+    Bind the verifier to the CURRENT task only, preserve an existing termination
+    callback, and restore every hook even if a task/evaluator raises. This wraps
+    the same episode boundary as the existing recovery and step-limit guards.
+    """
+    original_task = suite_utils._run_task
+    runner = suite_utils.episode_runner
+    original_episode = runner.run_episode
+    episode_signature = inspect.signature(original_episode)
+    active_tasks: list[Any] = []
+
+    @functools.wraps(original_task)
+    def run_task(*args: Any, **kwargs: Any):
+        active_tasks.append(args[0] if args else kwargs["task"])
+        try:
+            return original_task(*args, **kwargs)
+        finally:
+            active_tasks.pop()
+
+    @functools.wraps(original_episode)
+    def run_episode(*args: Any, **kwargs: Any):
+        if not active_tasks:
+            return original_episode(*args, **kwargs)
+        bound = episode_signature.bind_partial(*args, **kwargs)
+        original_termination = bound.arguments.get("termination_fn")
+        task = active_tasks[-1]
+
+        def termination(environment):
+            if original_termination is not None and original_termination(environment):
+                return True
+            return successful_episode_value(task.is_successful(environment))
+
+        bound.arguments["termination_fn"] = termination
+        return original_episode(*bound.args, **bound.kwargs)
+
+    suite_utils._run_task = run_task
+    runner.run_episode = run_episode
+    try:
+        yield
+    finally:
+        runner.run_episode = original_episode
+        suite_utils._run_task = original_task
+
+
 def _run_evaluation_suite(
     suite_utils: Any, suite: Any, agent: Any, environment: Any,
     config: ProjectConfig, progress: EvaluationProgress, *, max_steps: int,
     continue_on_infrastructure_failure: bool = False,
 ) -> list[dict[str, Any]]:
-    with recover_infrastructure_failures(
-        suite_utils, environment, config.android_world,
-        continue_on_infrastructure_failure=continue_on_infrastructure_failure,
-    ):
-        with progress.watch(suite_utils, suite):
-            return suite_utils.run(
-                suite, agent, checkpointer=progress, demo_mode=False,
-                return_full_episode_data=True, max_n_steps_override=max_steps,
-                stop_on_task_success=config.android_world.stop_on_task_success,
-            )
+    max_steps = _evaluation_max_steps(max_steps)
+    run = suite_utils.run
+    options: dict[str, Any] = {
+        "checkpointer": progress, "demo_mode": False, "return_full_episode_data": True,
+    }
+    native_step_limit = _supports_keyword(run, "max_n_steps_override")
+    native_stop = _supports_keyword(run, "stop_on_task_success")
+    if native_step_limit:
+        options["max_n_steps_override"] = max_steps
+    if native_stop:
+        options["stop_on_task_success"] = config.android_world.stop_on_task_success
+    with contextlib.ExitStack() as stack:
+        if not native_step_limit:
+            stack.enter_context(enforce_episode_step_limit(suite_utils, max_steps))
+        if not native_stop and config.android_world.stop_on_task_success:
+            stack.enter_context(_legacy_task_success_termination(suite_utils))
+        stack.enter_context(recover_infrastructure_failures(
+            suite_utils, environment, config.android_world,
+            continue_on_infrastructure_failure=continue_on_infrastructure_failure,
+        ))
+        stack.enter_context(progress.watch(suite_utils, suite))
+        return run(suite, agent, **options)
 
 
 def _evaluation_max_steps(value: int) -> int:

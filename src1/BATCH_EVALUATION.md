@@ -60,7 +60,7 @@ PORTS 使用现有分层规划/路由，不改变生命周期或离线估算记�
   standalone 一样的 src1 M3A、报告和恢复协议。默认 profiler + p1/p1p3 编译，
   每次请求选择适配变体，无 PORTS 模型切换，多模态截图传给模型。缓存按实际权重和
   技能内容隔离，不把 PORTS prior 当作 TCP。需要 `skvm` 可执行文件，或 Bun 与已安装
-  依赖的 `libs/skvm`。首次准备可能较慢。`--skvm-prepare reuse` 要求完整缓存；
+  依赖的 `libs/skvm`。首次准备可能较慢。`--skvm-prepare reuse` 要求完整 TCP，默认允许缺失变体明确回退；
   `--skvm-command /path/to/skvm` 指定程序。
 - `evaluate-vdroid-qwen`：**改造版，不是原论文结果**。保留原生 UI 候选枚举、动作
   补全、工作记忆和搜索，固定 Qwen adapter 替代专用 Llama verifier 和 GPT。
@@ -79,7 +79,7 @@ ms-swift 可能同时返回有效的 `tool_calls` 和 `finish_reason="stop"`，�
 现有 Python 启动器会自动启动仅监听本机的兼容桥，将这类有效调用的结束标记
 修正为 `tool_calls`；不从文本猜测工具，不修改参数，不改动截断或过滤响应。
 因此继续使用 `/root/.local/bin/skvm` 二进制也可以生效，无需先重新编译。
-必须同时同步根目录 `src/` 和 `src1/`，包含新增的 `src/skvm_artifacts.py`，不能只同步 `src1`。
+必须同时同步根目录 `src/` 和 `src1/`，包含 `src/skvm_artifacts.py`、`src/skvm_stability.py`，不能只同步 `src1`。
 
 旧 TCP/AOT 缓存保留原样，新结果自动放在原缓存根目录的 `openai-tool-calls-v2/`
 子目录，避免把旧的错误 L0 画像继续复用。使用默认 `--skvm-prepare auto` 即可重新准备，
@@ -87,7 +87,8 @@ ms-swift 可能同时返回有效的 `tool_calls` 和 `finish_reason="stop"`，�
 准备完成后 `skvm/protocol-compat.json` 记录被修正的响应数量。
 正式评测阶段仍直接连接原模型服务，不经过这个桥。
 如果旧 SKVM 已经产生正式 episode，批量脚本会自动改用
-`skvm/openai-tool-calls-v2-bounded-tool-evidence-v1/` 保存重测结果，不改动旧文件，也不重测其他已完成方法。
+`skvm/openai-tool-calls-v2-bounded-tool-evidence-v1-valid-aot-or-original-v1/`
+保存新协议的重测结果，不改动旧文件，也不重测其他已完成方法。
 只有 profiling/AOT 阶段中断的批次继续使用原来的 `skvm/` 目录。
 单独使用 `evaluate-skvm` 时，旧 episode 目录会被明确拒绝，需要指定新输出目录。
 
@@ -100,8 +101,9 @@ ms-swift 可能同时返回有效的 `tool_calls` 和 `finish_reason="stop"`，�
 旧版不存在的 pass 成功记录；`variants.csv` 中用 `plan_schema` 和
 `pass_telemetry_available` 区分。无 gap 时变体与原文相同是合法的编译结果。
 
-默认 `--skvm-prepare auto` 会检查 `SKILL.md`、编译计划、SCR、guard 和新版 pass 状态，
-只重试不完整/不合格的变体。编译器预先复制但未编译成功的原始 `SKILL.md` 不算缓存命中。
+`--skvm-prepare auto` 会检查 `SKILL.md`、编译计划、SCR、guard 和新版 pass 状态。
+在 `--skvm-failure-policy strict` 下要求所有指定变体合格；默认的 `fallback` 策略见下文。
+编译器预先复制但未编译成功的原始 `SKILL.md` 不算成功的 AOT 缓存命中。
 重编译前的旧计划及技能成对备份到缓存中的 `kernel-backups/`，防止失败后用旧计划认证原文。
 不必删除缓存、不必改 TOML、不必换 SkVM 二进制；保持原批量命令和 `--resume` 即可。
 
@@ -120,6 +122,42 @@ ms-swift 可能同时返回有效的 `tool_calls` 和 `finish_reason="stop"`，�
 `skvm/protocol-compat.json` 记录窗口、策略、摘录次数、输出限额、重试和未解决错误数；
 正式报告 metadata 中也保存准备统计。上下文策略更改前的正式 episode 不与新结果混跑，
 批量脚本自动隔离到上述新子目录；本次若仅在 profiling/AOT 中断，则保留原目录续跑。
+
+### SKVM 稳定 baseline：单个变体失败不阻塞整场测试
+
+`evaluate-skvm` 和批量脚本现在默认使用 `--skvm-failure-policy fallback`。
+现有批次只在准备阶段失败时，可以直接用原命令、原目录、`--resume` 重跑，
+不用删缓存、不用改 TOML、不用修改或重新编译 `libs/skvm`。
+
+每个技能的固定准备规则如下：
+
+1. 优先复用已通过校验的 `p1p3`；如果它不合格但已有合格 `p1`，立即复用 `p1`，不再花一轮时间升级。
+2. 没有合格缓存时，先编译 `p1p3`，失败的技能做有限重试，再尝试 `p1`。
+   `--skvm-compile-retries 1` 表示每个变体额外重试一次（默认值）；可设置 0–3。
+   已成功的技能不会因同一批次其他技能失败而重编。
+3. 所有指定变体均不合格时，保留原始技能，明确标记为 original/unadapted fallback。
+   不修改 `guardPassed`，不忽略验证错误，不删除 AndroidWorld 测试任务，也不修改官方任务得分。
+4. 配置错误、缺失 API key、模型服务不可用或损坏的 TCP 仍然报错；
+   不能把整套框架不可用伪装成正常 SKVM 测试或 SR=0。
+
+这是一种明确声明的容错改造版 baseline，并不承诺一定完成（例如模拟器或 GPU 真正故障时仍需恢复）。
+若所有技能均回退原文，任务 SR 仍按真实结果报告，但 `skvm_report` 不会标记为有效的 SKVM 适配效果对比。
+原始技能回退的请求不计入 `skvm_adapted_requests`；混合请求同时报告请求级和技能选择级覆盖率。
+
+开始正式测试前，选择的技能正文、计划和 TCP 会冻结在本轮目录，
+`skvm/preparation.json` 记录每个技能的选用版本、失败原因、guard 失败数、编译尝试数和 AOT 覆盖率。
+技能文件位于 `skvm/prepared-skills/<generation>/`。自动续跑只复用这些快照，
+不会因为共享缓存后来多出一个更好的变体而改变后半程条件。
+已有正式 episode 时不允许 `--skvm-prepare force` 改写技能选择；需要新输出目录。
+
+`skvm/runtime-stats.json` 只保存聚合计数，即使 `--no-store-trajectories` 也会保存，
+用于累计中断前后的适配/回退次数；不含逐步动作、截图或请求正文。
+`summary.json` metadata、`skvm_report.json/md` 和批量 `comparison.json/csv/md`
+均注明适配覆盖率/原文回退情况。
+
+若需要恢复原来的严格模式，添加 `--skvm-failure-policy strict`。
+独立旧入口 `src/task_runner_skvm.py` 保持 strict 默认值，需用下划线参数
+`--skvm_failure_policy fallback` 显式开启新策略。
 
 ## 解读限制
 

@@ -2382,6 +2382,10 @@ def build_parser() -> argparse.ArgumentParser:
             baseline.add_argument("--skvm-cache-dir")
             baseline.add_argument("--skvm-profile-instances", type=int, default=3)
             baseline.add_argument("--skvm-aot-pass-sets", nargs="+", default=["1", "1,3"])
+            baseline.add_argument("--skvm-failure-policy", choices=["fallback", "strict"], default="fallback",
+                                  help="默认复用合格 AOT；变体失败回退其他 AOT/原技能并记录，不删测试任务")
+            baseline.add_argument("--skvm-compile-retries", type=int, choices=range(4), default=1,
+                                  help="无合格缓存时，每个变体的额外编译重试次数（0–3，默认 1）")
         else:
             baseline.add_argument("--vdroid-root")
             baseline.add_argument("--vdroid-score-workers", type=int, default=4)

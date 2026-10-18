@@ -29,7 +29,7 @@ from .pmtskill_v2.core.config import load_config
 from .pmtskill_v2.core.io import write_json_atomic
 from .pmtskill_v2.evaluation.capabilities import CAPABILITY_ORDER
 from .baseline_skvm.protocol import (SKVM_TOOL_PROTOCOL, SKVM_CONTEXT_POLICY,
-                                     SKVM_EVALUATION_PROTOCOL, output_for_protocol)
+                                     SKVM_EVALUATION_PROTOCOL, SKVM_STABILITY_POLICY, output_for_protocol)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +84,8 @@ def build_parser():
     parser.add_argument("--skvm-command")
     parser.add_argument("--skvm-prepare", choices=("auto", "reuse", "force"), default="auto")
     parser.add_argument("--skvm-profile-instances", type=int, default=3)
+    parser.add_argument("--skvm-failure-policy", choices=("fallback", "strict"), default="fallback")
+    parser.add_argument("--skvm-compile-retries", type=int, choices=range(4), default=1)
     parser.add_argument("--vdroid-root", help="默认查找 libs/V-Droid 或 libs/v-droid")
     parser.add_argument("--vdroid-score-workers", type=int, default=4)
     parser.add_argument("--vdroid-search-iterations", type=int, default=1)
@@ -113,7 +115,7 @@ def build_commands(args, adapters=None, tasks=None):
     for method in dict.fromkeys(args.methods):
         folder = output / method.replace("-", "_")
         if method == "skvm":
-            folder = output_for_protocol(folder)
+            folder = output_for_protocol(folder, args.skvm_failure_policy)
         command = [sys.executable, "-m", "src1", "--config", str(Path(args.config).resolve()),
                    "--log-dir", str(folder / "cli_logs"), COMMANDS[method], *common,
                    "--output-dir", str(folder)]
@@ -131,6 +133,8 @@ def build_commands(args, adapters=None, tasks=None):
                         "--skvm-profile-instances", str(args.skvm_profile_instances)]
             if args.skvm_command:
                 command += ["--skvm-command", args.skvm_command]
+            command += ["--skvm-failure-policy", args.skvm_failure_policy,
+                        "--skvm-compile-retries", str(args.skvm_compile_retries)]
         if method == "vdroid":
             command += ["--vdroid-score-workers", str(args.vdroid_score_workers),
                         "--vdroid-search-iterations", str(args.vdroid_search_iterations)]
@@ -176,6 +180,10 @@ def read_summary(job, expected):
             metadata = summary.get("metadata")
             complete = complete and isinstance(metadata, dict) and metadata.get("skvm_tool_protocol") == SKVM_TOOL_PROTOCOL
             complete = complete and metadata.get("skvm_context_policy") == SKVM_CONTEXT_POLICY
+            policy_flag = job.get("command", [])
+            strict = ("--skvm-failure-policy" in policy_flag
+                      and policy_flag[policy_flag.index("--skvm-failure-policy") + 1] == "strict")
+            complete = complete and metadata.get("skvm_stability_policy") == ("strict" if strict else SKVM_STABILITY_POLICY)
         return summary, complete
     except (OSError, ValueError, TypeError, AttributeError):
         return {}, False
@@ -190,6 +198,9 @@ def comparison_rows(jobs, state, expected):
         status = result.get("status", "pending")
         if status == "completed" and not complete:
             status = "pending"
+        metadata = summary.get("metadata")
+        preparation = metadata.get("skvm_compilation") if isinstance(metadata, dict) else None
+        preparation = preparation if isinstance(preparation, dict) else {}
         row = {"method": "vdroid-qwen-adapted" if job["method"] == "vdroid" else job["method"],
                "status": status, "expected_episodes": expected,
                "episodes_evaluated": summary.get("episodes_evaluated"),
@@ -199,6 +210,8 @@ def comparison_rows(jobs, state, expected):
                "average_steps": summary.get("average_steps") if valid else None,
                "average_run_time_seconds": summary.get("average_run_time_seconds") if valid else None,
                "average_model_switches": summary.get("average_model_switches") if valid else None,
+               "skvm_aot_coverage": preparation.get("aot_coverage") if valid and job["method"] == "skvm" else None,
+               "skvm_original_fallback_skills": preparation.get("original_fallback_skills") if valid and job["method"] == "skvm" else None,
                "output_dir": job["output_dir"], "error": result.get("error", "")}
         for category in CAPABILITY_ORDER:
             row[category] = (summary.get("capability_distribution", {}).get(category, {}).get("score")
@@ -234,6 +247,13 @@ def write_comparison(output, jobs, state, expected):
                      f"{percent(row['micro_sr'])} | {percent(row['macro_sr'])} | "
                      f"{number(row['delta_micro_sr_pp'])} | {number(row['reasoning'])} | "
                      f"{number(row['coordination'])} | {number(row['manipulation'])} |")
+    for row in rows:
+        if row["method"] == "skvm" and row.get("skvm_aot_coverage") is not None:
+            lines.append("")
+            lines.append(f"SKVM 合格 AOT 技能覆盖率：{percent(row['skvm_aot_coverage'])}；"
+                         f"原始（未适配）技能回退数：{row['skvm_original_fallback_skills']}。"
+                         "若覆盖率为 0，本轮是原始技能回退结果，不代表 SKVM 适配效果。")
+            lines.append("")
     lines += ["", "技能库使用批次开始时的冻结快照，三个技能方法各用独立副本。"
               "默认不保存完整轨迹，保留报告、轻量 checkpoint、日志和 SKVM 编译/能力评估产物。",
               "PORTS 的增益包含多 adapter 池的影响，不是等模型资源的纯算法消融。",
@@ -327,6 +347,10 @@ def run(args):
             "vdroid": {"source": args.vdroid_root, "workers": args.vdroid_score_workers,
                        "iterations": args.vdroid_search_iterations}}
     manifest_path = output / "batch_manifest.json"
+    # Keep old default batch specifications compatible when they stopped
+    # before episodes; kernel provenance separately isolates completed runs.
+    if args.skvm_failure_policy != "fallback" or args.skvm_compile_retries != 1:
+        spec["skvm"].update(failure_policy=args.skvm_failure_policy, compile_retries=args.skvm_compile_retries)
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not args.resume or manifest["specification"] != spec:

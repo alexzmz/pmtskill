@@ -269,6 +269,7 @@ def _variant_evaluation(
                     and item.get("status") == "failed"
                 ) if pass_runs else None,
                 "proposal_id": variant.proposal_id,
+                "fallback_reason": getattr(variant, "fallback_reason", None),
                 "source_path": str(variant.path),
                 "snapshot_path": str(snapshot),
             }
@@ -436,6 +437,20 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
             f"{item['purpose_count']} | {item['gap_count']} |"
         )
 
+    preparation = report.get("preparation") or {}
+    if preparation:
+        lines.extend(["", "## Preparation stability / fallback", "",
+                      f"- Policy: `{preparation.get('policy')}`",
+                      f"- Skills with validated AOT: `{preparation.get('skills_with_aot')}/{preparation.get('skills_total')}`",
+                      f"- AOT coverage: `{_format_percent(preparation.get('aot_coverage'))}`",
+                      f"- Alternative AOT selections: `{preparation.get('alternate_aot_skills', 0)}`",
+                      f"- Original (unadapted) fallbacks: `{preparation.get('original_fallback_skills', 0)}`",
+                      f"- Guard-failed variants: `{preparation.get('guard_failed_variants', 0)}`",
+                      f"- Compilation attempts: `{preparation.get('compile_attempts', 0)}`", ""])
+        for item in preparation.get("selections", []):
+            if item.get("fallback_reason"):
+                lines.append(f"- `{item['skill_id']}` → `{item['tag']}`: {item['fallback_reason']}")
+
     runtime = report["runtime_adaptation"]
     lines.extend(
         [
@@ -443,6 +458,10 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
             "## Runtime adaptation",
             "",
             f"- Adapted requests: `{runtime.get('skvm_adapted_requests', 0)}`",
+            f"- Original-only requests (not adapted): `{runtime.get('skvm_original_only_requests', 0)}`",
+            f"- Runtime adaptation coverage: `{_format_percent(runtime.get('skvm_adaptation_coverage'))}`",
+            f"- Adapted skill-selection coverage: `{_format_percent(runtime.get('skvm_adapted_selection_coverage'))}`",
+            f"- Fallback selections: `{json.dumps(runtime.get('skvm_fallback_selection_counts') or {}, ensure_ascii=False)}`",
             (
                 "- Variant sources: `"
                 f"{json.dumps(runtime.get('skvm_variant_source_counts') or {}, ensure_ascii=False, sort_keys=True)}`"
@@ -487,7 +506,8 @@ def write_skvm_evaluation(
     runtime_stats: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Write JSON/Markdown/CSV summaries plus immutable artifact snapshots."""
-    profile_source = _profile_path(cache_dir, adapter, target_model)
+    profile_source = (Path(manifest["profile_snapshot"]) if manifest.get("profile_snapshot")
+                      else _profile_path(cache_dir, adapter, target_model))
     tcp: Mapping[str, Any] | None = None
     profile_snapshot: Path | None = None
     if profile_source.is_file():
@@ -550,6 +570,7 @@ def write_skvm_evaluation(
             "purposes": purpose_rows,
         },
         "runtime_adaptation": dict(runtime_stats),
+        "preparation": manifest.get("preparation") or {},
         "android_world": {
             "report_path": (
                 str(android_report_path)

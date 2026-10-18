@@ -262,8 +262,10 @@ class SKVMToolProtocolTest(unittest.TestCase):
             marker = folder / "skvm" / "kernel-protocol.json"
             marker.parent.mkdir()
             from src.skvm_protocol import SKVM_CONTEXT_POLICY
+            from src.skvm_stability import SKVM_STABILITY_POLICY
             marker.write_text(json.dumps({"protocol": runner.SKVM_TOOL_PROTOCOL,
-                                           "context_policy": SKVM_CONTEXT_POLICY}), encoding="utf-8")
+                                           "context_policy": SKVM_CONTEXT_POLICY,
+                                           "preparation_policy": SKVM_STABILITY_POLICY}), encoding="utf-8")
             self.assertEqual(output_for_protocol(folder), folder)
             validate_protocol_resume(folder)
 

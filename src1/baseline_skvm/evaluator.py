@@ -16,7 +16,7 @@ from typing import Any
 
 from ..pmtskill_v2.core.io import write_json_atomic
 from ..pmtskill_v2.evaluation.resume import fingerprint, model_resume_identity
-from .protocol import SKVM_TOOL_PROTOCOL, SKVM_CONTEXT_POLICY, validate_protocol_resume
+from .protocol import SKVM_TOOL_PROTOCOL, SKVM_CONTEXT_POLICY, SKVM_STABILITY_POLICY, validate_protocol_resume
 
 
 def legacy_kernel_module():
@@ -55,7 +55,10 @@ class MultimodalAdaptiveClient:
                 raw["_pmtskill"] = {**raw.get("_pmtskill", {}),
                                     "skill_id": selected[0]["skill_id"],
                                     "skvm_selections": selected,
-                                    "routing_mode": "fixed_adapter_skvm_aot"}
+                                    "routing_mode": ("fixed_adapter_skvm_aot" if all(s.get("source") == "aot" for s in selected)
+                                                     else "fixed_adapter_skvm_with_original_fallback"),
+                                    "model_adapted": any(s.get("source") == "aot" for s in selected),
+                                    "fallback_used": any(s.get("fallback_reason") or s.get("source") == "original" for s in selected)}
             return text, safe, raw
         finally:
             self.proxy.images = []
@@ -77,7 +80,8 @@ def run_skvm(config, store, profile, args, tasks):
 
     legacy = legacy_kernel_module()
     target = Path(args.output_dir).expanduser().resolve()
-    validate_protocol_resume(target)
+    failure_policy = getattr(args, "skvm_failure_policy", "fallback")
+    validate_protocol_resume(target, failure_policy)
     skills = AndroidWorldSimpleSkillEvaluator(config, store)._skills(args.include_candidates)
     if not skills:
         raise ValueError("SKVM 没有可用技能；不会悄悄退化成 standalone")
@@ -106,6 +110,8 @@ def run_skvm(config, store, profile, args, tasks):
         skvm_profile_concurrency=1, skvm_compile_concurrency=1,
         skvm_profile_timeout_ms=120_000, skvm_compile_timeout_ms=300_000,
         skvm_profile_primitives=None, vllm_api_key="skvm-local",
+        skvm_failure_policy=failure_policy,
+        skvm_compile_retries=getattr(args, "skvm_compile_retries", 1),
         skvm_context_window=(getattr(args, "max_model_len", None)
                              or config.training_evaluation.max_model_len),
         skill_mode="inject", skvm_variant_policy="aot",
@@ -119,7 +125,8 @@ def run_skvm(config, store, profile, args, tasks):
         extra={"skvm_identity": identity, "protocol": "skvm-aot-m3a-v1"},
     )
     write_json_atomic(target / "skvm" / "kernel-protocol.json",
-                      {"protocol": SKVM_TOOL_PROTOCOL, "context_policy": SKVM_CONTEXT_POLICY})
+                      {"protocol": SKVM_TOOL_PROTOCOL, "context_policy": SKVM_CONTEXT_POLICY,
+                       "preparation_policy": SKVM_STABILITY_POLICY if failure_policy == "fallback" else "strict"})
     for source in sources:
         source.path.parent.mkdir(parents=True, exist_ok=True)
         source.path.write_text(source.content, encoding="utf-8")
@@ -138,9 +145,14 @@ def run_skvm(config, store, profile, args, tasks):
         trace_path=target / "skvm" / "adaptations.jsonl", trace_include_goal=False,
     )
     original_record = adaptive._record_event
+    stats_path = target / "skvm" / "runtime-stats.json"
+    if stats_path.is_file():
+        adaptive.restore_runtime_stats(json.loads(stats_path.read_text(encoding="utf-8")))
 
     def record_event(event):
         adaptive.last_selected = event.get("selected", [])
+        # Aggregate numbers only: preserve resume metrics with trajectories off.
+        write_json_atomic(stats_path, adaptive.get_stats())
         if args.store_trajectories:
             original_record(event)
 
@@ -181,13 +193,18 @@ def run_skvm(config, store, profile, args, tasks):
                       "skill_database": str(store.database), "available_skills": len(skills),
                       "tasks": tasks or "all", "n_task_combinations": args.combinations,
                       "seed": args.seed, "family": args.family, "max_steps": args.max_steps,
-                      "dynamic_model_routing": False, "skill_adaptation": True,
+                      "dynamic_model_routing": False,
+                      "skill_adaptation": any(v.source == "aot" for v in variants),
+                      "skvm_failure_policy": failure_policy,
+                      "skvm_stability_policy": SKVM_STABILITY_POLICY if failure_policy == "fallback" else "strict",
+                      "skvm_compilation": kernel.preparation_summary,
+                      "skvm_runtime_adaptation": adaptive.get_stats(),
                       "skvm_identity": identity, "skvm_variant_policy": "aot",
                       "skvm_tool_protocol": SKVM_TOOL_PROTOCOL,
                       "skvm_context_policy": SKVM_CONTEXT_POLICY,
                       "skvm_preparation": json.loads((target / "skvm" / "protocol-compat.json").read_text(encoding="utf-8"))
                           if (target / "skvm" / "protocol-compat.json").is_file() else {"mode": args.skvm_prepare},
-                      "skvm_runtime_counter_scope": "all_saved_requests" if args.store_trajectories else "current_invocation",
+                      "skvm_runtime_counter_scope": "all_invocations_aggregate",
                       "resume": progress.metadata()},
         )
     finally:

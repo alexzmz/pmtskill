@@ -54,6 +54,7 @@ import task_runner_detail
 import skvm_reporting
 from skvm_artifacts import annotation_errors, normalize_compilation_plan, referenced_primitives
 from skvm_protocol import SKVMProtocolBridge, SKVM_TOOL_PROTOCOL, SKVM_CONTEXT_POLICY, is_context_error
+from skvm_stability import SKVM_STABILITY_POLICY, SkVMCommandError, prepare_stable
 
 
 REPO_ROOT = task_runner_detail.REPO_ROOT
@@ -237,6 +238,7 @@ class SkillVariant:
     sha256: str
     plan: Mapping[str, Any] = field(default_factory=dict)
     proposal_id: str | None = None
+    fallback_reason: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "plan", normalize_compilation_plan(self.plan))
@@ -255,6 +257,7 @@ class SkillVariant:
             "gap_count": len(artifacts.get("gaps") or []),
             "guard_passed": self.plan.get("guardPassed"),
             "proposal_id": self.proposal_id,
+            "fallback_reason": self.fallback_reason,
         }
 
 
@@ -562,8 +565,13 @@ class SkVMKernel:
         ]
         self.log_path = run_dir / "skvm" / "kernel.log"
         self._command: list[str] | None = None
+        self._route_configured = False
         self._bridge: SKVMProtocolBridge | None = None
         self._repair_primitives: set[str] = set()
+        self.failure_policy = getattr(args, "skvm_failure_policy", "strict")
+        if self.failure_policy not in {"strict", "fallback"}:
+            raise ValueError("skvm_failure_policy must be strict or fallback")
+        self.preparation_summary: dict[str, Any] = {}
 
     def _cached_plan(self, skill, passes):
         folder = self._variant_dir(skill.skill_id, passes)
@@ -718,6 +726,7 @@ class SkVMKernel:
         ]
         routes.insert(0, local_route)
         _write_json(config_path, config)
+        self._route_configured = True
 
     def _run(self, command_args: Sequence[str], label: str) -> None:
         command = [*self._resolve_command(), *command_args]
@@ -744,15 +753,28 @@ class SkVMKernel:
                 bufsize=1,
             )
             assert process.stdout is not None
+            content_failure = False
+            infrastructure_failure = False
             for line in process.stdout:
                 print(line, end="", flush=True)
                 log.write(line)
+                if re.search(r"\[\d+/\d+\].*FAILED:|Guard failed:", line):
+                    content_failure = True
+                if re.search(r"API error (?:401|402|403|404|429|5\d\d)\b|ECONNREFUSED|"
+                             r"ProviderNetworkError|ProviderAuthError|Connection refused|fetch failed|Unknown (?:option|argument|provider)|"
+                             r"No API key|API.?key.*(?:missing|required|not set|not found)",
+                             line, re.IGNORECASE):
+                    infrastructure_failure = True
             return_code = process.wait()
         if return_code:
-            raise RuntimeError(
+            raise SkVMCommandError(
                 f"SkVM {label} failed with exit code {return_code}. "
-                f"See {self.log_path}."
+                f"See {self.log_path}.",
+                recoverable=content_failure and not infrastructure_failure,
             )
+        # Released binaries sometimes return zero even for failed API calls.
+        if infrastructure_failure:
+            raise SkVMCommandError(f"SkVM {label}: provider/configuration unavailable; see {self.log_path}")
 
     def _missing_variants(
         self, passes: tuple[int, ...]
@@ -795,7 +817,7 @@ class SkVMKernel:
                 self._bridge = None
                 try:
                     # Do not leave an ephemeral/dead proxy URL in persistent config.
-                    if (self.cache_dir / "skvm.config.json").is_file():
+                    if self._route_configured and (self.cache_dir / "skvm.config.json").is_file():
                         self._configure_local_route()
                     _write_json(self.run_dir / "skvm" / "protocol-compat.json", {
                         **bridge.summary(), "prepare_mode": self.args.skvm_prepare,
@@ -811,6 +833,8 @@ class SkVMKernel:
         mode = self.args.skvm_prepare
         if mode == "off":
             return self.load_variants(include_aot=False)
+        if self.failure_policy == "fallback":
+            return prepare_stable(self, SkillVariant, _read_json, _write_json)
 
         repair_path = self.cache_dir / "aot-profile-repair.json"
         if repair_path.is_file():
@@ -1033,6 +1057,9 @@ class SkVMKernel:
             "compiler_model": self.compiler_model,
             "adapter": SKVM_ADAPTER,
             "prepare_mode": self.args.skvm_prepare,
+            "failure_policy": self.failure_policy,
+            "preparation": self.preparation_summary,
+            "profile_snapshot": self.preparation_summary.get("profile_snapshot"),
             "aot_pass_sets": [list(item) for item in self.pass_sets],
             "variant_policy": self.args.skvm_variant_policy,
             "skills": [skill.manifest() for skill in self.skills],
@@ -1215,6 +1242,9 @@ class SkVMAdaptiveWrapper:
         self._request_count = 0
         self._skill_load_requests = 0
         self._adapted_requests = 0
+        self._injected_requests = 0
+        self._original_only_requests = 0
+        self._fallback_counts: Counter[str] = Counter()
         self._discovery_requests = 0
         self._injected_chars = 0
         self._source_counts: Counter[str] = Counter()
@@ -1249,23 +1279,62 @@ class SkVMAdaptiveWrapper:
                 self._request_count = max(
                     self._request_count, int(event.get("request_id") or 0)
                 )
-                self._injected_chars += int(event.get("injected_chars") or 0)
             except (TypeError, ValueError):
                 pass
-            self._adapted_requests += 1
-            self._phase_counts[str(event.get("phase") or "unknown")] += 1
-            for label in event.get("intent_labels") or []:
-                self._intent_counts[str(label)] += 1
-            for label in event.get("ui_state_labels") or []:
-                self._state_counts[str(label)] += 1
-            for selection in event.get("selected") or []:
-                if not isinstance(selection, Mapping):
-                    continue
-                self._source_counts[str(selection.get("source") or "unknown")] += 1
-                self._tag_counts[str(selection.get("variant") or "unknown")] += 1
+            self._accumulate_event(event)
+
+    def _accumulate_event(self, event):
+        selected = [s for s in (event.get("selected") or []) if isinstance(s, Mapping)]
+        adapted = any(s.get("source") in {"aot", "jit"} for s in selected)
+        self._injected_requests += 1
+        self._adapted_requests += int(adapted)
+        self._original_only_requests += int(bool(selected) and not adapted)
+        try:
+            self._injected_chars += int(event.get("injected_chars") or 0)
+        except (TypeError, ValueError):
+            pass
+        self._phase_counts[str(event.get("phase") or "unknown")] += 1
+        for label in event.get("intent_labels") or []:
+            self._intent_counts[str(label)] += 1
+        for label in event.get("ui_state_labels") or []:
+            self._state_counts[str(label)] += 1
+        for selection in selected:
+            source = str(selection.get("source") or "unknown")
+            self._source_counts[source] += 1
+            self._tag_counts[str(selection.get("variant") or "unknown")] += 1
+            if source == "original":
+                self._fallback_counts["original"] += 1
+            elif selection.get("fallback_reason"):
+                self._fallback_counts["alternate_aot"] += 1
 
     def reset_skill_session(self) -> None:
         self._session_skill_loaded = self.mode == "inject"
+
+    def restore_runtime_stats(self, stats):
+        """Restore aggregate-only counters without needing per-request traces."""
+        if stats.get("skvm_target_model") != self.target_model:
+            raise ValueError("SKVM runtime stats belong to a different target model")
+        counts = {"_request_count": "skvm_online_requests", "_adapted_requests": "skvm_adapted_requests",
+                  "_injected_requests": "skvm_injected_requests", "_original_only_requests": "skvm_original_only_requests",
+                  "_discovery_requests": "skvm_discovery_requests", "_skill_load_requests": "skill_load_requests",
+                  "_injected_chars": "skvm_injected_chars"}
+        counters = {"_source_counts": "skvm_variant_source_counts", "_tag_counts": "skvm_variant_tag_counts",
+                    "_fallback_counts": "skvm_fallback_selection_counts", "_intent_counts": "skvm_intent_counts",
+                    "_state_counts": "skvm_ui_state_counts", "_phase_counts": "skvm_phase_counts",
+                    "_environment_event_counts": "android_environment_events"}
+        restored = {}
+        for attr, key in counts.items():
+            value = stats.get(key, 0)
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(f"Invalid SKVM runtime counter: {key}")
+            restored[attr] = value
+        for attr, key in counters.items():
+            value = stats.get(key, {})
+            if not isinstance(value, dict) or any(not isinstance(v, int) or v < 0 for v in value.values()):
+                raise ValueError(f"Invalid SKVM runtime counter map: {key}")
+            restored[attr] = Counter(value)
+        for attr, value in restored.items():
+            setattr(self, attr, value)
 
     def record_environment_event(self, kind: str, error: BaseException) -> None:
         self._environment_event_counts[kind] += 1
@@ -1479,6 +1548,8 @@ class SkVMAdaptiveWrapper:
                     "purposes": purpose_ids,
                     "gaps": gap_labels,
                     "proposal_id": variant.proposal_id,
+                    "fallback_reason": variant.fallback_reason,
+                    "model_adapted": variant.source in {"aot", "jit"},
                 }
             )
 
@@ -1511,10 +1582,12 @@ class SkVMAdaptiveWrapper:
             ),
             "</skvm-adaptation>",
         ]
+        has_adapted = any(s["model_adapted"] for s in selections)
         adaptation = (
-            "SkVM has selected a target-model-specific skill variant for this "
-            "request. Follow it when relevant and preserve the surrounding "
-            "prompt's exact response format.\n"
+            ("SkVM selected validated model-adapted skills; any entries marked original are unadapted fallbacks. "
+             if has_adapted else
+             "No validated SkVM-compiled variant is available for these skills. The following ORIGINAL skills are unadapted fallbacks. ")
+            + "Follow them when relevant and preserve the surrounding prompt's exact response format.\n"
             + "\n".join(annotation_lines)
             + "\n\n"
             + "\n\n".join(skill_blocks)
@@ -1529,6 +1602,7 @@ class SkVMAdaptiveWrapper:
             "goal_sha256": _sha256(goal),
             "context_sha256": _sha256(context),
             "selected": selections,
+            "model_adapted": has_adapted,
             "injected_chars": len(adaptation),
         }
         if self.trace_include_goal:
@@ -1579,16 +1653,7 @@ class SkVMAdaptiveWrapper:
             self._session_skill_loaded = True
 
         adapted_prompt, event = self._adapt(text_prompt)
-        self._adapted_requests += 1
-        self._injected_chars += int(event["injected_chars"])
-        self._phase_counts[str(event["phase"])] += 1
-        for label in event["intent_labels"]:
-            self._intent_counts[str(label)] += 1
-        for label in event["ui_state_labels"]:
-            self._state_counts[str(label)] += 1
-        for selection in event["selected"]:
-            self._source_counts[str(selection["source"])] += 1
-            self._tag_counts[str(selection["variant"])] += 1
+        self._accumulate_event(event)
         self._record_event(event)
         return self.base_llm.predict(adapted_prompt)
 
@@ -1610,6 +1675,14 @@ class SkVMAdaptiveWrapper:
             "skvm_variant_policy": self.variant_policy,
             "skvm_online_requests": self._request_count,
             "skvm_adapted_requests": self._adapted_requests,
+            "skvm_injected_requests": self._injected_requests,
+            "skvm_original_only_requests": self._original_only_requests,
+            "skvm_adaptation_coverage": (self._adapted_requests / self._injected_requests
+                                         if self._injected_requests else None),
+            "skvm_adapted_selection_coverage": (
+                (self._source_counts["aot"] + self._source_counts["jit"]) / sum(self._source_counts.values())
+                if sum(self._source_counts.values()) else None),
+            "skvm_fallback_selection_counts": dict(self._fallback_counts),
             "skvm_discovery_requests": self._discovery_requests,
             "skill_load_requests": self._skill_load_requests,
             "skvm_injected_chars": self._injected_chars,
@@ -1766,6 +1839,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--skvm_profile_instances", type=int, default=3)
     prepare.add_argument("--skvm_profile_concurrency", type=int, default=1)
     prepare.add_argument("--skvm_compile_concurrency", type=int, default=1)
+    prepare.add_argument("--skvm_failure_policy", choices=("strict", "fallback"), default="strict",
+                         help="strict requires every variant; fallback isolates invalid variants per skill")
+    prepare.add_argument("--skvm_compile_retries", type=int, choices=range(4), default=1)
     prepare.add_argument(
         "--skvm_profile_timeout_ms", type=int, default=120_000
     )

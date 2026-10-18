@@ -218,6 +218,7 @@ class BatchEvaluationTest(unittest.TestCase):
                 return [legacy.SkillVariant(source, "aot", "p1p3", source.path, source.content, "hash")]
             kernel.prepare.side_effect = prepare
             kernel.manifest.return_value = {"variants": [], "skills": []}
+            kernel.preparation_summary = {}
             class Agent:
                 def __init__(self, env, llm, **kwargs):
                     self.llm = llm
@@ -253,6 +254,9 @@ class BatchEvaluationTest(unittest.TestCase):
             self.assertIn("<skvm-adaptation>", client.predict_mm.call_args.args[0])
             self.assertTrue((root / "run/skvm/skill-catalog.json").is_file())
             self.assertFalse((root / "run/skvm/adaptations.jsonl").exists())
+            stats = json.loads((root / "run/skvm/runtime-stats.json").read_text(encoding="utf-8"))
+            self.assertEqual(stats["skvm_adapted_requests"], 1)
+            self.assertEqual(artifacts.summary["metadata"]["skvm_runtime_counter_scope"], "all_invocations_aggregate")
             self.assertEqual(artifacts.summary["metadata"]["evaluation_mode"], "skvm_fixed_adapter_aot")
 
     def test_qwen_resume_ignores_endpoint_not_weights(self):
@@ -298,13 +302,15 @@ class BatchEvaluationTest(unittest.TestCase):
                         "episodes_evaluated": 2, "successes": 1,
                         "success_rate_micro": 0.5, "success_rate_macro": 0.5,
                         "metadata": {"skvm_tool_protocol": batch.SKVM_TOOL_PROTOCOL,
-                                     "skvm_context_policy": batch.SKVM_CONTEXT_POLICY},
+                                     "skvm_context_policy": batch.SKVM_CONTEXT_POLICY,
+                                     "skvm_stability_policy": batch.SKVM_STABILITY_POLICY},
                     }), encoding="utf-8")
                     if "evaluate-skvm" in command:
                         marker = output / "skvm" / "kernel-protocol.json"
                         marker.parent.mkdir(parents=True, exist_ok=True)
                         marker.write_text(json.dumps({"protocol": batch.SKVM_TOOL_PROTOCOL,
-                                                      "context_policy": batch.SKVM_CONTEXT_POLICY}), encoding="utf-8")
+                                                      "context_policy": batch.SKVM_CONTEXT_POLICY,
+                                                      "preparation_policy": batch.SKVM_STABILITY_POLICY}), encoding="utf-8")
                 return 0
 
             with mock.patch.object(batch, "validate_dependencies"), mock.patch.object(

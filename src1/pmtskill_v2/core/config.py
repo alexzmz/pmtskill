@@ -98,14 +98,33 @@ class TrainingEvaluationConfig:
 @dataclasses.dataclass(slots=True)
 class RoutingConfig:
     success_weight: float = 1.0
-    latency_weight: float = 0.0001
-    switch_weight: float = 0.003
+    latency_weight: float = 0.0
+    switch_weight: float = 0.0
     polished_bonus: float = 0.05
     degradation_weight: float = 0.02
     minimum_capability: float = 0.05
     maximum_candidates_per_position: int = 32
     # 离线估计仅在缺少实测证据时作为先验，不覆盖已观测的模型—技能状态。
     use_skill_estimates: bool = True
+    # Success is the primary objective, not a term latency can outweigh.
+    objective: str = "success_first"
+    runtime_rerouting: bool = True
+    runtime_context_weight: float = 0.25
+    stall_threshold: int = 3
+    stall_model_discount: float = 0.35
+
+    def __post_init__(self):
+        import math
+        if self.objective not in {"success_first", "weighted"}:
+            raise ValueError("routing.objective must be success_first or weighted")
+        for name in ("success_weight", "latency_weight", "switch_weight", "polished_bonus", "degradation_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"routing.{name} must be finite and nonnegative")
+        if self.objective == "success_first" and self.success_weight <= 0:
+            raise ValueError("success_first requires positive success_weight")
+        if not 0 <= self.runtime_context_weight <= 1 or not 0 < self.stall_model_discount < 1 or self.stall_threshold < 2:
+            raise ValueError("Invalid routing runtime_context_weight/stall_model_discount/stall_threshold")
 
 
 @dataclasses.dataclass(slots=True)
@@ -213,6 +232,8 @@ class EvaluationConfig:
 
     resume: bool = False
     store_trajectories: bool = True
+    # Opt-in for ALL methods sharing this TOML, not an implicit PORTS advantage.
+    fixed_step_budget: bool = False
 
 
 @dataclasses.dataclass(slots=True)
@@ -485,6 +506,8 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
     store_trajectories = evaluation_raw.get("store_trajectories", True)
     if not isinstance(store_trajectories, bool):
         raise ValueError("evaluation.store_trajectories 必须是布尔值")
+    if not isinstance(evaluation_raw.get("fixed_step_budget", False), bool):
+        raise ValueError("evaluation.fixed_step_budget 必须是布尔值")
     calibration = CalibrationConfig(**_section(raw, "calibration"))
     if calibration.mode not in {"androidworld", "offline"}:
         raise ValueError("calibration.mode 必须是 androidworld 或 offline")
@@ -504,6 +527,7 @@ def load_config(path: str | os.PathLike[str]) -> ProjectConfig:
         maintenance=maintenance,
         android_world=android_world,
         models=models,
-        evaluation=EvaluationConfig(resume=resume, store_trajectories=store_trajectories),
+        evaluation=EvaluationConfig(resume=resume, store_trajectories=store_trajectories,
+                                    fixed_step_budget=evaluation_raw.get("fixed_step_budget", False)),
         calibration=calibration,
     )

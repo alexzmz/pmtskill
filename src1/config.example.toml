@@ -60,6 +60,10 @@ store_trajectories = true
 # 开启后必须通过 --output-dir 固定到原运行目录；--resume / --no-resume 可覆盖。
 # 真正的任务失败也算已完成；异常/基础设施失败下次重试，不偏置最终 SR。
 resume = false
+# true：所有共用此 TOML 的评测在旧 harness 上也获得完整 --max-steps 预算。
+# false：保留旧的 min(任务原生预算, --max-steps)，例如命令写 30 实际可能只有 20。
+# 对比实验务必对各方法使用同一设置。
+fixed_step_budget = false
 
 [training_evaluation]
 deploy_port = 8002
@@ -103,14 +107,23 @@ deploy_extra_args = []
 [routing]
 # true: 无实测证据时使用当前模型/技能版本的离线适配估计；不覆盖真实标定或已观测的禁用状态。
 use_skill_estimates = true
-# 总分 = log(成功率) - 延迟惩罚 - 切换惩罚 + polished 奖励 - 降级代价。
+# success_first：成功率是主目标，延迟/切换实际惩罚为 0；奖励仅打破成功率相同的平局。
+# weighted：恢复旧的加权目标，并使用下列 latency_weight / switch_weight。
+objective = "success_first"
 success_weight = 1.0
-latency_weight = 0.0001
-switch_weight = 0.003
+latency_weight = 0.0
+switch_weight = 0.0
 polished_bonus = 0.05
 degradation_weight = 0.02
 minimum_capability = 0.05
 maximum_candidates_per_position = 32
+# 每个 GUI 动作按当前技能证据和界面原语重选模型；动作/总结固定同一 adapter。
+runtime_rerouting = true
+runtime_context_weight = 0.25
+# 重复的界面+动作、无效输出达到阈值，触发本 episode 内的恢复折扣与技能短暂冷却。
+# 这是恢复启发式，不是新标定 SR，不回写模型能力表。
+stall_threshold = 3
+stall_model_discount = 0.35
 
 [calibration]
 # 两种主模式：androidworld（原有端到端配对标定）/ offline（无模拟器估计）。

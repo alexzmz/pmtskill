@@ -1273,6 +1273,12 @@ def _dry_evaluation_result(
         {
             "dry_run": True,
             "evaluation_mode": mode,
+            **({"routing_objective": deployment.config.routing.objective,
+                "runtime_rerouting": deployment.config.routing.runtime_rerouting,
+                "effective_latency_weight": deployment.config.routing.latency_weight if deployment.config.routing.objective == "weighted" else 0.0,
+                "effective_switch_weight": deployment.config.routing.switch_weight if deployment.config.routing.objective == "weighted" else 0.0,
+                "fixed_step_budget": deployment.config.evaluation.fixed_step_budget}
+               if mode == "pmtskill_online" else {}),
             "android_world_connection": {
                 "console_port": deployment.config.android_world.console_port,
                 "grpc_port": deployment.config.android_world.grpc_port,
@@ -1519,6 +1525,109 @@ def command_evaluate_fixed_baseline(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_evaluate_additional_baseline(args: argparse.Namespace) -> int:
+    """Official agent, paper-adapted EchoTrail, or random routing + real SKVM."""
+    config = load_config(args.config)
+    args.resume = _evaluation_resume(config, args)
+    args.store_trajectories = _evaluation_store_trajectories(config, args)
+    if not args.output_dir or min(args.combinations, args.max_steps) <= 0:
+        raise ValueError("请指定 --output-dir，combinations/max-steps 必须为正数")
+    random_skvm = args.command in {"evaluate-random-skvm", "evaluate-random-routing-skvm"}
+    echo = args.command == "evaluate-echotrail-gui"
+    store = _open_evaluation_skill_store(config, args.skill_database) if random_skvm else None
+    if random_skvm:
+        if len(args.adapter_paths) < 2 or args.skvm_profile_instances <= 0:
+            raise ValueError("随机 SKVM 需要至少两个 adapter，profile-instances 必须为正数")
+        if args.record_traces:
+            raise ValueError("随机 SKVM baseline 不回写技能库，请使用 --no-record-traces")
+        paths, ids = args.adapter_paths, args.adapter_model_ids
+    else:
+        paths, ids = [args.adapter_path], [args.model_id] if args.model_id else None
+    if echo:
+        from ..baselines.echotrail import validate_memory
+        validate_memory(args, check_encoder=True)
+    deployment, bindings = _adapter_deployment(config, store, args, paths, ids)
+    if args.dry_run:
+        return _dry_evaluation_result(args.command, deployment, bindings, args,
+                                      resume=args.resume, store_trajectories=args.store_trajectories)
+    config.ensure_runtime_dirs()
+    tasks = _evaluation_tasks(config, args)
+    with deployment.activate_adapters() as profiles:
+        if random_skvm:
+            from ..baselines.random_skvm import run_random_skvm
+            artifacts = run_random_skvm(config, store, profiles, args, tasks)
+        elif echo:
+            from ..baselines.echotrail import run_echotrail
+            artifacts = run_echotrail(config, profiles[0], args, tasks)
+        else:
+            from ..baselines.androidworld import run_androidworld
+            artifacts = run_androidworld(config, profiles[0], args, tasks)
+    _print(_evaluation_result(mode=args.command, artifacts=artifacts, bindings=bindings,
+                              skill_database=store.database if store else None))
+    return 0
+
+
+def command_prepare_echotrail_memory(args: argparse.Namespace) -> int:
+    from ..baselines.echotrail import build_memory, embedding_identity, load_source
+    from .evaluation.resume import model_resume_identity
+    config = load_config(args.config)
+    args.resume = _evaluation_resume(config, args)
+    if not args.output_dir or args.limit <= 0 or args.critic_context_chars <= 0:
+        raise ValueError("请提供 --output-dir；limit/critic-context-chars 必须为正数")
+    # Read-only validation before any paid/model call or server launch.
+    embedding_identity(args.embedding_model_path)
+    if not load_source(args.source_database):
+        raise ValueError("source-database 中没有成功轨迹")
+    if args.critic_api_model_id:
+        unused = [name for name in ("base_model_path", "deploy_host", "deploy_port", "cuda_visible_devices",
+                                    "infer_backend", "max_model_len", "gpu_memory_utilization", "max_new_tokens",
+                                    "deploy_extra_arg") if getattr(args, name) is not None]
+        if unused:
+            raise ValueError("API Critic 不启动本地部署，请移除：" + ", ".join("--" + n.replace("_", "-") for n in unused))
+        profile = config.model(args.critic_api_model_id)
+        if not profile.enabled:
+            raise ValueError("Critic API 模型未启用")
+        if not args.dry_run and profile.api_key_env and not os.environ.get(profile.api_key_env):
+            raise ValueError(f"缺少 Critic API key 环境变量 {profile.api_key_env}")
+        deployment, bindings = None, []
+        context = contextlib.nullcontext([profile])
+    else:
+        deployment, bindings = _adapter_deployment(config, None, args, [args.adapter_path],
+                                                   [args.model_id] if args.model_id else None)
+        context = deployment.activate_adapters()
+    if args.dry_run:
+        _print({"dry_run": True, "source": args.source_database, "source_seed": args.source_seed,
+                "output": args.output_dir, "critic": args.critic_api_model_id or args.adapter_path,
+                "deployment_command": deployment.build_adapter_command() if deployment else None,
+                "implementation": "historical-memory adaptation; no autonomous self-exploration"})
+        return 0
+    with context as profiles:
+        profile = profiles[0]
+        _print(build_memory(args, OpenAICompatibleVLClient(profile), model_resume_identity(profile)))
+    return 0
+
+
+def command_collect_echotrail_memory(args: argparse.Namespace) -> int:
+    from ..baselines.echotrail import collect_memory, embedding_identity
+    config = load_config(args.config)
+    args.resume = _evaluation_resume(config, args)
+    if (not args.output_dir or args.episodes_per_app <= 0 or args.max_steps <= args.focus_after_steps
+            or args.focus_after_steps < 1 or args.critic_context_chars <= 0):
+        raise ValueError("请指定 output-dir；episodes-per-app>0，max-steps>focus-after-steps>=1")
+    embedding_identity(args.embedding_model_path)
+    deployment, bindings = _adapter_deployment(config, None, args, [args.adapter_path],
+                                               [args.model_id] if args.model_id else None)
+    if args.dry_run:
+        _print({"dry_run": True, "apps": args.apps, "exploration_seed": args.seed,
+                "output_dir": args.output_dir, "starts_emulator": False,
+                "deployment_command": deployment.build_adapter_command(),
+                "note": "critic quality is not benchmark SR"})
+        return 0
+    with deployment.activate_adapters() as profiles:
+        _print(collect_memory(config, profiles[0], args))
+    return 0
+
+
 def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
     """接口三：多 adapter 模型池 + PMT-Skill 规划、技能和动态路由。"""
 
@@ -1530,6 +1639,9 @@ def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
     config.ensure_runtime_dirs()
     store = _open_evaluation_skill_store(config, args.skill_database)
     route_overrides = {
+        "objective": args.routing_objective,
+        "runtime_rerouting": args.routing_runtime_rerouting,
+        "stall_threshold": args.routing_stall_threshold,
         "success_weight": args.routing_success_weight,
         "latency_weight": args.routing_latency_weight,
         "switch_weight": args.routing_switch_weight,
@@ -1901,6 +2013,18 @@ def _add_skill_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
         default=False,
         help="是否把本轮轻量轨迹写回技能库；默认关闭，避免基准测试污染路由统计",
     )
+
+
+def _add_skvm_arguments(parser):
+    parser.add_argument("--skvm-prepare", choices=["auto", "force", "reuse"], default="auto")
+    parser.add_argument("--skvm-command")
+    parser.add_argument("--skvm-cache-dir")
+    parser.add_argument("--skvm-profile-instances", type=int, default=3)
+    parser.add_argument("--skvm-aot-pass-sets", nargs="+", default=["1", "1,3"])
+    parser.add_argument("--skvm-failure-policy", choices=["fallback", "strict"], default="fallback",
+                        help="变体失败回退其他合格 AOT/原技能并记录，不删测试任务")
+    parser.add_argument("--skvm-compile-retries", type=int, choices=range(4), default=1,
+                        help="无合格缓存时每变体的额外编译重试次数，默认 1")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2423,20 +2547,63 @@ def build_parser() -> argparse.ArgumentParser:
         _add_common_evaluation_arguments(baseline)
         if mode == "skvm":
             _add_skill_evaluation_arguments(baseline)
-            baseline.add_argument("--skvm-prepare", choices=["auto", "force", "reuse"], default="auto")
-            baseline.add_argument("--skvm-command")
-            baseline.add_argument("--skvm-cache-dir")
-            baseline.add_argument("--skvm-profile-instances", type=int, default=3)
-            baseline.add_argument("--skvm-aot-pass-sets", nargs="+", default=["1", "1,3"])
-            baseline.add_argument("--skvm-failure-policy", choices=["fallback", "strict"], default="fallback",
-                                  help="默认复用合格 AOT；变体失败回退其他 AOT/原技能并记录，不删测试任务")
-            baseline.add_argument("--skvm-compile-retries", type=int, choices=range(4), default=1,
-                                  help="无合格缓存时，每个变体的额外编译重试次数（0–3，默认 1）")
+            _add_skvm_arguments(baseline)
         else:
             baseline.add_argument("--vdroid-root")
             baseline.add_argument("--vdroid-score-workers", type=int, default=4)
             baseline.add_argument("--vdroid-search-iterations", type=int, default=1)
         baseline.set_defaults(handler=command_evaluate_fixed_baseline)
+
+    for mode in ("androidworld", "echotrail-gui", "random-skvm"):
+        baseline = subparsers.add_parser(
+            f"evaluate-{mode}", aliases=["evaluate-random-routing-skvm"] if mode == "random-skvm" else [],
+            help=f"{mode} AndroidWorld baseline；论文适配差异在报告中注明")
+        if mode == "random-skvm":
+            baseline.add_argument("--adapter-paths", nargs="+", required=True)
+            baseline.add_argument("--adapter-model-ids", nargs="+")
+            _add_skill_evaluation_arguments(baseline)
+            _add_skvm_arguments(baseline)
+            baseline.add_argument("--routing-seed", type=int, default=42)
+        else:
+            baseline.add_argument("--adapter-path", required=True)
+            baseline.add_argument("--model-id")
+        _add_common_evaluation_arguments(baseline)
+        if mode == "androidworld":
+            baseline.add_argument("--androidworld-agent", choices=["m3a", "t3a"], default="m3a",
+                                  help="ICLR2025 原生 M3A（与 standalone 重合），或文本 T3A")
+        elif mode == "echotrail-gui":
+            baseline.add_argument("--memory-file", required=True)
+            baseline.add_argument("--embedding-model-path", required=True)
+            baseline.add_argument("--memory-alpha", type=float, default=0.5)
+            baseline.add_argument("--memory-top-k", type=int, default=2)
+            baseline.add_argument("--memory-max-chars", type=int, default=12000)
+        baseline.set_defaults(handler=command_evaluate_additional_baseline)
+
+    memory = subparsers.add_parser("prepare-echotrail-memory", help="历史轨迹 + 真实 Critic + 本地语义 embedding 建库（非原版自主探索）")
+    source = memory.add_mutually_exclusive_group(required=True)
+    source.add_argument("--adapter-path", help="用单个本地 adapter 做 Critic")
+    source.add_argument("--critic-api-model-id", help="或使用 TOML 的 API 模型做 Critic")
+    memory.add_argument("--model-id")
+    _add_common_evaluation_arguments(memory)
+    memory.add_argument("--source-database", required=True)
+    memory.add_argument("--source-seed", type=int, required=True, help="只接收带该 suite_seed 的历史轨迹；必须与评测不同")
+    memory.add_argument("--embedding-model-path", required=True, help="本地 sentence-transformers 兼容模型目录，不自动下载")
+    memory.add_argument("--critic-threshold", type=int, choices=range(1, 6), default=4)
+    memory.add_argument("--critic-context-chars", type=int, default=24000)
+    memory.add_argument("--limit", type=int, default=500)
+    memory.set_defaults(handler=command_prepare_echotrail_memory)
+
+    exploration = subparsers.add_parser("collect-echotrail-memory", help="Qwen 适配的好奇探索→子目标探索→Critic→记忆库，不计算 benchmark SR")
+    exploration.add_argument("--adapter-path", required=True)
+    exploration.add_argument("--model-id")
+    _add_common_evaluation_arguments(exploration)
+    exploration.add_argument("--apps", nargs="+", required=True, help="已安装 app 的 AndroidWorld 名称，例如 markor contacts")
+    exploration.add_argument("--episodes-per-app", type=int, default=3)
+    exploration.add_argument("--focus-after-steps", type=int, default=4)
+    exploration.add_argument("--embedding-model-path", required=True)
+    exploration.add_argument("--critic-threshold", type=int, choices=range(1, 6), default=4)
+    exploration.add_argument("--critic-context-chars", type=int, default=32000)
+    exploration.set_defaults(handler=command_collect_echotrail_memory)
 
     evaluate = subparsers.add_parser(
         "evaluate-pmtskill",
@@ -2461,6 +2628,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="第一阶段任务分解模型 ID；可引用本次部署的任一 adapter，默认关键词规划",
     )
     evaluate.add_argument("--routing-success-weight", type=float)
+    evaluate.add_argument("--routing-objective", choices=["success_first", "weighted"],
+                          help="默认 success_first；忽略延迟/切换权重，weighted 保留旧加权目标")
+    evaluate.add_argument("--routing-runtime-rerouting", action=argparse.BooleanOptionalAction, default=None,
+                          help="每个动作重选 adapter；卡住时临时降低当前模型优先级并降级技能，默认开启")
+    evaluate.add_argument("--routing-stall-threshold", type=int, help="连续循环/无效动作证据阈值，默认 3")
     evaluate.add_argument("--routing-latency-weight", type=float)
     evaluate.add_argument("--routing-switch-weight", type=float)
     evaluate.add_argument("--routing-polished-bonus", type=float)

@@ -93,6 +93,13 @@ class EvaluationSuiteCompatibilityTest(unittest.TestCase):
         self.evaluate(harness, suite)
         self.assertEqual(seen, [8])
 
+    def test_explicit_fixed_budget_uses_full_limit_and_records_exhaustion(self):
+        self.config.evaluation.fixed_step_budget = True
+        harness, suite, seen = self.harness(budget=8)
+        result = self.evaluate(harness, suite, max_steps=30)
+        self.assertEqual(seen, [30])
+        self.assertEqual(result[0].aux_data["collector_step_limit"], 30)
+
     def test_legacy_verifier_stops_immediately_on_success(self):
         harness, suite, _ = self.harness(success_after=2)
         result = self.evaluate(harness, suite)

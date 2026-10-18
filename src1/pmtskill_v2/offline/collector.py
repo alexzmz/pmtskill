@@ -53,7 +53,7 @@ def _supports_keyword(function: Any, name: str) -> bool:
 
 
 @contextmanager
-def enforce_episode_step_limit(suite_utils: Any, step_limit: int) -> Iterator[None]:
+def enforce_episode_step_limit(suite_utils: Any, step_limit: int, *, fixed_budget: bool = False) -> Iterator[None]:
     """在 AndroidWorld episode_runner 外层施加不可绕过的步数上限。"""
 
     runner_module = suite_utils.episode_runner
@@ -62,11 +62,14 @@ def enforce_episode_step_limit(suite_utils: Any, step_limit: int) -> Iterator[No
     @functools.wraps(original)
     def bounded_run_episode(*args: Any, **kwargs: Any):
         positional = list(args)
+        effective_limit = step_limit
         if "max_n_steps" in kwargs:
             requested = kwargs["max_n_steps"]
-            kwargs["max_n_steps"] = min(max(1, int(requested)), step_limit)
+            kwargs["max_n_steps"] = step_limit if fixed_budget else min(max(1, int(requested)), step_limit)
+            effective_limit = kwargs["max_n_steps"]
         elif len(positional) >= 3:
-            positional[2] = min(max(1, int(positional[2])), step_limit)
+            positional[2] = step_limit if fixed_budget else min(max(1, int(positional[2])), step_limit)
+            effective_limit = positional[2]
         else:
             kwargs["max_n_steps"] = step_limit
         result = original(*positional, **kwargs)
@@ -74,13 +77,13 @@ def enforce_episode_step_limit(suite_utils: Any, step_limit: int) -> Iterator[No
         step_numbers = (
             step_data.get("step_number", []) if isinstance(step_data, dict) else []
         )
-        if len(step_numbers) >= step_limit and not bool(getattr(result, "done", False)):
+        if len(step_numbers) >= effective_limit and not bool(getattr(result, "done", False)):
             aux_data = getattr(result, "aux_data", None)
             aux_data = dict(aux_data) if isinstance(aux_data, dict) else {}
             aux_data.update(
                 {
                     "collector_termination_reason": "max_steps",
-                    "collector_step_limit": step_limit,
+                    "collector_step_limit": effective_limit,
                 }
             )
             result.aux_data = aux_data

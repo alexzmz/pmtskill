@@ -1,0 +1,3 @@
+# Optional addition to the existing AndroidWorld + ms-swift environment.
+# Local semantic encoder only; no FAISS service or extra submodule required.
+sentence-transformers>=5.0,<6

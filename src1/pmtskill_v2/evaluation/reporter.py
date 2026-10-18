@@ -170,7 +170,9 @@ def summarize_episodes(
             ):
                 failure_reasons["invalid_episode_data"] += 1
                 continue
-            if outputs and "infeasible" in str(outputs[-1]).lower():
+            if isinstance(aux_data, Mapping) and aux_data.get("collector_termination_reason") == "max_steps":
+                failure_reasons["step_budget_exhausted"] += 1
+            elif outputs and "infeasible" in str(outputs[-1]).lower():
                 failure_reasons["agent_infeasible"] += 1
             elif outputs and "status" not in str(outputs[-1]).lower():
                 failure_reasons["environment_not_satisfied"] += 1
@@ -188,16 +190,23 @@ def summarize_episodes(
     model_usage: collections.Counter[str] = collections.Counter()
     skill_usage: collections.Counter[str] = collections.Counter()
     switch_counts: list[int] = []
+    routing_runtime: collections.Counter[str] = collections.Counter()
     for trace in trace_list:
         stored_summary = trace.metadata.get(STORED_SUMMARY_KEY)
         if isinstance(stored_summary, Mapping):
             model_usage.update(stored_summary.get("model_usage", {}))
             skill_usage.update(stored_summary.get("skill_usage", {}))
             switch_counts.extend(stored_summary.get("switch_counts", []))
+            routing_runtime.update(stored_summary.get("routing_runtime", {}))
             continue
         previous: str | None = None
         switches = 0
         for event in trace.events:
+            runtime = event.metadata.get("ports_runtime")
+            if isinstance(runtime, Mapping) and runtime.get("runtime_decision"):
+                routing_runtime["action_decisions"] += 1
+                for key in ("adapter_switched", "stall_recovery", "skill_fallback", "summary_fallback"):
+                    routing_runtime[key] += int(bool(runtime.get(key)))
             model_usage[event.model_id] += 1
             if event.skill_id:
                 skill_usage[event.skill_id] += 1
@@ -219,6 +228,7 @@ def summarize_episodes(
         "average_steps": statistics.fmean(step_counts) if step_counts else 0.0,
         "average_run_time_seconds": statistics.fmean(run_times) if run_times else 0.0,
         "average_model_switches": statistics.fmean(switch_counts) if switch_counts else 0.0,
+        "routing_runtime": dict(routing_runtime),
         "permission_controller_restarts": permission_restarts,
         "permission_controller_dialogs_dismissed": permission_dialogs_dismissed,
         "permission_controller_model_delegations": permission_model_delegations,
@@ -263,6 +273,8 @@ def compact_result_for_storage(
         "model_usage": summary["model_usage"], "skill_usage": summary["skill_usage"],
         "switch_counts": switch_counts, "failure_reasons": summary["failure_reasons"],
     }
+    if summary["routing_runtime"]:
+        result[STORED_SUMMARY_KEY]["routing_runtime"] = summary["routing_runtime"]
     # 异常 reward/长度常为 NaN；轻量 JSON 使用 null，恢复时仍视为不可复用。
     for key, value in result.items():
         if isinstance(value, float) and not math.isfinite(value):
@@ -302,6 +314,33 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"- 完整轨迹存储：`{metadata.get('store_trajectories', True)}`",
     ]
     skipped_tasks = summary.get("infrastructure_skipped_tasks", [])
+    if metadata.get("routing_objective"):
+        lines.extend(("", "### PORTS 路由策略", "",
+                      f"- 目标：`{metadata['routing_objective']}`；执行中重选：`{metadata.get('runtime_rerouting')}`",
+                      f"- 生效的延迟 / 切换权重：`{metadata.get('effective_latency_weight')}` / `{metadata.get('effective_switch_weight')}`",
+                      f"- 动作级路由统计（含恢复后的复用结果）：`{json.dumps(summary.get('routing_runtime', {}))}`",
+                      "- 卡住折扣仅为当前 episode 的恢复启发式，不是实测成功率，不回写标定表。"))
+    if metadata.get("implementation"):
+        lines.extend(("", "### Baseline 实现与来源", "",
+                      f"- 实现：`{metadata['implementation']}`"))
+        if metadata.get("same_agent_as_standalone"):
+            lines.append("- 当前使用官方 M3A，与 standalone 的 agent 相同；不是新增独立方法。")
+        for adaptation in metadata.get("adaptations", []):
+            lines.append(f"- 适配差异：{adaptation}")
+        if "memory_count" in metadata:
+            lines.extend((f"- 冻结记忆数：{metadata['memory_count']}；来源：`{metadata.get('memory_source_kind')}`；"
+                          f"采集 seed：`{metadata.get('memory_source_seed')}`",
+                          "- Critic 分数不是 AndroidWorld SR；测试期间不写入记忆。"))
+        if metadata.get("selection_policy"):
+            lines.append(f"- 模型选择：{metadata['selection_policy']}；seed：`{metadata.get('routing_seed')}`")
+        runtime = metadata.get("runtime", {})
+        if isinstance(runtime, Mapping) and "memory_injected_calls" in runtime:
+            lines.append(f"- 记忆注入动作调用：{runtime['memory_injected_calls']} / {runtime['action_calls']}（含重试）。")
+        preparation = metadata.get("skvm_compilation", {})
+        if metadata.get("per_model_tcp_and_aot") and isinstance(preparation, Mapping):
+            for model_id, detail in preparation.items():
+                lines.append(f"- `{model_id}`：AOT 覆盖率 `{detail.get('aot_coverage')}`；"
+                             f"原技能回退 `{detail.get('original_fallback_skills')}`；真实 TCP/AOT 按模型分别保存。")
     if metadata.get("use_skill_estimates"):
         lines.append("- 技能评分优先使用实测证据；缺失时可使用离线估计先验，估计分数不是实测 SR。")
     resume = metadata.get("resume")
@@ -410,6 +449,9 @@ def _markdown(summary: dict[str, Any]) -> str:
     lines.extend(("", "## 失败分类", "", "| 原因 | 次数 |", "|---|---:|"))
     for reason, count in summary["failure_reasons"].items():
         lines.append(f"| {reason} | {count} |")
+    if "environment_not_satisfied" in summary["failure_reasons"]:
+        lines.append("\n`environment_not_satisfied` 表示任务真值未满足且未正常结束，不等于模拟器环境故障；"
+                     "完整步数预算耗尽在新记录中单独记为 `step_budget_exhausted`。")
     lines.append("")
     return "\n".join(lines)
 

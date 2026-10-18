@@ -49,6 +49,7 @@ class _Candidate:
 class _State:
     score: float
     steps: tuple[RouteStep, ...]
+    success_score: float = 0.0
 
 
 class DynamicProgrammingRouter:
@@ -58,7 +59,7 @@ class DynamicProgrammingRouter:
     留给执行器；未来要换成图搜索/强化学习，只需实现 :class:`RoutingAlgorithm`。
     """
 
-    algorithm_id = "dp-model-skill-router-v1"
+    algorithm_id = "dp-model-skill-router-v2"
 
     def __init__(self, config: RoutingConfig, store: SkillStore | None = None):
         self.config = config
@@ -121,7 +122,39 @@ class DynamicProgrammingRouter:
                 candidate.skill.skill_id if candidate.skill else "",
             )
         )
-        return candidates[: self.config.maximum_candidates_per_position]
+        selected = candidates[:max(1, self.config.maximum_candidates_per_position)]
+        # Truncating the catalogue must not accidentally remove the only fallback.
+        if not any(candidate.skill is None for candidate in selected):
+            fallback = next(candidate for candidate in candidates if candidate.skill is None)
+            if len(selected) == 1:
+                selected.append(fallback)
+            else:
+                selected[-1] = fallback
+        return selected
+
+    def model_unit_support(self, model: ModelProfile, step: RouteStep, skill: SkillRecord | None,
+                           *, include_candidates: bool = False) -> tuple[float, float, str] | None:
+        """Use the same lifecycle/matrix evidence in online model re-selection."""
+        candidate = _Candidate(step.primitive_ids, step.node_ids, skill)
+        if not self._model_skill_allowed(model, candidate, include_candidates=include_candidates):
+            return None
+        probability, latency = self._probability(model, candidate)
+        if skill is None and step.primitive_ids:
+            # These are simultaneous FEATURES of one GUI action, not a path of
+            # independent executed actions. Normalize rather than exponentiating
+            # uncertainty merely because more context features were available.
+            probability = math.exp(sum(math.log(model.capability(p)) for p in step.primitive_ids)
+                                   / len(step.primitive_ids))
+        if probability < self.config.minimum_capability and min(
+                (model.capability(p) for p in step.primitive_ids), default=probability) < self.config.minimum_capability:
+            return None
+        source = self._score_sources.get((skill_version_id(skill), model_variant_id(model)), "primitive_prior") if skill else "primitive_prior"
+        return probability, latency, source
+
+    def _rank(self, state: _State) -> tuple:
+        # Equivalent products computed through different segmentations differ
+        # at machine precision; do not let that defeat the intended tie-break.
+        return (round(state.success_score, 12), state.score) if self.config.objective == "success_first" else (state.score,)
 
     def _probability(
         self, model: ModelProfile, candidate: _Candidate
@@ -256,10 +289,10 @@ class DynamicProgrammingRouter:
                             include_candidates=include_candidates,
                         ):
                             continue
-                        capabilities = [model.capability(p) for p in candidate.primitive_ids]
-                        if min(capabilities) < self.config.minimum_capability:
-                            continue
                         probability, latency = self._probability(model, candidate)
+                        if probability < self.config.minimum_capability and min(
+                                model.capability(p) for p in candidate.primitive_ids) < self.config.minimum_capability:
+                            continue
                         switch_cost = (
                             model.switch_cost_ms
                             if previous_model_id is not None and previous_model_id != model.model_id
@@ -274,8 +307,10 @@ class DynamicProgrammingRouter:
                         success_term = self.config.success_weight * math.log(
                             max(0.000001, probability)
                         )
-                        latency_term = self.config.latency_weight * latency
-                        switch_term = self.config.switch_weight * switch_cost
+                        # Existing TOMLs may retain old, large weights. In this
+                        # mode they cannot trade away even a small success gain.
+                        latency_term = self.config.latency_weight * latency if self.config.objective == "weighted" else 0.0
+                        switch_term = self.config.switch_weight * switch_cost if self.config.objective == "weighted" else 0.0
                         delta = success_term - latency_term - switch_term + polished_gain - degradation
                         step = RouteStep(
                             step_id=uuid.uuid4().hex,
@@ -285,7 +320,7 @@ class DynamicProgrammingRouter:
                             node_ids=candidate.node_ids,
                             expected_success=probability,
                             expected_latency_ms=latency,
-                            score=delta,
+                            score=success_term if self.config.objective == "success_first" else delta,
                             is_polished=candidate.skill is not None,
                             score_detail={
                                 "log_success": success_term,
@@ -297,22 +332,23 @@ class DynamicProgrammingRouter:
                         )
                         next_position = position + len(candidate.primitive_ids)
                         key = (next_position, model.model_id)
-                        new_state = _State(state.score + delta, state.steps + (step,))
+                        new_state = _State(state.score + delta, state.steps + (step,), state.success_score + success_term)
                         old_state = states.get(key)
-                        if old_state is None or new_state.score > old_state.score:
+                        if old_state is None or self._rank(new_state) > self._rank(old_state):
                             states[key] = new_state
 
         finals = [state for (position, _), state in states.items() if position == len(primitives)]
         if not finals:
             raise RuntimeError("路由失败：能力阈值过滤了所有模型候选")
-        best = max(finals, key=lambda state: state.score)
+        best = max(finals, key=self._rank)
         return ExecutionPlan(
             goal=goal,
             topology=topology,
             steps=best.steps,
-            total_score=best.score,
+            total_score=best.success_score if self.config.objective == "success_first" else best.score,
             planner_id=planner_id,
             metadata={"algorithm": self.algorithm_id,
+                      "objective": self.config.objective, "log_success_objective": best.success_score,
                       "skill_score_sources": {step.step_id: self._score_sources.get(
                           (skill_version_id(next(skill for skill in skills if skill.skill_id == step.skill_id)),
                            model_variant_id(next(model for model in enabled_models if model.model_id == step.model_id))),

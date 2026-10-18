@@ -9,6 +9,7 @@ import functools
 import inspect
 import logging
 import random
+import re
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -97,6 +98,8 @@ def _evaluation_progress(
         "skill_database": str(store.database.resolve()) if store else None,
         **dict(extra or {}),
     }
+    if config.evaluation.fixed_step_budget:
+        specification["fixed_step_budget"] = True
     return EvaluationProgress(
         target, specification, resume=resume, store_trajectories=store_trajectories,
         result_compactor=lambda episode: compact_result_for_storage(episode, episodes_to_traces([episode])),
@@ -168,7 +171,8 @@ def _run_evaluation_suite(
         options["stop_on_task_success"] = config.android_world.stop_on_task_success
     with contextlib.ExitStack() as stack:
         if not native_step_limit:
-            stack.enter_context(enforce_episode_step_limit(suite_utils, max_steps))
+            stack.enter_context(enforce_episode_step_limit(suite_utils, max_steps,
+                                                           fixed_budget=config.evaluation.fixed_step_budget))
         if not native_stop and config.android_world.stop_on_task_success:
             stack.enter_context(_legacy_task_success_termination(suite_utils))
         stack.enter_context(recover_infrastructure_failures(
@@ -365,6 +369,7 @@ def episodes_to_traces(episodes: Sequence[dict[str, Any]]) -> list[ExecutionTrac
                     "planner_id": route.get("planner_id"),
                     "skill_version_id": route.get("skill_version_id"),
                     "skill_score_source": route.get("skill_score_source", "unspecified"),
+                    "ports_runtime": route.get("ports_runtime"),
                     "plan_revision": route.get("current_revision"),
                     "planned_unit": route.get("planned_unit"),
                     "planned_primitive_ids": list(planned_primitives),
@@ -899,14 +904,21 @@ class AndroidWorldOnlineEvaluator:
         if not profiles:
             profiles = [profile for profile in self.config.models if profile.enabled]
         model_pool = ModelPool(profiles)
-        routed_wrapper = RoutedVLWrapper(model_pool, polished)
         planner_pipeline = PlannerPipeline(
             self._planner(planner_model_id, profiles), PrimitiveTopologyGenerator()
         )
         router = DynamicProgrammingRouter(self.config.routing, self.store)
+        try:
+            from android_world.env import adb_utils
+            supported_apps = sorted({name for pattern in getattr(adb_utils, "_PATTERN_TO_ACTIVITY", {})
+                                     for name in pattern.split("|") if re.fullmatch(r"[a-zA-Z0-9 _-]+", name)})
+        except ImportError:
+            supported_apps = []
+        routed_wrapper = RoutedVLWrapper(model_pool, polished, router=router,
+                                         include_candidates=include_candidate_skills, supported_apps=supported_apps)
 
         class DynamicRoutingM3A(m3a.M3A):
-            """在每个新 episode 首步生成计划，随后复用到 M3A 各动作。"""
+            """Initial DP + observation-driven model/skill re-selection per action."""
 
             def __init__(self, environment):
                 super().__init__(
@@ -922,6 +934,7 @@ class AndroidWorldOnlineEvaluator:
                 self.current_goal = None
                 self.latest_plan = None
                 model_pool.reset_counters()
+                routed_wrapper.reset()
                 return super().reset(go_home_on_reset)
 
             def step(self, goal: str):
@@ -941,7 +954,10 @@ class AndroidWorldOnlineEvaluator:
                     self.latest_plan.metadata["task_skill_id"] = decomposition.task_skill_id
                     routed_wrapper.set_plan(self.latest_plan)
                     self.current_goal = goal
-                return compact_m3a_step_result(super().step(goal))
+                routed_wrapper.begin_step()
+                result = super().step(goal)
+                routed_wrapper.observe_step(getattr(result, "data", {}))
+                return compact_m3a_step_result(result)
 
         self_outer = self
         run_stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -960,6 +976,7 @@ class AndroidWorldOnlineEvaluator:
             max_steps=max_steps, resume=resume, skills=[*raw_skills, *polished], store=self.store,
             store_trajectories=store_trajectories,
             extra={
+                "runtime_protocol": "ports-success-observation-routing-v2",
                 "routing": dataclasses.asdict(self.config.routing),
                 "planner_model": model_resume_identity(planner_profile) if planner_profile else None,
                 "include_candidate_skills": include_candidate_skills,
@@ -1046,5 +1063,11 @@ class AndroidWorldOnlineEvaluator:
                 "episode_storage": "compact_without_screenshots",
                 "resume": progress.metadata(),
                 "use_skill_estimates": self.config.routing.use_skill_estimates,
+                "routing": dataclasses.asdict(self.config.routing),
+                "routing_objective": self.config.routing.objective,
+                "runtime_rerouting": self.config.routing.runtime_rerouting,
+                "runtime_protocol": "ports-success-observation-routing-v2",
+                "effective_latency_weight": self.config.routing.latency_weight if self.config.routing.objective == "weighted" else 0.0,
+                "effective_switch_weight": self.config.routing.switch_weight if self.config.routing.objective == "weighted" else 0.0,
             },
         )

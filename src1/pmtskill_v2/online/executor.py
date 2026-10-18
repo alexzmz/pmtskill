@@ -185,19 +185,56 @@ class RoutedVLWrapper:
     只有下一次动作选择才前进到下一 route step，从而减少 adapter 切换。
     """
 
-    def __init__(self, model_pool: ModelPool, skills: Sequence[SkillRecord]):
+    def __init__(self, model_pool: ModelPool, skills: Sequence[SkillRecord], *, router=None,
+                 include_candidates=False, supported_apps=()):
         self.model_pool = model_pool
         self.skills = {skill.skill_id: skill for skill in skills}
         self.plan: ExecutionPlan | None = None
         self.action_call_index = 0
         self._last_action_step: RouteStep | None = None
         self.call_log: list[dict[str, Any]] = []
+        from .runtime import AdaptiveRoutingSession
+        self.runtime = AdaptiveRoutingSession(router, model_pool, self.skills,
+                                              include_candidates=include_candidates) if router and router.config.runtime_rerouting else None
+        self.supported_apps = tuple(supported_apps)
+        self._pending_action = None
 
     def set_plan(self, plan: ExecutionPlan) -> None:
         self.plan = plan
         self.action_call_index = 0
         self._last_action_step = None
         self.call_log = []
+        self._pending_action = None
+        if self.runtime:
+            self.runtime.reset()
+
+    def reset(self):
+        self.plan = None
+        self.action_call_index = 0
+        self._last_action_step = None
+        self.call_log = []
+        self._pending_action = None
+        if self.runtime:
+            self.runtime.reset()
+
+    def begin_step(self):
+        self._pending_action = True
+
+    def _binding(self, skill=None):
+        root = self.skills.get(self.plan.metadata.get("task_skill_id", "")) if self.plan else None
+        return root or skill
+
+    def observe_step(self, data):
+        summary_raw = data.get("summary_raw_response") or {}
+        if isinstance(summary_raw, dict) and summary_raw.get("_pmtskill", {}).get("summary_fallback"):
+            action_raw = data.get("action_raw_response") or {}
+            runtime = action_raw.get("_pmtskill", {}).get("ports_runtime") if isinstance(action_raw, dict) else None
+            if isinstance(runtime, dict):
+                runtime["summary_fallback"] = True
+        if self.runtime:
+            skill = self.skills.get(self._last_action_step.skill_id or "") if self._last_action_step else None
+            self.runtime.observe(data, self._binding(skill))
+        self._pending_action = None
 
     def _route_step(self) -> RouteStep:
         if self.plan is None or not self.plan.steps:
@@ -228,13 +265,18 @@ class RoutedVLWrapper:
         root = self.skills.get(self.plan.metadata.get("task_skill_id", ""))
         binding = root if root and root.metadata.get("compiler") == "evidence-hierarchy-v2" else skill
         instructions = binding.metadata.get("instructions", [])
-        stage = min(self.action_call_index if binding is root else local_stage, max(0, len(instructions) - 1))
+        progress = self.runtime.stage if self.runtime else (self.action_call_index if binding is root else local_stage)
+        stage = min(progress, max(0, len(instructions) - 1))
         primitives = binding.metadata.get("leaf_primitive_ids", [])
         current_primitive = primitives[stage] if primitives else "inspect current UI"
+        if self.runtime and current_primitive == "control.finish":
+            current_primitive = "reason.verify (stage index is NOT proof of completion)"
         from ..skills.evidence_miner import GUARD
 
+        label = ("PMT-Skill reference guidance (live UI takes priority)" if self.runtime else
+                 "PMT-Skill guidance (evidence-based; not student-calibrated)")
         header = (
-            "\n\nPMT-Skill guidance (evidence-based; not student-calibrated):\n"
+            f"\n\n{label}:\n"
             f"Skill: {skill.name[:100]}\nCurrent primitive: {current_primitive}\n"
             f"Approximate stage: {stage + 1}/{max(1, len(instructions))}. Check the live UI; progress is advisory.\n"
             + GUARD + "\n"
@@ -248,13 +290,20 @@ class RoutedVLWrapper:
     def predict_mm(
         self, text_prompt: str, images: list[Any]
     ) -> tuple[str, bool | None, dict[str, Any] | None]:
-        is_summary = "summerize the latest step" in text_prompt.lower()
+        is_summary = (not self._pending_action) if self._pending_action is not None else any(
+            marker in text_prompt.lower() for marker in ("summerize the latest step", "summarize the latest step"))
         # 动作总结必须沿用刚才动作选择的模型，不能提前切到下一 route step。
         route_step = (
             self._last_action_step
             if is_summary and self._last_action_step is not None
             else self._route_step()
         )
+        decision = {}
+        if not is_summary and self.runtime:
+            route_step, decision = self.runtime.select(route_step, text_prompt, self.plan.goal,
+                                                       self._binding(self.skills.get(route_step.skill_id or "")))
+        elif is_summary and self.runtime:
+            decision = self.runtime.last_decision
         skill = self.skills.get(route_step.skill_id or "")
         augmented = text_prompt
         stage_index = None
@@ -270,10 +319,26 @@ class RoutedVLWrapper:
                     f"- 技能说明：{skill.body[:3000] if skill else '按原语完成一个可靠动作。'}\n"
                     "以上约束不能改变 AndroidWorld 要求的 Reason/Action 输出格式。"
                 )
+                if self.runtime and not skill:
+                    # Plan exhaustion is not task completion, and bare recovery
+                    # should not keep forcing the final control.finish primitive.
+                    from ..skills.evidence_miner import GUARD
+                    guidance = "\n\nPORTS live-UI recovery (no skill injected):\n" + GUARD + "\n"
+            if self.runtime:
+                guidance += self.runtime.recovery_guidance()
+                if self.supported_apps:
+                    guidance += "\nSupported open_app names (installation not guaranteed): " + ", ".join(self.supported_apps) + ".\n"
             augmented += guidance
             guidance_chars = len(guidance)
         client = self.model_pool.client(route_step.model_id)
         output, safe, raw = client.predict_mm(augmented, images)  # type: ignore[attr-defined]
+        summary_fallback = False
+        if self.runtime and is_summary and raw is not None and (
+                str(output).lstrip().startswith(("{", "```")) and '"action_type"' in str(output)
+                or str(output).lstrip().startswith("Reason:") and "Action:" in str(output)):
+            from .runtime import grounded_summary
+            output = grounded_summary(text_prompt)
+            summary_fallback = True
         route_metadata = {
             "model_id": route_step.model_id,
             "skill_score_source": self.plan.metadata.get("skill_score_sources", {}).get(route_step.step_id, "primitive_prior"),
@@ -282,7 +347,11 @@ class RoutedVLWrapper:
             "is_summary": is_summary,
             "guidance_chars": guidance_chars,
             "skill_stage_index": stage_index,
+            "summary_fallback": summary_fallback,
         }
+        if self.runtime:
+            route_metadata.update({"routing_mode": "ports_observation_rerouting",
+                                   "ports_runtime": decision, "skill_score_source": decision.get("score_source", "primitive_prior")})
         if raw is not None:
             raw = dict(raw)
             raw.setdefault("_pmtskill", {}).update(route_metadata)
@@ -290,6 +359,8 @@ class RoutedVLWrapper:
         if not is_summary:
             self._last_action_step = route_step
             self.action_call_index += 1
+            if self._pending_action is not None:
+                self._pending_action = False
         return output, safe, raw
 
     def predict(self, text_prompt: str):

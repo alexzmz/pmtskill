@@ -64,6 +64,7 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(split.switch_count, 1)
 
         high_penalty = RoutingConfig(
+            objective="weighted",
             latency_weight=0,
             switch_weight=0.02,
             polished_bonus=0,

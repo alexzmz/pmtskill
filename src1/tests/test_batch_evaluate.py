@@ -16,6 +16,7 @@ from unittest import mock
 from src1 import batch_evaluate as batch
 from src1.baseline_skvm.evaluator import MultimodalAdaptiveClient, MultimodalSkillProxy
 from src1.baseline_vdroid.qwen import QwenVerifier, yes_no_score
+from src1.pmtskill_v2.online.runtime import PORTS_RUNTIME_PROTOCOL
 from src1.pmtskill_v2.cli import build_parser as cli_parser
 from src1.pmtskill_v2.evaluation.resume import vdroid_resume_specification
 
@@ -308,7 +309,8 @@ class BatchEvaluationTest(unittest.TestCase):
                         "evaluation_available": True, "episodes_total": 2,
                         "episodes_evaluated": 2, "successes": 1,
                         "success_rate_micro": 0.5, "success_rate_macro": 0.5,
-                        "metadata": {"skvm_tool_protocol": batch.SKVM_TOOL_PROTOCOL,
+                        "metadata": {"runtime_protocol": PORTS_RUNTIME_PROTOCOL,
+                                     "skvm_tool_protocol": batch.SKVM_TOOL_PROTOCOL,
                                      "skvm_context_policy": batch.SKVM_CONTEXT_POLICY,
                                      "skvm_stability_policy": batch.SKVM_STABILITY_POLICY},
                     }), encoding="utf-8")

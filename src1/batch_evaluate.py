@@ -36,6 +36,10 @@ ROOT = Path(__file__).resolve().parents[1]
 METHODS = ("standalone", "simple-skill", "skvm", "vdroid", "ports")
 COMMANDS = dict(zip(METHODS, ("evaluate-standalone", "evaluate-simple-skills",
                             "evaluate-skvm", "evaluate-vdroid-qwen", "evaluate-pmtskill")))
+ALL_METHODS = (*METHODS[:-1], "androidworld", "echotrail-gui", "random-skvm", "ports")
+COMMANDS.update({"androidworld": "evaluate-androidworld", "echotrail-gui": "evaluate-echotrail-gui",
+                 "random-skvm": "evaluate-random-skvm"})
+SKILL_METHODS = {"simple-skill", "skvm", "random-skvm", "ports"}
 DEFAULT_ADAPTERS = (
     "src1/runtime/checkpoints/adapter_control01",
     "src1/runtime/checkpoints/adapter_crossapp01",
@@ -58,13 +62,13 @@ def parse_tasks(values):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="五种方法共用同一个 PORTS TOML")
+    parser.add_argument("--config", required=True, help="各方法共用同一个 PORTS TOML")
     parser.add_argument("--output-dir", required=True, help="固定批次目录；再次运行即续跑")
     parser.add_argument("--skill-database", help="默认读取 TOML；首次运行创建一致性快照")
     parser.add_argument("--adapter-paths", nargs=3, default=DEFAULT_ADAPTERS)
     parser.add_argument("--adapter-model-ids", nargs=3,
                         default=("adapter_control01", "adapter_crossapp01", "adapter_all02"))
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
+    parser.add_argument("--methods", nargs="+", choices=ALL_METHODS, default=METHODS)
     parser.add_argument("--tasks", nargs="+")
     parser.add_argument("--task-count", type=int)
     parser.add_argument("--combinations", type=int, default=2)
@@ -80,7 +84,15 @@ def build_parser():
     parser.add_argument("--store-trajectories", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--continue-on-error", action="store_true", help="单个方法失败后继续；错误结果仍显示 N/A")
-    parser.add_argument("--dry-run", action="store_true", help="只打印五个命令，不写文件、不启动服务")
+    parser.add_argument("--dry-run", action="store_true", help="只打印所选方法的命令，不写文件、不启动服务")
+    parser.add_argument("--prepare-only", action="store_true", help="冻结输入、创建各方法目录并预检；不启动评测")
+    parser.add_argument("--androidworld-agent", choices=["m3a", "t3a"], default="m3a")
+    parser.add_argument("--echotrail-memory", help="prepare-echotrail-memory 生成的 memory.json")
+    parser.add_argument("--embedding-model-path", help="与记忆建库时相同权重的本地语义模型目录")
+    parser.add_argument("--memory-alpha", type=float, default=0.5)
+    parser.add_argument("--memory-top-k", type=int, default=2)
+    parser.add_argument("--memory-max-chars", type=int, default=12000)
+    parser.add_argument("--routing-seed", type=int, default=42)
     parser.add_argument("--skvm-command")
     parser.add_argument("--skvm-prepare", choices=("auto", "reuse", "force"), default="auto")
     parser.add_argument("--skvm-profile-instances", type=int, default=3)
@@ -119,22 +131,31 @@ def build_commands(args, adapters=None, tasks=None):
         command = [sys.executable, "-m", "src1", "--config", str(Path(args.config).resolve()),
                    "--log-dir", str(folder / "cli_logs"), COMMANDS[method], *common,
                    "--output-dir", str(folder)]
-        if method == "ports":
+        if method in {"ports", "random-skvm"}:
             command += ["--adapter-paths", *map(str, adapters),
                         "--adapter-model-ids", *args.adapter_model_ids]
         else:
             command += ["--adapter-path", str(adapters[0]), "--model-id", args.adapter_model_ids[0]]
-        if method in {"simple-skill", "skvm", "ports"}:
+        if method in SKILL_METHODS:
             command += ["--skill-database", str(folder / "skill_library.sqlite3"), "--no-record-traces"]
             if args.include_candidates:
                 command += ["--include-candidates"]
-        if method == "skvm":
+        if method in {"skvm", "random-skvm"}:
             command += ["--skvm-prepare", args.skvm_prepare,
                         "--skvm-profile-instances", str(args.skvm_profile_instances)]
             if args.skvm_command:
                 command += ["--skvm-command", args.skvm_command]
             command += ["--skvm-failure-policy", args.skvm_failure_policy,
                         "--skvm-compile-retries", str(args.skvm_compile_retries)]
+        if method == "random-skvm":
+            command += ["--routing-seed", str(args.routing_seed)]
+        if method == "androidworld":
+            command += ["--androidworld-agent", args.androidworld_agent]
+        if method == "echotrail-gui":
+            command += ["--memory-file", str(output / "inputs" / "echotrail_memory.json"),
+                        "--embedding-model-path", str(args.embedding_model_path or "MISSING_EMBEDDING_MODEL"),
+                        "--memory-alpha", str(args.memory_alpha), "--memory-top-k", str(args.memory_top_k),
+                        "--memory-max-chars", str(args.memory_max_chars)]
         if method == "vdroid":
             command += ["--vdroid-score-workers", str(args.vdroid_score_workers),
                         "--vdroid-search-iterations", str(args.vdroid_search_iterations)]
@@ -156,7 +177,7 @@ def snapshot_database(source, target):
 
 
 def validate_dependencies(args, config):
-    if "skvm" in args.methods and args.skvm_prepare != "reuse":
+    if {"skvm", "random-skvm"}.intersection(args.methods) and args.skvm_prepare != "reuse":
         if args.skvm_command:
             available = Path(args.skvm_command).is_file() or shutil.which(args.skvm_command)
         else:
@@ -176,6 +197,9 @@ def read_summary(job, expected):
         complete = (summary.get("evaluation_available") is True
                     and summary.get("episodes_total") == expected
                     and summary.get("episodes_evaluated") == expected)
+        if job["method"] == "ports":
+            from .pmtskill_v2.online.runtime import PORTS_RUNTIME_PROTOCOL
+            complete = complete and summary.get("metadata", {}).get("runtime_protocol") == PORTS_RUNTIME_PROTOCOL
         if job["method"] == "skvm":
             metadata = summary.get("metadata")
             complete = complete and isinstance(metadata, dict) and metadata.get("skvm_tool_protocol") == SKVM_TOOL_PROTOCOL
@@ -184,6 +208,14 @@ def read_summary(job, expected):
             strict = ("--skvm-failure-policy" in policy_flag
                       and policy_flag[policy_flag.index("--skvm-failure-policy") + 1] == "strict")
             complete = complete and metadata.get("skvm_stability_policy") == ("strict" if strict else SKVM_STABILITY_POLICY)
+        if job["method"] in {"androidworld", "echotrail-gui", "random-skvm"}:
+            from .baselines.echotrail import PROTOCOL as ECHO_PROTOCOL
+            from .baselines.random_skvm import PROTOCOL as RANDOM_PROTOCOL
+            command = job.get("command", [])
+            kind = command[command.index("--androidworld-agent") + 1] if "--androidworld-agent" in command else "m3a"
+            expected_mode = {"androidworld": f"androidworld-official-{kind}-qwen-v1",
+                             "echotrail-gui": ECHO_PROTOCOL, "random-skvm": RANDOM_PROTOCOL}[job["method"]]
+            complete = complete and summary.get("metadata", {}).get("evaluation_mode") == expected_mode
         return summary, complete
     except (OSError, ValueError, TypeError, AttributeError):
         return {}, False
@@ -235,8 +267,10 @@ def write_comparison(output, jobs, state, expected):
         return "N/A" if value is None else f"{value:.2%}"
     def number(value):
         return "N/A" if value is None else f"{value:.2f}"
-    lines = ["# AndroidWorld 五方法对比", "",
-             "四个 baseline 固定第一个 adapter；PORTS 使用三个 adapter 池。",
+    lines = ["# AndroidWorld 方法对比", "",
+             "固定模型 baseline 使用第一个 adapter；随机 SKVM 和 PORTS 使用三个 adapter 池。",
+             "AndroidWorld 默认是 ICLR2025 官方 M3A，与 standalone 使用同一 agent，不应当成独立方法增益。",
+             "EchoTrail-GUI 是论文/Qwen 适配版；记忆来自独立探索或显式标注的历史导入，来源见 metadata，不是原论文结果。",
              "V-Droid-Qwen 是改造版：保留原生候选枚举/搜索，改用 Qwen Yes/No 概率评分，"
              "不是原论文的训练 verifier。各方法独立启动服务，顺序使用同一 GPU 和模拟器。",
              "失败、未完成或基础设施不可用的实验标为 N/A，不当作 SR=0。", "",
@@ -254,13 +288,14 @@ def write_comparison(output, jobs, state, expected):
                          f"原始（未适配）技能回退数：{row['skvm_original_fallback_skills']}。"
                          "若覆盖率为 0，本轮是原始技能回退结果，不代表 SKVM 适配效果。")
             lines.append("")
-    lines += ["", "技能库使用批次开始时的冻结快照，三个技能方法各用独立副本。"
+    lines += ["", "技能库使用批次开始时的冻结快照，各技能方法使用独立副本。"
               "默认不保存完整轨迹，保留报告、轻量 checkpoint、日志和 SKVM 编译/能力评估产物。",
               "PORTS 的增益包含多 adapter 池的影响，不是等模型资源的纯算法消融。",
               "V-Droid 使用上游独立 AndroidWorld fork；同名任务/seed 不保证两版本的参数实现完全相同，"
               "应同时检查各自 checkpoint 中的 goal/task_seed。", "", "## 详细报告", ""]
     for job in jobs:
-        lines.append(f"- [{job['method']}]({Path(job['output_dir']).name}/report.md)")
+        relative = Path(job["output_dir"]).relative_to(output).as_posix()
+        lines.append(f"- [{job['method']}]({relative}/report.md)")
         if state.get(job["method"], {}).get("error"):
             lines.append(f"  - {state[job['method']]['error']}")
     (output / "comparison.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -309,7 +344,7 @@ def run(args):
     # Preview intentionally does not require any Linux adapter paths to exist.
     if args.dry_run:
         jobs = build_commands(args)
-        print("DRY RUN: baselines=adapter_control01; PORTS=three-adapter pool")
+        print("DRY RUN: fixed baselines=first adapter; PORTS/random-SKVM=three-adapter pool")
         for job in jobs:
             print(shlex.join(job["command"]))
         return 0
@@ -319,6 +354,15 @@ def run(args):
 
     config = load_config(args.config)
     validate_dependencies(args, config)
+    echo_identity = None
+    if "echotrail-gui" in args.methods:
+        from .baselines.echotrail import embedding_identity
+        if not args.echotrail_memory or not args.embedding_model_path:
+            raise ValueError("EchoTrail 需要 --echotrail-memory 和 --embedding-model-path；先独立建库")
+        echo_identity = {"memory_sha256": file_sha256(args.echotrail_memory),
+                         "embedding": embedding_identity(args.embedding_model_path),
+                         "alpha": args.memory_alpha, "k": args.memory_top_k,
+                         "max_chars": args.memory_max_chars}
     preview = build_commands(args)
     ports = next((item for item in preview if item["method"] == "ports"), None)
     # Record real checkpoint identities and check them before every method.
@@ -347,6 +391,10 @@ def run(args):
             "vdroid": {"source": args.vdroid_root, "workers": args.vdroid_score_workers,
                        "iterations": args.vdroid_search_iterations}}
     manifest_path = output / "batch_manifest.json"
+    if set(args.methods) - set(METHODS):
+        spec["protocol"] = "extended-method-fixed-first-v1"
+        spec["additional_baselines"] = {"androidworld_agent": args.androidworld_agent,
+                                        "routing_seed": args.routing_seed, "echotrail": echo_identity}
     # Keep old default batch specifications compatible when they stopped
     # before episodes; kernel provenance separately isolates completed runs.
     if args.skvm_failure_policy != "fallback" or args.skvm_compile_retries != 1:
@@ -369,8 +417,27 @@ def run(args):
                     "skill_database_sha256": file_sha256(database),
                     "created_at": dt.datetime.now().isoformat(), "expected_episodes_per_method": expected}
         write_json_atomic(manifest_path, manifest)
+    if echo_identity:
+        frozen_memory = output / "inputs" / "echotrail_memory.json"
+        if not frozen_memory.exists():
+            shutil.copyfile(args.echotrail_memory, frozen_memory)
+        if file_sha256(frozen_memory) != echo_identity["memory_sha256"]:
+            raise ValueError("批次冻结的 EchoTrail 记忆已改变，请使用新 output-dir")
+    # Reference copy only: relative TOML paths still resolve at the original path.
+    # Commands deliberately keep that original path and guard its SHA on resume.
+    reference = output / "inputs" / "config.reference.toml"
+    if not reference.exists():
+        shutil.copyfile(config.config_path, reference)
+    write_json_atomic(output / "inputs" / "environment.json", {
+        "repo_root": str(ROOT), "python": sys.executable, "config_in_use": str(config.config_path),
+        "androidworld_root": str(config.paths.android_world_root),
+        "console_port": config.android_world.console_port, "grpc_port": config.android_world.grpc_port,
+        "cuda_visible_devices": args.cuda_visible_devices, "deploy_port": args.deploy_port,
+        "note": "config.reference.toml is an archive, not a relocatable configuration",
+    })
     for job in jobs:
-        if job["method"] in {"simple-skill", "skvm", "ports"}:
+        Path(job["output_dir"]).mkdir(parents=True, exist_ok=True)
+        if job["method"] in SKILL_METHODS:
             copy = Path(job["output_dir"]) / "skill_library.sqlite3"
             if not copy.exists():
                 snapshot_database(database, copy)
@@ -392,6 +459,10 @@ def run(args):
             write_json_atomic(state_path, state)
             write_comparison(output, jobs, state, expected)
             return 1
+    if args.prepare_only:
+        print(f"已冻结输入并通过预检，未启动模型/模拟器：{output}")
+        print("去掉 --prepare-only 重复同一条命令，即开始/继续评测。")
+        return 0
     failed = False
     for job in jobs:
         name = job["method"]

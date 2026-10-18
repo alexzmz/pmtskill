@@ -3,6 +3,13 @@
 五方法串行对比（四个 baseline 固定 control01，PORTS 使用三个 adapter）：见
 [批量评测说明](BATCH_EVALUATION.md)，入口为 `python -m src1.batch_evaluate`。
 
+新增 AndroidWorld 官方 M3A/T3A、EchoTrail-GUI 论文/Qwen 适配版、随机 adapter 路由 + SKVM：
+见 [八入口 CLI 与环境准备](EIGHT_METHOD_EVALUATION.md)，入口为 `python -m src1.compare_eight`，
+支持 `--prepare-only` 冻结输入后再开始实验。默认官方 M3A 与已有 standalone 重合，报告中明确标注。
+
+PORTS 的成功率优先路由、卡住恢复、固定步数预算与重测指令见
+[PORTS 成功率优先评测](PORTS_SUCCESS_FIRST.md)。新路由协议不能混用旧目录中的已完成结果。
+
 本目录是新框架，主体与旧 `src` 隔离；`evaluate-skvm` 显式复用旧 runner 的 SKVM
 内核集成代码，但不复用旧 T3A 评测流程。它按照 PPT 的思路实现三条闭环：
 
@@ -13,7 +20,7 @@
 3. **backend 技能优化**：设备上传成功/失败轨迹；backend 挖掘高频成功子路径，
    生成候选 polished skill，经过真实 trial 后晋升，退化时自动回滚。
 
-旧目录 `src` 不会被导入或修改。新框架只读取：
+除 SKVM baseline 显式复用旧 `src` 的内核集成代码外，主框架不依赖旧评测流程。主要依赖：
 
 - `libs/android_world`：环境、M3A agent、任务 evaluator 和 checkpointer；
 - `libs/skvm/skvm-data/skills`：raw skill 初始来源；

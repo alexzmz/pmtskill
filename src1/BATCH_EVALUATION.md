@@ -72,6 +72,27 @@ PORTS 使用现有分层规划/路由，不改变生命周期或离线估算记�
 
 原 `evaluate-vdroid` 原生 Llama 入口不变。新入口均读取主配置 TOML。
 
+### SKVM 工具调用协议修复
+
+ms-swift 可能同时返回有效的 `tool_calls` 和 `finish_reason="stop"`，旧 SKVM
+会把它当作 `end_turn`，在执行工具之前退出，导致“1 step、文件不存在、L0”。
+现有 Python 启动器会自动启动仅监听本机的兼容桥，将这类有效调用的结束标记
+修正为 `tool_calls`；不从文本猜测工具，不修改参数，不改动截断或过滤响应。
+因此继续使用 `/root/.local/bin/skvm` 二进制也可以生效，无需先重新编译。
+必须同步根目录 `src/skvm_protocol.py` 和 `src/task_runner_skvm.py`，不能只同步 `src1`。
+
+旧 TCP/AOT 缓存保留原样，新结果自动放在原缓存根目录的 `openai-tool-calls-v2/`
+子目录，避免把旧的错误 L0 画像继续复用。使用默认 `--skvm-prepare auto` 即可重新准备，
+不必把批次参数改成 force。当前日志中应出现 `SkVM tool-call compatibility bridge`，
+准备完成后 `skvm/protocol-compat.json` 记录被修正的响应数量。
+正式评测阶段仍直接连接原模型服务，不经过这个桥。
+如果旧 SKVM 已经产生正式 episode，批量脚本会自动改用
+`skvm/openai-tool-calls-v2/` 保存重测结果，不改动旧文件，也不重测其他已完成方法。
+只有 profiling/AOT 阶段中断的批次继续使用原来的 `skvm/` 目录。
+单独使用 `evaluate-skvm` 时，旧 episode 目录会被明确拒绝，需要指定新输出目录。
+
+仓库 `libs/skvm` 子模块中的 provider 也已做同样修复，使用源码或重新构建时生效。
+
 ## 解读限制
 
 PORTS 有三个 adapter，其他方法只有一个，增益包含模型池资源的贡献，不是等模型

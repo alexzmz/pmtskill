@@ -16,6 +16,7 @@ from typing import Any
 
 from ..pmtskill_v2.core.io import write_json_atomic
 from ..pmtskill_v2.evaluation.resume import fingerprint, model_resume_identity
+from .protocol import SKVM_TOOL_PROTOCOL, validate_protocol_resume
 
 
 def legacy_kernel_module():
@@ -76,6 +77,7 @@ def run_skvm(config, store, profile, args, tasks):
 
     legacy = legacy_kernel_module()
     target = Path(args.output_dir).expanduser().resolve()
+    validate_protocol_resume(target)
     skills = AndroidWorldSimpleSkillEvaluator(config, store)._skills(args.include_candidates)
     if not skills:
         raise ValueError("SKVM 没有可用技能；不会悄悄退化成 standalone")
@@ -114,6 +116,7 @@ def run_skvm(config, store, profile, args, tasks):
         store_trajectories=args.store_trajectories,
         extra={"skvm_identity": identity, "protocol": "skvm-aot-m3a-v1"},
     )
+    write_json_atomic(target / "skvm" / "kernel-protocol.json", {"protocol": SKVM_TOOL_PROTOCOL})
     for source in sources:
         source.path.parent.mkdir(parents=True, exist_ok=True)
         source.path.write_text(source.content, encoding="utf-8")
@@ -177,6 +180,7 @@ def run_skvm(config, store, profile, args, tasks):
                       "seed": args.seed, "family": args.family, "max_steps": args.max_steps,
                       "dynamic_model_routing": False, "skill_adaptation": True,
                       "skvm_identity": identity, "skvm_variant_policy": "aot",
+                      "skvm_tool_protocol": SKVM_TOOL_PROTOCOL,
                       "skvm_runtime_counter_scope": "all_saved_requests" if args.store_trajectories else "current_invocation",
                       "resume": progress.metadata()},
         )

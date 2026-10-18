@@ -28,6 +28,7 @@ from pathlib import Path
 from .pmtskill_v2.core.config import load_config
 from .pmtskill_v2.core.io import write_json_atomic
 from .pmtskill_v2.evaluation.capabilities import CAPABILITY_ORDER
+from .baseline_skvm.protocol import SKVM_TOOL_PROTOCOL, output_for_protocol
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +111,8 @@ def build_commands(args, adapters=None, tasks=None):
     jobs = []
     for method in dict.fromkeys(args.methods):
         folder = output / method.replace("-", "_")
+        if method == "skvm":
+            folder = output_for_protocol(folder)
         command = [sys.executable, "-m", "src1", "--config", str(Path(args.config).resolve()),
                    "--log-dir", str(folder / "cli_logs"), COMMANDS[method], *common,
                    "--output-dir", str(folder)]
@@ -168,8 +171,11 @@ def read_summary(job, expected):
         complete = (summary.get("evaluation_available") is True
                     and summary.get("episodes_total") == expected
                     and summary.get("episodes_evaluated") == expected)
+        if job["method"] == "skvm":
+            metadata = summary.get("metadata")
+            complete = complete and isinstance(metadata, dict) and metadata.get("skvm_tool_protocol") == SKVM_TOOL_PROTOCOL
         return summary, complete
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         return {}, False
 
 
@@ -179,8 +185,11 @@ def comparison_rows(jobs, state, expected):
         result = state.get(job["method"], {})
         summary, complete = read_summary(job, expected)
         valid = result.get("status") == "completed" and complete
+        status = result.get("status", "pending")
+        if status == "completed" and not complete:
+            status = "pending"
         row = {"method": "vdroid-qwen-adapted" if job["method"] == "vdroid" else job["method"],
-               "status": result.get("status", "pending"), "expected_episodes": expected,
+               "status": status, "expected_episodes": expected,
                "episodes_evaluated": summary.get("episodes_evaluated"),
                "successes": summary.get("successes") if valid else None,
                "micro_sr": summary.get("success_rate_micro") if valid else None,

@@ -254,7 +254,7 @@ class KernelArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             skill = make_skill(root / "source")
-            cache = root / "cache"
+            cache = root / "cache" / runner.SKVM_TOOL_PROTOCOL
             safe_model = "vllm--test"
             aot_root = (
                 cache
@@ -294,7 +294,7 @@ class KernelArtifactTests(unittest.TestCase):
             )
 
             args = SimpleNamespace(
-                skvm_cache_dir=cache,
+                skvm_cache_dir=cache.parent,
                 skvm_target_model="vllm/test",
                 skvm_compiler_model="target",
                 skvm_aot_pass_sets=["1", "1,3"],

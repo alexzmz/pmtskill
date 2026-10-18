@@ -52,6 +52,7 @@ from urllib import request as urllib_request
 
 import task_runner_detail
 import skvm_reporting
+from skvm_protocol import SKVMProtocolBridge, SKVM_TOOL_PROTOCOL
 
 
 REPO_ROOT = task_runner_detail.REPO_ROOT
@@ -533,7 +534,9 @@ class SkVMKernel:
         self.args = args
         self.skills = list(skills)
         self.run_dir = run_dir
-        self.cache_dir = args.skvm_cache_dir.expanduser().resolve()
+        # Keep old profiles/AOT files intact, but never reuse TCPs produced when
+        # valid tool calls were discarded as end_turn by the previous protocol.
+        self.cache_dir = args.skvm_cache_dir.expanduser().resolve() / SKVM_TOOL_PROTOCOL
         self.vllm_base_url = _normalize_base_url(vllm_base_url)
         self.served_model = served_model
         self.target_model = (
@@ -675,6 +678,28 @@ class SkVMKernel:
         ]
 
     def prepare(self) -> list[SkillVariant]:
+        if self.args.skvm_prepare in {"off", "reuse"}:
+            return self._prepare()
+        upstream_url = self.vllm_base_url
+        with SKVMProtocolBridge(upstream_url) as bridge:
+            print(f"SkVM tool-call compatibility bridge: {bridge.base_url} -> {upstream_url}", flush=True)
+            self.vllm_base_url = bridge.base_url
+            try:
+                return self._prepare()
+            finally:
+                active_error = sys.exc_info()[0]
+                self.vllm_base_url = upstream_url
+                try:
+                    # Do not leave an ephemeral/dead proxy URL in persistent config.
+                    if (self.cache_dir / "skvm.config.json").is_file():
+                        self._configure_local_route()
+                    _write_json(self.run_dir / "skvm" / "protocol-compat.json", bridge.summary())
+                except Exception:
+                    if not active_error:
+                        raise
+                print(f"SkVM tool-call compatibility: normalized {bridge.normalized_choices} choices", flush=True)
+
+    def _prepare(self) -> list[SkillVariant]:
         mode = self.args.skvm_prepare
         if mode == "off":
             return self.load_variants(include_aot=False)
@@ -888,6 +913,7 @@ class SkVMKernel:
             "skvm_version": package_version,
             "skvm_root": str(SKVM_ROOT),
             "skvm_cache": str(self.cache_dir),
+            "tool_call_protocol": SKVM_TOOL_PROTOCOL,
             "target_model": self.target_model,
             "compiler_model": self.compiler_model,
             "adapter": SKVM_ADAPTER,

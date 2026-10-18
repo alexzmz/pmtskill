@@ -297,7 +297,12 @@ class BatchEvaluationTest(unittest.TestCase):
                         "evaluation_available": True, "episodes_total": 2,
                         "episodes_evaluated": 2, "successes": 1,
                         "success_rate_micro": 0.5, "success_rate_macro": 0.5,
+                        "metadata": {"skvm_tool_protocol": batch.SKVM_TOOL_PROTOCOL},
                     }), encoding="utf-8")
+                    if "evaluate-skvm" in command:
+                        marker = output / "skvm" / "kernel-protocol.json"
+                        marker.parent.mkdir(parents=True, exist_ok=True)
+                        marker.write_text(json.dumps({"protocol": batch.SKVM_TOOL_PROTOCOL}), encoding="utf-8")
                 return 0
 
             with mock.patch.object(batch, "validate_dependencies"), mock.patch.object(
@@ -308,6 +313,21 @@ class BatchEvaluationTest(unittest.TestCase):
                 calls.clear()
                 self.assertEqual(batch.run(args), 0)
                 self.assertEqual(calls, [])
+                # A completed pre-fix SKVM run must not be reused. Other four
+                # methods remain skipped; only SKVM is rerun in a new folder.
+                previous = Path(args.output_dir) / "skvm"
+                marker = previous / "skvm" / "kernel-protocol.json"
+                marker.unlink()
+                summary_path = previous / "summary.json"
+                legacy_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                legacy_summary.pop("metadata")
+                summary_path.write_text(json.dumps(legacy_summary), encoding="utf-8")
+                before = summary_path.read_bytes()
+                self.assertEqual(batch.run(args), 0)
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(all("evaluate-skvm" in command for command in calls))
+                self.assertEqual(summary_path.read_bytes(), before)
+                self.assertTrue((previous / batch.SKVM_TOOL_PROTOCOL / "summary.json").is_file())
             manifest = json.loads((Path(args.output_dir) / "batch_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["specification"]["tasks"], ["ContactsAddContact"])
             self.assertTrue((Path(args.output_dir) / "ports" / "skill_library.sqlite3").is_file())

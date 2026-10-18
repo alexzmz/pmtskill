@@ -28,7 +28,8 @@ from pathlib import Path
 from .pmtskill_v2.core.config import load_config
 from .pmtskill_v2.core.io import write_json_atomic
 from .pmtskill_v2.evaluation.capabilities import CAPABILITY_ORDER
-from .baseline_skvm.protocol import SKVM_TOOL_PROTOCOL, output_for_protocol
+from .baseline_skvm.protocol import (SKVM_TOOL_PROTOCOL, SKVM_CONTEXT_POLICY,
+                                     SKVM_EVALUATION_PROTOCOL, output_for_protocol)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -174,6 +175,7 @@ def read_summary(job, expected):
         if job["method"] == "skvm":
             metadata = summary.get("metadata")
             complete = complete and isinstance(metadata, dict) and metadata.get("skvm_tool_protocol") == SKVM_TOOL_PROTOCOL
+            complete = complete and metadata.get("skvm_context_policy") == SKVM_CONTEXT_POLICY
         return summary, complete
     except (OSError, ValueError, TypeError, AttributeError):
         return {}, False

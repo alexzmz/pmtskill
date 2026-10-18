@@ -244,6 +244,8 @@ def _variant_evaluation(
                 "skill_id": variant.skill.skill_id,
                 "source": variant.source,
                 "variant": variant.tag,
+                "plan_schema": plan.get("_plan_schema", "registry" if "passRuns" in plan else "none"),
+                "pass_telemetry_available": bool(pass_runs),
                 "changed_from_original": (
                     variant.sha256 != variant.skill.sha256
                 ),
@@ -259,13 +261,13 @@ def _variant_evaluation(
                     for item in pass_runs.values()
                     if isinstance(item, Mapping)
                     and item.get("status") == "ok"
-                ),
+                ) if pass_runs else None,
                 "failed_pass_count": sum(
                     1
                     for item in pass_runs.values()
                     if isinstance(item, Mapping)
                     and item.get("status") == "failed"
-                ),
+                ) if pass_runs else None,
                 "proposal_id": variant.proposal_id,
                 "source_path": str(variant.path),
                 "snapshot_path": str(snapshot),

@@ -79,7 +79,7 @@ ms-swift 可能同时返回有效的 `tool_calls` 和 `finish_reason="stop"`，�
 现有 Python 启动器会自动启动仅监听本机的兼容桥，将这类有效调用的结束标记
 修正为 `tool_calls`；不从文本猜测工具，不修改参数，不改动截断或过滤响应。
 因此继续使用 `/root/.local/bin/skvm` 二进制也可以生效，无需先重新编译。
-必须同步根目录 `src/skvm_protocol.py` 和 `src/task_runner_skvm.py`，不能只同步 `src1`。
+必须同时同步根目录 `src/` 和 `src1/`，包含新增的 `src/skvm_artifacts.py`，不能只同步 `src1`。
 
 旧 TCP/AOT 缓存保留原样，新结果自动放在原缓存根目录的 `openai-tool-calls-v2/`
 子目录，避免把旧的错误 L0 画像继续复用。使用默认 `--skvm-prepare auto` 即可重新准备，
@@ -87,11 +87,39 @@ ms-swift 可能同时返回有效的 `tool_calls` 和 `finish_reason="stop"`，�
 准备完成后 `skvm/protocol-compat.json` 记录被修正的响应数量。
 正式评测阶段仍直接连接原模型服务，不经过这个桥。
 如果旧 SKVM 已经产生正式 episode，批量脚本会自动改用
-`skvm/openai-tool-calls-v2/` 保存重测结果，不改动旧文件，也不重测其他已完成方法。
+`skvm/openai-tool-calls-v2-bounded-tool-evidence-v1/` 保存重测结果，不改动旧文件，也不重测其他已完成方法。
 只有 profiling/AOT 阶段中断的批次继续使用原来的 `skvm/` 目录。
 单独使用 `evaluate-skvm` 时，旧 episode 目录会被明确拒绝，需要指定新输出目录。
 
 仓库 `libs/skvm` 子模块中的 provider 也已做同样修复，使用源码或重新构建时生效。
+
+### AOT 格式与上下文预算修复
+
+兼容已发布二进制的顶层 `scr/gaps/pass3.dag`，以及源码版的
+`artifacts/passRuns`。转换仅发生在内存中，旧 JSON 不被改写，也不伪造
+旧版不存在的 pass 成功记录；`variants.csv` 中用 `plan_schema` 和
+`pass_telemetry_available` 区分。无 gap 时变体与原文相同是合法的编译结果。
+
+默认 `--skvm-prepare auto` 会检查 `SKILL.md`、编译计划、SCR、guard 和新版 pass 状态，
+只重试不完整/不合格的变体。编译器预先复制但未编译成功的原始 `SKILL.md` 不算缓存命中。
+重编译前的旧计划及技能成对备份到缓存中的 `kernel-backups/`，防止失败后用旧计划认证原文。
+不必删除缓存、不必改 TOML、不必换 SkVM 二进制；保持原批量命令和 `--resume` 即可。
+
+准备阶段的本机转发层采用 `bounded-tool-evidence-v1`：输出上限不超过
+`min(8192, context_window / 4)`，超长工具结果和编译器附带的 `_profiling/` 日志做明确标注的摘录。
+工具输出共享最多 12000 字符的预算；原任务指令、原技能、其他依赖文件及工具参数不被截断。
+完整数据仍在磁盘上，模型可通过工具分段读取或执行脚本处理。
+上下文窗口取 `--max-model-len`，未指定时使用 TOML 的 `training_evaluation.max_model_len`。
+这不是精确 token 计数；若服务仍返回上下文错误，最多再尝试两次更小摘录，仍失败则明确报
+`SKVM_CONTEXT_WINDOW_EXCEEDED`，不进入正式测试，也不把它当成真实 SR=0。
+
+旧 TCP 中带有上下文 HTTP400 的 primitive 会被定向重测（保留其他 primitive），
+依赖这些 primitive 的 AOT 会重新编译；修复清单及每个变体的 TCP 指纹持久保存，中断后可续跑。
+这是纠正了标定依据，相关变体需要更新，不仅仅是解析旧 JSON。
+`--skvm-prepare reuse` 不会修复这类 TCP，而会拒绝使用并提示切换 `auto`。
+`skvm/protocol-compat.json` 记录窗口、策略、摘录次数、输出限额、重试和未解决错误数；
+正式报告 metadata 中也保存准备统计。上下文策略更改前的正式 episode 不与新结果混跑，
+批量脚本自动隔离到上述新子目录；本次若仅在 profiling/AOT 中断，则保留原目录续跑。
 
 ## 解读限制
 

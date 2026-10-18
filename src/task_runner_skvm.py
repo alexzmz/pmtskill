@@ -52,7 +52,8 @@ from urllib import request as urllib_request
 
 import task_runner_detail
 import skvm_reporting
-from skvm_protocol import SKVMProtocolBridge, SKVM_TOOL_PROTOCOL
+from skvm_artifacts import annotation_errors, normalize_compilation_plan, referenced_primitives
+from skvm_protocol import SKVMProtocolBridge, SKVM_TOOL_PROTOCOL, SKVM_CONTEXT_POLICY, is_context_error
 
 
 REPO_ROOT = task_runner_detail.REPO_ROOT
@@ -236,6 +237,9 @@ class SkillVariant:
     sha256: str
     plan: Mapping[str, Any] = field(default_factory=dict)
     proposal_id: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "plan", normalize_compilation_plan(self.plan))
 
     def manifest(self) -> dict[str, Any]:
         artifacts = self.plan.get("artifacts") or {}
@@ -558,6 +562,88 @@ class SkVMKernel:
         ]
         self.log_path = run_dir / "skvm" / "kernel.log"
         self._command: list[str] | None = None
+        self._bridge: SKVMProtocolBridge | None = None
+        self._repair_primitives: set[str] = set()
+
+    def _cached_plan(self, skill, passes):
+        folder = self._variant_dir(skill.skill_id, passes)
+        try:
+            if not (folder / "SKILL.md").read_text(encoding="utf-8").strip():
+                return {}, ["empty SKILL.md"]
+            plan = normalize_compilation_plan(_read_json(folder / "compilation-plan.json"))
+            errors = annotation_errors(plan, skill_id=skill.skill_id, model=self.target_model,
+                                       harness=SKVM_ADAPTER, passes=passes)
+            return plan, errors
+        except (OSError, ValueError, TypeError) as exc:
+            return {}, [f"missing/unreadable compilation artifacts: {exc}"]
+
+    def _profile_path(self):
+        return (self.cache_dir / "profiles" / SKVM_ADAPTER
+                / _safe_model_name(self.target_model) / "latest.json")
+
+    def _profile_context_failures(self):
+        try:
+            profile = _read_json(self._profile_path())
+            return {detail["primitiveId"] for detail in profile.get("details", [])
+                    if any(is_context_error(failure)
+                           for level in detail.get("levelResults", [])
+                           for failure in level.get("failureDetails", []))}
+        except FileNotFoundError:
+            return set()
+
+    def _tcp_signature(self):
+        path = self._profile_path()
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "none"
+
+    def _variant_needs_profile_repair(self, skill, passes, plan):
+        if not referenced_primitives(plan) & self._repair_primitives:
+            return False
+        try:
+            stamp = _read_json(self._variant_stamp_path(skill, passes))
+            return stamp.get("tcp_sha256") != self._tcp_signature()
+        except (OSError, ValueError, AttributeError):
+            return True
+
+    def _variant_stamp_path(self, skill, passes):
+        return (self.cache_dir / "kernel-aot-state" / SKVM_ADAPTER
+                / _safe_model_name(self.target_model) / skill.skill_id / f"{_pass_tag(passes)}.json")
+
+    def _compile_variants(self, skills, passes, command):
+        for skill in skills:
+            folder = self._variant_dir(skill.skill_id, passes)
+            plan = folder / "compilation-plan.json"
+            if plan.is_file():
+                # The native CLI pre-copies SKILL.md before it calls the model.
+                # Keep a recoverable previous pair, but invalidate its plan so
+                # a failed recompile cannot certify that pre-copied original.
+                backup = (self.cache_dir / "kernel-backups" / SKVM_ADAPTER
+                          / _safe_model_name(self.target_model) / skill.skill_id / _pass_tag(passes)
+                          / dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+                backup.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(plan, backup / "compilation-plan.json")
+                if (folder / "SKILL.md").is_file():
+                    shutil.copy2(folder / "SKILL.md", backup / "SKILL.md")
+                plan.unlink()
+        try:
+            self._run(command, f"AOT compile ({_pass_tag(passes)})")
+        finally:
+            # A new CLI exits nonzero on a partially failed batch, an older
+            # binary exits zero. Keep/stamp actual successes in either case.
+            for skill in skills:
+                if not self._cached_plan(skill, passes)[1]:
+                    _write_json(self._variant_stamp_path(skill, passes),
+                                {"tcp_sha256": self._tcp_signature()})
+
+    def _profile_command(self, primitives=None, *, force=False):
+        command = ["profile", f"--model={self.target_model}", f"--adapter={SKVM_ADAPTER}",
+                   f"--instances={self.args.skvm_profile_instances}",
+                   f"--concurrency={self.args.skvm_profile_concurrency}",
+                   f"--timeout-ms={self.args.skvm_profile_timeout_ms}"]
+        if primitives:
+            command.append(f"--primitives={','.join(primitives)}")
+        if force:
+            command.append("--force")
+        return command
 
     def _variant_dir(self, skill_id: str, passes: Iterable[int]) -> Path:
         return (
@@ -671,38 +757,78 @@ class SkVMKernel:
     def _missing_variants(
         self, passes: tuple[int, ...]
     ) -> list[SkillSource]:
-        return [
-            skill
-            for skill in self.skills
-            if not (self._variant_dir(skill.skill_id, passes) / "SKILL.md").is_file()
-        ]
+        missing = []
+        for skill in self.skills:
+            plan, errors = self._cached_plan(skill, passes)
+            if errors or self._variant_needs_profile_repair(skill, passes, plan):
+                missing.append(skill)
+        return missing
 
     def prepare(self) -> list[SkillVariant]:
+        context_window = (getattr(self.args, "skvm_context_window", None)
+                          or getattr(self.args, "max_model_len", None) or 32768)
         if self.args.skvm_prepare in {"off", "reuse"}:
-            return self._prepare()
+            try:
+                return self._prepare()
+            finally:
+                active_error = sys.exc_info()[0]
+                try:
+                    _write_json(self.run_dir / "skvm" / "protocol-compat.json", {
+                        "protocol": SKVM_TOOL_PROTOCOL, "context_policy": SKVM_CONTEXT_POLICY,
+                        "context_window": context_window, "prepare_mode": self.args.skvm_prepare,
+                        "status": "failed" if active_error else "ready", "requests": 0,
+                    })
+                except Exception:
+                    if not active_error:
+                        raise
         upstream_url = self.vllm_base_url
-        with SKVMProtocolBridge(upstream_url) as bridge:
+        with SKVMProtocolBridge(upstream_url, context_window=context_window,
+                                protected_texts=[skill.content for skill in self.skills]) as bridge:
             print(f"SkVM tool-call compatibility bridge: {bridge.base_url} -> {upstream_url}", flush=True)
             self.vllm_base_url = bridge.base_url
+            self._bridge = bridge
             try:
                 return self._prepare()
             finally:
                 active_error = sys.exc_info()[0]
                 self.vllm_base_url = upstream_url
+                self._bridge = None
                 try:
                     # Do not leave an ephemeral/dead proxy URL in persistent config.
                     if (self.cache_dir / "skvm.config.json").is_file():
                         self._configure_local_route()
-                    _write_json(self.run_dir / "skvm" / "protocol-compat.json", bridge.summary())
+                    _write_json(self.run_dir / "skvm" / "protocol-compat.json", {
+                        **bridge.summary(), "prepare_mode": self.args.skvm_prepare,
+                        "status": "failed" if active_error else "ready",
+                    })
                 except Exception:
                     if not active_error:
                         raise
                 print(f"SkVM tool-call compatibility: normalized {bridge.normalized_choices} choices", flush=True)
+                print(f"SkVM context budget: {bridge.summary()}", flush=True)
 
     def _prepare(self) -> list[SkillVariant]:
         mode = self.args.skvm_prepare
         if mode == "off":
             return self.load_variants(include_aot=False)
+
+        repair_path = self.cache_dir / "aot-profile-repair.json"
+        if repair_path.is_file():
+            self._repair_primitives.update(_read_json(repair_path).get("pending_primitives", []))
+        bad_primitives = self._profile_context_failures()
+        if bad_primitives and mode == "reuse":
+            raise RuntimeError("Cached SkVM TCP contains context/infrastructure errors, not real capability scores: "
+                               + ", ".join(sorted(bad_primitives)) + "; rerun with --skvm-prepare auto")
+        if bad_primitives and mode != "force":
+            self._repair_primitives.update(bad_primitives)
+            # Persist before changing the TCP, so an interruption cannot leave
+            # old AOT files silently paired with the repaired profile.
+            _write_json(repair_path, {"pending_primitives": sorted(self._repair_primitives)})
+            self._configure_local_route()
+            print("SkVM repairing context-tainted primitives only: " + ", ".join(sorted(bad_primitives)), flush=True)
+            self._run(self._profile_command(sorted(bad_primitives), force=True), "profile context repair")
+            if self._profile_context_failures() or (self._bridge and self._bridge.context_errors):
+                raise RuntimeError("SKVM_CONTEXT_WINDOW_EXCEEDED: repaired TCP still contains infrastructure errors; AndroidWorld evaluation not started")
 
         missing_by_pass = {
             passes: self._missing_variants(passes) for passes in self.pass_sets
@@ -723,25 +849,16 @@ class SkVMKernel:
             self._configure_local_route()
             needs_profile = any(1 in passes for passes in self.pass_sets)
             if needs_profile:
-                profile_command = [
-                    "profile",
-                    f"--model={self.target_model}",
-                    f"--adapter={SKVM_ADAPTER}",
-                    f"--instances={self.args.skvm_profile_instances}",
-                    f"--concurrency={self.args.skvm_profile_concurrency}",
-                    f"--timeout-ms={self.args.skvm_profile_timeout_ms}",
-                ]
                 primitives = _split_csv_values(
                     self.args.skvm_profile_primitives
                 )
-                if primitives:
-                    profile_command.append(
-                        f"--primitives={','.join(primitives)}"
-                    )
-                if mode == "force":
-                    profile_command.append("--force")
+                profile_command = self._profile_command(primitives, force=mode == "force")
                 self._run(profile_command, "model profiling")
+                if self._profile_context_failures() or (self._bridge and self._bridge.context_errors):
+                    raise RuntimeError("SKVM_CONTEXT_WINDOW_EXCEEDED: profiling contains infrastructure errors; refusing to score them as capability failures")
 
+            if self._bridge:
+                self._bridge.stage = "compile"
             for passes in self.pass_sets:
                 compile_skills = (
                     self.skills
@@ -766,36 +883,37 @@ class SkVMKernel:
                     f"--concurrency={self.args.skvm_compile_concurrency}",
                     f"--timeout-ms={self.args.skvm_compile_timeout_ms}",
                 ]
-                self._run(
-                    compile_command,
-                    f"AOT compile ({_pass_tag(passes)})",
-                )
+                self._compile_variants(compile_skills, passes, compile_command)
 
         variants = self.load_variants(include_aot=True)
         self._validate_aot_annotations(variants)
+        if self._repair_primitives:
+            _write_json(repair_path, {"pending_primitives": []})
+            self._repair_primitives.clear()
         return variants
 
     def _validate_aot_annotations(
         self, variants: Sequence[SkillVariant]
     ) -> None:
         errors: list[str] = []
-        for variant in variants:
-            if variant.source != "aot" or "p1" not in variant.tag:
-                continue
-            artifacts = variant.plan.get("artifacts") or {}
-            pass_runs = variant.plan.get("passRuns") or {}
-            if not artifacts.get("scr"):
-                errors.append(f"{variant.skill.skill_id}/{variant.tag}: no SCR")
-            rewrite = pass_runs.get("rewrite-skill") or {}
-            if rewrite.get("status") != "ok":
-                errors.append(
-                    f"{variant.skill.skill_id}/{variant.tag}: "
-                    "rewrite-skill pass not successful"
-                )
+        found = {(v.skill.skill_id, v.tag): v for v in variants if v.source == "aot"}
+        for skill in self.skills:
+            for passes in self.pass_sets:
+                tag = _pass_tag(passes)
+                variant = found.get((skill.skill_id, tag))
+                problems = ((self._cached_plan(skill, passes)[1] or ["missing complete AOT variant"])
+                            if variant is None else
+                            annotation_errors(variant.plan, skill_id=skill.skill_id,
+                                              model=self.target_model, harness=SKVM_ADAPTER,
+                                              passes=passes))
+                if problems:
+                    errors.append(f"{skill.skill_id}/{tag}: " + "; ".join(problems))
         if errors:
             raise RuntimeError(
-                "SkVM produced incomplete AOT artifacts:\n- "
-                + "\n- ".join(errors)
+                f"SkVM produced incomplete AOT artifacts ({len(errors)} variants); "
+                "successful variants are retained, --skvm-prepare auto retries invalid ones:\n- "
+                + "\n- ".join(errors[:20])
+                + (f"\n... {len(errors) - 20} more; see kernel.log" if len(errors) > 20 else "")
             )
 
     def _latest_jit_variant(
@@ -861,15 +979,12 @@ class SkVMKernel:
             for passes in self.pass_sets:
                 variant_dir = self._variant_dir(skill.skill_id, passes)
                 skill_path = variant_dir / "SKILL.md"
-                plan_path = variant_dir / "compilation-plan.json"
                 if not skill_path.is_file():
                     continue
+                plan, problems = self._cached_plan(skill, passes)
+                if problems:
+                    continue  # A pre-copied original is not a compiled variant.
                 content = skill_path.read_text(encoding="utf-8")
-                plan: Mapping[str, Any] = {}
-                if plan_path.is_file():
-                    loaded = _read_json(plan_path)
-                    if isinstance(loaded, Mapping):
-                        plan = loaded
                 variant = SkillVariant(
                     skill=skill,
                     source="aot",

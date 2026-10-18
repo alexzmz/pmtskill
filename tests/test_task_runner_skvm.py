@@ -100,7 +100,7 @@ def make_plan(*, parallel: bool):
                 ),
             },
         },
-        "passRuns": {"rewrite-skill": {"status": "ok"}},
+        "passRuns": {"rewrite-skill": {"status": "ok"}, "extract-parallelism": {"status": "ok"}},
         "guardPassed": True,
     }
 

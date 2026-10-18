@@ -491,7 +491,11 @@ class AndroidWorldStandaloneEvaluator:
             combinations=n_task_combinations, seed=seed, family=family,
             max_steps=max_steps, resume=resume,
             store_trajectories=store_trajectories,
-            extra={"continue_on_infrastructure_failure": continue_on_infrastructure_failure},
+            extra={
+                "continue_on_infrastructure_failure": continue_on_infrastructure_failure,
+                **({"api_endpoint": profile.base_url.rstrip("/")}
+                   if profile.metadata.get("inference_source") == "configured_api" else {}),
+            },
         )
         model = OpenAICompatibleVLClient(profile)
 
@@ -544,6 +548,10 @@ class AndroidWorldStandaloneEvaluator:
             store_trajectories=store_trajectories,
             metadata={
                 "evaluation_mode": "standalone",
+                "inference_source": profile.metadata.get(
+                    "inference_source", "local_adapter" if profile.metadata.get("evaluation_checkpoint") else "existing_service",
+                ),
+                "model_base_url": profile.base_url,
                 "model_id": profile.model_id,
                 "served_model": profile.served_model,
                 "adapter": profile.adapter,

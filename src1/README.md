@@ -483,7 +483,7 @@ polished skill 失败后，执行器会禁用当前技能，
 skill_library_db = "./runtime/skill_library.sqlite3"
 ```
 
-### 6.1 裸模型：单 adapter + 原生 M3A
+### 6.1 裸模型：本地 adapter 或 API + 原生 M3A
 
 不读取技能库，不注入技能，也不执行动态路由：
 
@@ -494,6 +494,28 @@ python -m src1 --config src1/config.local.toml evaluate-standalone \
   --tasks ContactsAddContact SimpleCalendarAddOneEvent \
   --combinations 5 --seed 42 --max-steps 30
 ```
+
+也可以直接测试 `[[models]]` 中的 OpenAI-compatible API 模型，不部署本地模型：
+
+```bash
+python -m src1 --config src1/config.local_teacher_api.toml evaluate-standalone \
+  --api-model-id teacher-qwen3.7-plus \
+  --combinations 1 --seed 42 --max-steps 30 \
+  --resume --no-store-trajectories \
+  --output-dir /home/zmz/Workspace/gui/src1/runtime/evaluations/standalone_teacher_api
+```
+
+配置中的 `[android_world]` 仍需设置对应设备，例如 `console_port=5558`、`grpc_port=8556`。
+`--api-model-id` 使用 TOML 的逻辑 `model_id`，真正发给服务端的是该项的 `served_model`。
+请先在 shell 中设置其 `api_key_env` 指定的变量；API key 不写入报告。
+API 模型必须支持 `image_url` 图片输入，原生 M3A 会发送截图，不能用只支持文本的接口。
+
+此模式不读取 SQLite、不注入技能，任务、步数、SR、报告和续跑流程与本地 standalone 相同。
+它与 `--adapter-path` 互斥，也不接受 `--deploy-port`、`--cuda-visible-devices`、
+`--infer-backend` 等本地模型部署参数：远程服务不使用本机 GPU，也不需要 8004 一类的
+监听端口。TOML 原有 `[training_evaluation]` 的部署配置不会被用于该模式。
+`--dry-run` 会显示服务模型、设备端口及密钥变量是否已设置，但不发出 API 请求。
+报告会标注 `inference_source=configured_api`；API 地址改变后不能继续混用同一目录的结果。
 
 ### 6.2 简单技能：单 adapter + 单技能关键词检索
 

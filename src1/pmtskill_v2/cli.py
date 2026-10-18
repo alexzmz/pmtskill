@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -66,7 +68,7 @@ def _run_label(args: argparse.Namespace) -> str:
     if task_values:
         suffix = f"+{len(task_values) - 3}more" if len(task_values) > 3 else ""
         return "+".join(task_values[:3]) + suffix
-    for name in ("adapter_name", "model_id", "family"):
+    for name in ("adapter_name", "model_id", "api_model_id", "family"):
         value = getattr(args, name, None)
         if value:
             return str(value)
@@ -1352,26 +1354,63 @@ def command_evaluate_vdroid(args: argparse.Namespace) -> int:
 
 
 def command_evaluate_standalone(args: argparse.Namespace) -> int:
-    """接口一：单 adapter 裸模型 + 原生 M3A，不读取或注入技能。"""
+    """单个本地 adapter 或已配置 API + 原生 M3A，不读取或注入技能。"""
 
     from .evaluation.android_world import AndroidWorldStandaloneEvaluator
 
     config = load_config(args.config)
     resume = _evaluation_resume(config, args)
     store_trajectories = _evaluation_store_trajectories(config, args)
+    if args.api_model_id:
+        if args.model_id:
+            raise ValueError("API 模式只需 --api-model-id；--model-id 是本地 adapter 的报告 ID")
+        deployment_flags = (
+            "base_model_path", "deploy_host", "deploy_port", "cuda_visible_devices", "infer_backend",
+            "max_model_len", "gpu_memory_utilization", "max_new_tokens", "deploy_extra_arg",
+        )
+        unused = ["--" + name.replace("_", "-") for name in deployment_flags if getattr(args, name) is not None]
+        if unused:
+            raise ValueError(
+                "--api-model-id 直接调用 TOML 中的服务，不部署本地模型；请移除本地部署参数："
+                + ", ".join(unused)
+            )
+        configured = config.model(args.api_model_id)
+        if not configured.enabled:
+            raise ValueError(f"API 模型 {configured.model_id} 未启用，请设置 enabled=true")
+        profile = dataclasses.replace(configured, metadata={
+            **configured.metadata, "inference_source": "configured_api",
+        })
+        key_available = not profile.api_key_env or bool(os.environ.get(profile.api_key_env, "").strip())
+        if args.dry_run:
+            _print({
+                "dry_run": True, "evaluation_mode": "standalone", "inference_source": "configured_api",
+                "android_world_connection": {
+                    "console_port": config.android_world.console_port,
+                    "grpc_port": config.android_world.grpc_port,
+                },
+                "deployment_command": None, "starts_model_server": False, "uses_local_model_gpu": False,
+                "profiles": [profile.to_dict()], "adapters": [], "api_key_available": key_available,
+                "tasks": _tasks(args.tasks) or (f"sample:{args.task_count}" if args.task_count is not None else "all"),
+                "combinations": args.combinations, "seed": args.seed, "family": args.family,
+                "max_steps": args.max_steps, "output_dir": args.output_dir,
+                "resume": resume, "store_trajectories": store_trajectories,
+            })
+            return 0
+        if not key_available:
+            raise ValueError(f"API 模型 {profile.model_id} 缺少环境变量 {profile.api_key_env}；请先设置 API key")
+        bindings = []
+        model_context = contextlib.nullcontext([profile])
+    else:
+        deployment, bindings = _adapter_deployment(
+            config, None, args, [args.adapter_path], [args.model_id] if args.model_id else None,
+        )
+        if args.dry_run:
+            return _dry_evaluation_result("standalone", deployment, bindings, args,
+                                          resume=resume, store_trajectories=store_trajectories)
+        model_context = deployment.activate_adapters()
     config.ensure_runtime_dirs()
-    deployment, bindings = _adapter_deployment(
-        config,
-        None,
-        args,
-        [args.adapter_path],
-        [args.model_id] if args.model_id else None,
-    )
-    if args.dry_run:
-        return _dry_evaluation_result("standalone", deployment, bindings, args,
-                                      resume=resume, store_trajectories=store_trajectories)
     tasks = _evaluation_tasks(config, args)
-    with deployment.activate_adapters() as profiles:
+    with model_context as profiles:
         artifacts = AndroidWorldStandaloneEvaluator(config).run(
             profile=profiles[0],
             tasks=tasks,
@@ -2348,12 +2387,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     standalone = subparsers.add_parser(
         "evaluate-standalone",
-        help="单 adapter 裸模型 + 原生 M3A AndroidWorld 评测",
+        help="单个本地 adapter 或 TOML API 模型 + 原生 M3A AndroidWorld 评测",
     )
-    standalone.add_argument(
+    standalone_source = standalone.add_mutually_exclusive_group(required=True)
+    standalone_source.add_argument(
         "--adapter-path",
-        required=True,
         help="adapter 顶层目录；自动选择最新 training_run/最后 epoch/best",
+    )
+    standalone_source.add_argument(
+        "--api-model-id", help="直接使用 TOML [[models]] 中的 model_id，不启动本地模型服务",
     )
     standalone.add_argument("--model-id", help="报告中的 adapter ID；默认取目录名")
     _add_common_evaluation_arguments(standalone)

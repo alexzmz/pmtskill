@@ -251,7 +251,7 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
     """完整调用四个 evaluator，验证旧轨迹合并，而不只单测 skip helper。"""
 
     def test_all_port_evaluators_resume_full_episodes_and_reports(self):
-        for mode, store_trajectories in ((mode, storage) for mode in ("standalone", "simple", "forced", "pmtskill")
+        for mode, store_trajectories in ((mode, storage) for mode in ("standalone", "standalone_api", "simple", "forced", "pmtskill")
                                          for storage in (True, False)):
             with self.subTest(mode=mode, store_trajectories=store_trajectories), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -269,6 +269,8 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
                 )
                 store.upsert_skill(skill)
                 profile = ModelProfile(model_id="student", served_model="student", base_url="http://local/v1", capabilities={})
+                if mode == "standalone_api":
+                    profile.metadata["inference_source"] = "configured_api"
                 environment = types.SimpleNamespace(close=mock.Mock())
                 def recorded_episode(task):
                     result = _episode(task)
@@ -319,7 +321,7 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
                 common = dict(tasks=["ContactsAddContact"], n_task_combinations=2,
                               output_dir=root / "run", record_traces=True,
                               store_trajectories=store_trajectories)
-                if mode == "standalone":
+                if mode in {"standalone", "standalone_api"}:
                     evaluator = AndroidWorldStandaloneEvaluator(config)
                     common.pop("record_traces")
                     common["profile"] = profile
@@ -343,6 +345,12 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
                 ):
                     first = evaluator.run(**common)
                     second = evaluator.run(**common, resume=True)
+                    if mode == "standalone_api":
+                        self.assertEqual(second.summary["metadata"]["inference_source"], "configured_api")
+                        self.assertEqual(second.summary["metadata"]["model_base_url"], "http://local/v1")
+                        profile.base_url = "http://different-api/v1"
+                        with self.assertRaisesRegex(ValueError, "api_endpoint"):
+                            evaluator.run(**common, resume=True)
                 self.assertEqual(runner.call_count, 2)
                 self.assertEqual(launch.call_count, 2)
                 for call in launch.call_args_list:

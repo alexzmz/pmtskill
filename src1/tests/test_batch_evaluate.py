@@ -191,7 +191,9 @@ class BatchEvaluationTest(unittest.TestCase):
         vdroid.ModelActor.options(num_gpus=1)
         remote.options.assert_called_once_with(num_gpus=0)
         self.assertEqual(captured[0]("ignored-service", "ignored-llama").client.model_id, "adapter_control01")
-        self.assertIsInstance(vdroid.infer.Gpt4Wrapper("ignored-gpt"), StrictFixedClient)
+        client = vdroid.infer.Gpt4Wrapper("ignored-gpt")
+        self.assertIsInstance(client, StrictFixedClient)
+        self.assertEqual(client.model_name, "adapter_control01")
 
     def test_skvm_evaluator_uses_real_adaptation_and_common_reporting_without_hardware(self):
         from src1.baseline_skvm.evaluator import run_skvm, legacy_kernel_module

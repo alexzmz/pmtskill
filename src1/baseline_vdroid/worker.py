@@ -146,28 +146,47 @@ def _select_tasks(registry_items: Mapping[str, Any], request: Mapping[str, Any])
 
 
 def _contain_qwen_harness(suite_utils: Any, output_dir: Path) -> None:
-    """Keep upstream per-task logs in the run, and stop on broken emulator UI."""
+    """Contain logs and do not let upstream swallow backend/contract errors."""
     from src1.pmtskill_v2.evaluation.recovery import (
         AndroidWorldInfrastructureError, is_infrastructure_failure,
     )
+    from src1.baseline_vdroid.validation import VDroidIntegrationError
 
     original_episode = suite_utils.run_episode
     original_task = suite_utils._run_task
+    fatal_errors: list[Exception] = []
 
     def run_episode(*args, **kwargs):
         previous = Path.cwd()
         try:
             os.chdir(output_dir)
             return original_episode(*args, **kwargs)
+        except Exception as exc:
+            # _run_task catches Exception and turns it into a failed episode.
+            # Re-raise after that boundary rather than repeat the same broken
+            # adapter interface for every task in a multi-hour suite.
+            wrapper_error = isinstance(exc, (AttributeError, TypeError, NotImplementedError)) and any(
+                name in str(exc) for name in ("StrictFixedClient", "QwenVerifier")
+            )
+            if isinstance(exc, (VDroidIntegrationError, ImportError)) or wrapper_error:
+                fatal_errors.append(exc)
+            raise
         finally:
             os.chdir(previous)
 
     def run_task(*args, **kwargs):
+        fatal_errors.clear()
         result = original_task(*args, **kwargs)
         if is_infrastructure_failure(result):
             raise AndroidWorldInfrastructureError(
                 "V-Droid-Qwen emulator infrastructure unavailable; stop instead of recording false SR=0: "
                 + str(result.get("exception_info", "")))
+        if fatal_errors:
+            cause = fatal_errors[0]
+            raise VDroidIntegrationError(
+                "V-Droid-Qwen backend/upstream integration failed; stopping the suite "
+                f"instead of recording false task failures: {type(cause).__name__}: {cause}"
+            ) from cause
         return result
 
     suite_utils.run_episode = run_episode
@@ -256,6 +275,10 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             if_store_screen=bool(request.get("store_screenshots", False)),
             wait_after_action_seconds=float(device["wait_after_action_seconds"]),
         )
+        if request.get("qwen_adapter"):
+            from src1.baseline_vdroid.qwen import validate_qwen_agent
+
+            validate_qwen_agent(agent)
         # Upstream VDroidAgent does not forward wait_after_action_seconds to its
         # base transition_pause property, so set it explicitly for a fair cap.
         agent.transition_pause = float(device["wait_after_action_seconds"])
@@ -276,8 +299,6 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
         episodes = progress.episodes()
         from src1.pmtskill_v2.evaluation.recovery import ensure_valid_evaluation_episodes
 
-        ensure_valid_evaluation_episodes(
-            episodes, expected_episodes=sum(len(items) for items in suite.values()))
         metadata = {
             "evaluation_mode": "vdroid_qwen_adapted" if request.get("qwen_adapter") else "vdroid",
             "report_title": "V-Droid AndroidWorld Baseline",
@@ -316,6 +337,13 @@ def run_request(request: Mapping[str, Any]) -> dict[str, Any]:
             metadata=metadata,
             store_trajectories=bool(request.get("store_trajectories", True)),
         )
+        # Keep diagnostic reports even when all episodes failed, but never
+        # return CLI success for an unavailable evaluation.
+        ensure_valid_evaluation_episodes(
+            episodes, expected_episodes=sum(len(items) for items in suite.values()))
+        from src1.baseline_vdroid.validation import require_available_evaluation
+
+        require_available_evaluation(artifacts.summary)
         result = {
             "evaluation_mode": metadata["evaluation_mode"],
             "summary": artifacts.summary,

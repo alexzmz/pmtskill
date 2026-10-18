@@ -43,3 +43,47 @@ result-only JSON checkpoints are saved, with resume and verifier statistics
 preserved. It also overrides screenshot saving. Existing artifacts and native
 V-Droid/CLI diagnostic logs are not deleted.
 
+## Qwen adapter: smoke test and invalid-run diagnosis
+
+`evaluate-vdroid-qwen` is the explicitly labelled Qwen adaptation; it does not
+use the original trained Llama verifier. For the 5554/8554 emulator, confirm
+these settings in `src1/config.local_test.toml` (the inference port is separate):
+
+```toml
+[android_world]
+console_port = 5554
+grpc_port = 8554
+```
+
+Run two tasks on CUDA 0 / inference port 8002 before a full suite:
+
+```bash
+python -m src1 --config src1/config.local_test.toml evaluate-vdroid-qwen \
+  --adapter-path /home/zmz/Workspace/gui/src1/runtime/checkpoints/adapter_control01 \
+  --model-id adapter_control01 \
+  --tasks AudioRecorderRecordAudio ContactsAddContact \
+  --combinations 1 --seed 42 --max-steps 30 \
+  --cuda-visible-devices 0 --deploy-port 8002 --infer-backend vllm \
+  --no-require-training-state --resume --no-store-trajectories \
+  --output-dir /home/zmz/Workspace/gui/src1/runtime/evaluations/vdroid_control_smoke_fixed
+```
+
+Check that `summary.json` has `evaluation_available = true`,
+`episodes_evaluated = 2`, and nonzero `vdroid.decision_count`. This checks that
+the baseline actually ran; it does not require either task to succeed. For the
+full suite, remove `--tasks AudioRecorderRecordAudio ContactsAddContact` and use
+a **different** output directory such as `.../vdroid_control_fixed`. Do not
+resume a two-task smoke test as a full-suite experiment in the same directory.
+
+The previous `AttributeError: 'StrictFixedClient' object has no attribute
+'model_name'` occurred at the end of upstream `search()`, after model requests
+had already succeeded. The upstream task harness swallowed it and discarded
+each episode; 116 such exceptions mean **unavailable evaluation, not SR=0**.
+The wrapper now supplies the deployed adapter identity and optional timing
+arguments, and is checked before GUI tasks start. Backend/interface/import
+errors stop the suite immediately; ordinary completed task failures remain
+valid failures and do not stop evaluation. Zero-valid-episode runs cannot
+return CLI success; diagnostic reports display N/A and V-Droid JSON SR values
+are null. Existing files are not rewritten or deleted. Normal resume retries
+exception episodes rather than treating them as completed tasks.
+

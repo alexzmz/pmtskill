@@ -20,6 +20,7 @@ from ..pmtskill_v2.inference.vlm import OpenAICompatibleVLClient
 from .config import VDroidBaselineConfig, VDroidDeviceConfig, VDroidPathConfig
 from .config import VDroidModelConfig, VDroidAssistantConfig, VDroidEvaluationConfig
 from .evaluator import VDroidBaselineEvaluator, VDroidRunOptions
+from .validation import VDroidIntegrationError
 
 
 def yes_no_score(raw):
@@ -86,14 +87,38 @@ class QwenVerifier:
 
 
 class StrictFixedClient(OpenAICompatibleVLClient):
-    """V-Droid does not check raw=None like M3A; propagate API failures."""
+    """Fixed Qwen client implementing the upstream Gpt4Wrapper contract.
 
-    def predict_mm(self, prompt, images):
-        result = self.generate(prompt, images, max_tokens=2048)
-        return result.text, True, result.raw
+    V-Droid reads ``llm.model_name`` at the END of search(), even when all
+    generation requests succeeded. Keep it bound to the deployed adapter,
+    never to the ignored upstream GPT/Llama constructor arguments.
+    """
 
-    def predict(self, prompt):
-        return self.predict_mm(prompt, [])
+    def __init__(self, profile, **kwargs):
+        super().__init__(profile, **kwargs)
+        self.model_name = profile.served_model
+
+    def predict_mm(self, text_prompt, images, measure_time=False):
+        # Unlike M3A, upstream V-Droid does not inspect raw=None on API failure.
+        try:
+            result = self.generate(text_prompt, images, max_tokens=2048)
+        except Exception as exc:
+            raise VDroidIntegrationError(
+                f"V-Droid fixed Qwen backend failed ({self.model_name}): {exc}"
+            ) from exc
+        return result.text, result.latency_ms / 1000 if measure_time else True, result.raw
+
+    def predict(self, text_prompt, measure_time=False):
+        return self.predict_mm(text_prompt, [], measure_time)
+
+
+def validate_qwen_agent(agent):
+    """Catch wrapper incompatibility before spending time on any GUI task."""
+    client = agent.llm
+    if not isinstance(getattr(client, "model_name", None), str) or not client.model_name.strip():
+        raise VDroidIntegrationError("V-Droid Qwen client requires a non-empty llm.model_name")
+    if not all(callable(getattr(client, name, None)) for name in ("predict", "predict_mm")):
+        raise VDroidIntegrationError("V-Droid Qwen client requires predict and predict_mm")
 
 
 def install_qwen_backend(vdroid, ray, profile, workers=4):

@@ -21,6 +21,7 @@ from ..pmtskill_v2.evaluation.resume import (
     vdroid_resume_specification,
 )
 from .config import VDroidBaselineConfig
+from .validation import require_available_evaluation
 
 
 @dataclasses.dataclass(slots=True)
@@ -258,6 +259,8 @@ class VDroidBaselineEvaluator:
                 f"V-Droid worker completed without {result_path}"
             )
         result = json.loads(result_path.read_text(encoding="utf-8"))
+        # Exit code zero alone does not guarantee any task was evaluated.
+        require_available_evaluation(result.get("summary"))
         result["worker_return_code"] = return_code
         result["resolved_request"] = str(request_path)
         return result

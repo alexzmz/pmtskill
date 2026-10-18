@@ -175,6 +175,9 @@ def write_vdroid_report(
     )
     vdroid_metrics = summarize_vdroid_runtime(episodes)
     artifacts.summary["vdroid"] = vdroid_metrics
+    if not artifacts.summary["evaluation_available"]:
+        artifacts.summary["success_rate_micro"] = None
+        artifacts.summary["success_rate_macro"] = None
     write_json_atomic(artifacts.summary_json, artifacts.summary)
 
     markdown = artifacts.report_markdown.read_text(encoding="utf-8")

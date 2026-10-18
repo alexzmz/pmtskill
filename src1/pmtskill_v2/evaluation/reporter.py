@@ -284,6 +284,8 @@ def compact_result_for_storage(
 
 def _markdown(summary: dict[str, Any]) -> str:
     metadata = summary.get("metadata", {})
+    micro_sr = f"{summary['success_rate_micro']:.2%}" if summary['evaluation_available'] else "N/A"
+    macro_sr = f"{summary['success_rate_macro']:.2%}" if summary['evaluation_available'] else "N/A"
     lines = [
         "# PMT-Skill AndroidWorld 评测报告",
         "",
@@ -294,8 +296,8 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"| 评测可用 | {'是' if summary['evaluation_available'] else '否'} |",
         f"| 有效 episode | {summary['episodes_evaluated']} / {summary['episodes_total']} |",
         f"| 成功数 | {summary['successes']} |",
-        f"| Micro SR | {summary['success_rate_micro']:.2%} |",
-        f"| Macro SR | {summary['success_rate_macro']:.2%} |",
+        f"| Micro SR | {micro_sr} |",
+        f"| Macro SR | {macro_sr} |",
         f"| 平均步数 | {summary['average_steps']:.2f} |",
         f"| 平均运行时间 | {summary['average_run_time_seconds']:.2f}s |",
         f"| 平均模型/adapter 切换 | {summary['average_model_switches']:.2f} |",

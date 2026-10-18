@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import sys
 import tempfile
@@ -255,6 +256,9 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
             with self.subTest(mode=mode, store_trajectories=store_trajectories), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 config = load_config(Path(__file__).parents[1] / "config.example.toml")
+                config.android_world = dataclasses.replace(
+                    config.android_world, console_port=5556, grpc_port=8555,
+                )
                 store = SkillStore(root / "skills.sqlite3")
                 store.initialize()
                 skill = SkillRecord(
@@ -308,7 +312,8 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
 
                 agents.m3a = types.SimpleNamespace(M3A=M3A)
                 env_module = types.ModuleType("android_world.env")
-                env_module.env_launcher = types.SimpleNamespace(load_and_setup_env=lambda **kwargs: environment)
+                launch = mock.Mock(return_value=environment)
+                env_module.env_launcher = types.SimpleNamespace(load_and_setup_env=launch)
                 modules = {"android_world": android_world, "android_world.agents": agents,
                            "android_world.env": env_module}
                 common = dict(tasks=["ContactsAddContact"], n_task_combinations=2,
@@ -339,6 +344,10 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
                     first = evaluator.run(**common)
                     second = evaluator.run(**common, resume=True)
                 self.assertEqual(runner.call_count, 2)
+                self.assertEqual(launch.call_count, 2)
+                for call in launch.call_args_list:
+                    self.assertEqual(call.kwargs["console_port"], 5556)
+                    self.assertEqual(call.kwargs["grpc_port"], 8555)
                 self.assertEqual(len(second.episodes), 2)
                 self.assertEqual(first.summary["success_rate_micro"], second.summary["success_rate_micro"])
                 for key in ("model_usage", "skill_usage", "average_model_switches", "failure_reasons"):
@@ -369,6 +378,9 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
 
     def _check_vdroid_worker_resume(self, *, store_trajectories):
         config = load_vdroid_config(Path(__file__).parents[1] / "baseline_vdroid" / "config.example.toml")
+        config.device = dataclasses.replace(
+            config.device, console_port=5556, grpc_port=8555, device_name="emulator-5556",
+        )
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             options = apply_cli_overrides(VDroidRunOptions.from_config(config),
@@ -405,7 +417,8 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
 
             agents.vdroid = types.SimpleNamespace(VDroidAgent=VDroidAgent)
             env_module = types.ModuleType("android_world.env")
-            env_module.env_launcher = types.SimpleNamespace(load_and_setup_env=lambda **kwargs: environment,
+            launch = mock.Mock(return_value=environment)
+            env_module.env_launcher = types.SimpleNamespace(load_and_setup_env=launch,
                                                            verify_api_level=lambda env: None)
             ray = types.SimpleNamespace(is_initialized=lambda: False)
             modules = {"android_world": android_world, "android_world.agents": agents,
@@ -422,6 +435,9 @@ class EvaluationInterfaceResumeTest(unittest.TestCase):
                 first = run_request(request)
                 second = run_request(request)
             self.assertEqual(runner.call_count, 2)
+            for call in launch.call_args_list:
+                self.assertEqual(call.kwargs["console_port"], 5556)
+                self.assertEqual(call.kwargs["grpc_port"], 8555)
             self.assertEqual(second["summary"]["episodes_total"], 2)
             self.assertEqual(first["summary"]["success_rate_micro"], second["summary"]["success_rate_micro"])
             self.assertEqual(second["summary"]["metadata"]["resume"]["episodes_skipped"], 2)

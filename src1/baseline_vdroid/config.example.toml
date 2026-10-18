@@ -10,7 +10,9 @@ log_dir = "../runtime/logs"
 [android_world]
 adb_path = "adb"
 console_port = 5554
+# 与该 emulator 的 -grpc 启动参数一致；不能由 console_port 推算。
 grpc_port = 8554
+# 模拟器通常可省略 device_name，按 console_port 自动生成；如填写则必须一致。
 device_name = "emulator-5554"
 emulator_setup = false
 freeze_datetime = true

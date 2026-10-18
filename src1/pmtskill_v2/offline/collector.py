@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from ..core.config import ProjectConfig
+from ..core.environment import load_android_world_environment
 from ..evaluation.recovery import recover_infrastructure_failures
 from ..inference.vlm import OpenAICompatibleVLClient
 from .reporting import summarize_collection
@@ -165,11 +166,7 @@ def collect_teacher_trajectories(
     teacher = OpenAICompatibleVLClient(config.model(config.offline.teacher_model_id))
     trajectory_dir = (output_dir or config.offline.trajectory_dir).resolve()
     trajectory_dir.mkdir(parents=True, exist_ok=True)
-    environment = env_launcher.load_and_setup_env(
-        console_port=config.android_world.console_port,
-        emulator_setup=config.android_world.emulator_setup,
-        adb_path=config.android_world.adb_path,
-    )
+    environment = load_android_world_environment(env_launcher, config.android_world)
     try:
         task_registry = registry.TaskRegistry()
         suite = suite_utils.create_suite(

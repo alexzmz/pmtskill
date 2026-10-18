@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..core.config import ProjectConfig
+from ..core.environment import load_android_world_environment
 from ..core.io import load_primitives, write_json_atomic
 from ..core.models import ModelProfile, SkillRecord
 from ..evaluation.android_world import episodes_to_traces
@@ -413,11 +414,7 @@ class AndroidWorldOptimizationTraceCollector:
             self.config.android_world.max_steps, options.max_steps
         )
         all_episodes: list[dict[str, Any]] = []
-        environment = env_launcher.load_and_setup_env(
-            console_port=self.config.android_world.console_port,
-            emulator_setup=self.config.android_world.emulator_setup,
-            adb_path=self.config.android_world.adb_path,
-        )
+        environment = load_android_world_environment(env_launcher, self.config.android_world)
         try:
             if options.source_kind == "task":
                 all_episodes.extend(

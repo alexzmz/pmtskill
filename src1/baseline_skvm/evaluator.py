@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..pmtskill_v2.core.environment import load_android_world_environment
 from ..pmtskill_v2.core.io import write_json_atomic
 from ..pmtskill_v2.evaluation.resume import fingerprint, model_resume_identity
 from .protocol import SKVM_TOOL_PROTOCOL, SKVM_CONTEXT_POLICY, SKVM_STABILITY_POLICY, validate_protocol_resume
@@ -168,11 +169,7 @@ def run_skvm(config, store, profile, args, tasks):
         def step(self, goal):
             return compact_m3a_step_result(super().step(goal))
 
-    environment = env_launcher.load_and_setup_env(
-        console_port=config.android_world.console_port,
-        emulator_setup=config.android_world.emulator_setup,
-        adb_path=config.android_world.adb_path,
-    )
+    environment = load_android_world_environment(env_launcher, config.android_world)
     try:
         suite = suite_utils.create_suite(
             registry.TaskRegistry().get_registry(family=args.family),

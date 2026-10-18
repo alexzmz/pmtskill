@@ -31,6 +31,29 @@ python -m src1.batch_evaluate \
 默认遇到失败停止；`--continue-on-error` 可继续后续方法。错误/不完整结果显示 N/A，
 不伪装成 SR=0。Ctrl+C 先通知子进程退出，让部署上下文释放服务。
 
+## 多模拟器端口绑定
+
+`--deploy-port`（如 8003）只属于模型服务。设备的 console 和 gRPC 端口在主 TOML
+中独立指定，必须来自**同一个 emulator 进程**的启动参数。例如：
+
+```toml
+[android_world]
+console_port = 5556
+grpc_port = 8555
+```
+
+如果你启动时指定了 5554/8554、5556/8555、5558/8556、5560/8557，就按这四组配置；
+这不是 Android 自动生成的对应关系，不要将 gRPC 写成 console+1 或固定 8554。
+旧版 5554/8554 配置仍可省略 grpc_port；其他 console 端口缺失该字段会在部署模型前报错。
+该字段已透传到五方法评测、forced-skill 标定、训练评测和教师轨迹采集。
+启动日志包含 `ANDROIDWORLD_CONNECTION: ADB=emulator-5556; emulator_gRPC=localhost:8555`，
+独立评测的 `--dry-run` 也会显示 `android_world_connection`。
+
+多项实验并行时必须使用不同模拟器（且任务初始化、截图、ADB 操作均属于各自设备），
+仅换 GPU 或模型端口不能隔离 AndroidWorld 状态。修复连接后请使用**新的 output-dir**，
+不要复用此前接错设备的结果。评测 manifest 会记录 grpc_port，改变它后不能续跑旧结果；
+旧版本未记录此字段的主配置评测也需要新目录，原结果保留不覆盖。
+
 ## 输出
 
 ```text

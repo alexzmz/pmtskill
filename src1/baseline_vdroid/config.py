@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..pmtskill_v2.core.config import resolve_android_world_grpc_port
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility.
@@ -25,12 +27,23 @@ class VDroidPathConfig:
 class VDroidDeviceConfig:
     adb_path: str = "adb"
     console_port: int = 5554
-    grpc_port: int = 8554
-    device_name: str = "emulator-5554"
+    grpc_port: int | None = None
+    device_name: str | None = None
     emulator_setup: bool = False
     freeze_datetime: bool = True
     verify_api_level: bool = True
     wait_after_action_seconds: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.grpc_port = resolve_android_world_grpc_port(self.console_port, self.grpc_port)
+        expected = f"emulator-{self.console_port}"
+        if self.device_name is None:
+            self.device_name = expected
+        elif self.device_name.startswith("emulator-") and self.device_name != expected:
+            raise ValueError(
+                f"android_world.device_name={self.device_name} 与 console_port={self.console_port} "
+                f"指向不同模拟器；应为 {expected}"
+            )
 
 
 @dataclasses.dataclass(slots=True)

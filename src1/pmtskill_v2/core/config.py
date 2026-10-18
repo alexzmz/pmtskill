@@ -150,6 +150,36 @@ class MaintenanceConfig:
     mining: EvidenceMiningConfig = dataclasses.field(default_factory=EvidenceMiningConfig)
 
 
+def resolve_android_world_grpc_port(console_port: int, grpc_port: int | None) -> int:
+    """Validate independent emulator ports; never guess a second device's gRPC.
+
+    Only the historical 5554/8554 default is implicit. Other console ports must
+    name the actual ``emulator -grpc`` port, which Android does not derive from
+    ``-port`` (and which is unrelated to the model server's deploy port).
+    """
+    if (
+        isinstance(console_port, bool)
+        or not isinstance(console_port, int)
+        or not 1 <= console_port <= 65535
+    ):
+        raise ValueError("android_world.console_port 必须是 [1, 65535] 内的整数")
+    if grpc_port is None:
+        if console_port != 5554:
+            raise ValueError(
+                f"android_world.console_port={console_port} 时必须显式配置 "
+                "android_world.grpc_port，填写模拟器启动命令的 -grpc 端口；"
+                "它不能由 console_port 推断，也不是模型的 deploy_port"
+            )
+        grpc_port = 8554
+    if (
+        isinstance(grpc_port, bool)
+        or not isinstance(grpc_port, int)
+        or not 1 <= grpc_port <= 65535
+    ):
+        raise ValueError("android_world.grpc_port 必须是 [1, 65535] 内的整数")
+    return grpc_port
+
+
 @dataclasses.dataclass(slots=True)
 class AndroidWorldConfig:
     adb_path: str = "adb"
@@ -170,6 +200,11 @@ class AndroidWorldConfig:
     # 硬恢复只重启 Android emulator guest，不会重启宿主机。
     recovery_timeout_seconds: float = 180.0
     recovery_poll_seconds: float = 2.0
+    # 独立于 console_port；非默认设备必须填写 emulator 的真实 -grpc 端口。
+    grpc_port: int | None = None
+
+    def __post_init__(self) -> None:
+        self.grpc_port = resolve_android_world_grpc_port(self.console_port, self.grpc_port)
 
 
 @dataclasses.dataclass(slots=True)

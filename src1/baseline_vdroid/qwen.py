@@ -147,6 +147,7 @@ def evaluator_for_adapter(config, profile, args, tasks):
         config.config_path,
         VDroidPathConfig(config.paths.repo_root, source, target, config.paths.log_dir),
         VDroidDeviceConfig(adb_path=device.adb_path, console_port=device.console_port,
+                           grpc_port=device.grpc_port,
                            device_name=f"emulator-{device.console_port}",
                            emulator_setup=device.emulator_setup,
                            wait_after_action_seconds=device.wait_after_action_seconds),

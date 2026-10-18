@@ -32,6 +32,10 @@ lora_alpha = 32
 
 [android_world]
 console_port = 5554
+# 必须与同一 emulator 进程的 -grpc 参数一致，独立于 console_port / deploy_port。
+# 例如你依次启动的四台设备可配为 5554/8554、5556/8555、5558/8556、5560/8557；
+# 这不是 Android 的自动映射。非 5554 的 console_port 必须显式填写 grpc_port。
+grpc_port = 8554
 adb_path = "adb"
 emulator_setup = false
 # 每个 episode 最多 50 步；collector 还会在运行时强制执行这一硬上限。

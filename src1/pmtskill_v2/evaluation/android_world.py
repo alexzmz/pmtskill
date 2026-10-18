@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ..core.config import ProjectConfig
+from ..core.environment import load_android_world_environment
 from ..core.io import load_primitives
 from ..core.models import (
     ExecutionPlan,
@@ -500,11 +501,7 @@ class AndroidWorldStandaloneEvaluator:
             def step(self, goal: str):
                 return compact_m3a_step_result(super().step(goal))
 
-        environment = env_launcher.load_and_setup_env(
-            console_port=self.config.android_world.console_port,
-            emulator_setup=self.config.android_world.emulator_setup,
-            adb_path=self.config.android_world.adb_path,
-        )
+        environment = load_android_world_environment(env_launcher, self.config.android_world)
         try:
             task_registry = registry.TaskRegistry()
             suite = suite_utils.create_suite(
@@ -657,11 +654,7 @@ class AndroidWorldSimpleSkillEvaluator:
                     self.current_goal = goal
                 return compact_m3a_step_result(super().step(goal))
 
-        environment = env_launcher.load_and_setup_env(
-            console_port=self.config.android_world.console_port,
-            emulator_setup=self.config.android_world.emulator_setup,
-            adb_path=self.config.android_world.adb_path,
-        )
+        environment = load_android_world_environment(env_launcher, self.config.android_world)
         try:
             task_registry = registry.TaskRegistry()
             suite = suite_utils.create_suite(
@@ -788,11 +781,7 @@ class AndroidWorldForcedSkillEvaluator:
             def step(self, goal: str):
                 return compact_m3a_step_result(super().step(goal))
 
-        environment = env_launcher.load_and_setup_env(
-            console_port=self.config.android_world.console_port,
-            emulator_setup=self.config.android_world.emulator_setup,
-            adb_path=self.config.android_world.adb_path,
-        )
+        environment = load_android_world_environment(env_launcher, self.config.android_world)
         try:
             task_registry = registry.TaskRegistry()
             suite = suite_utils.create_suite(
@@ -977,11 +966,7 @@ class AndroidWorldOnlineEvaluator:
                 ]),
             },
         )
-        environment = env_launcher.load_and_setup_env(
-            console_port=self.config.android_world.console_port,
-            emulator_setup=self.config.android_world.emulator_setup,
-            adb_path=self.config.android_world.adb_path,
-        )
+        environment = load_android_world_environment(env_launcher, self.config.android_world)
         try:
             task_registry = registry.TaskRegistry()
             suite = suite_utils.create_suite(

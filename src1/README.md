@@ -86,6 +86,12 @@ cp src1/config.example.toml src1/config.local.toml
 - `offline.student_model_path` 是 ms-swift 训练的学生 VL 基座；
 - 每个 `[[models]]` 是在线可选的基座或 LoRA served model；
 - `[models.capabilities]` 保存该模型在每个原语上的成功率画像；
+- `android_world.console_port` 对应模拟器启动时的 `-port`，
+  `android_world.grpc_port` 对应同一模拟器进程的 `-grpc`。二者独立，不能自动推算；
+  模型服务的 `--deploy-port` 是另一个端口。旧配置只有默认 5554/8554 可省略
+  `grpc_port`；非 5554 设备缺少该字段会在加载配置时明确报错，而非静默连到 8554。
+  该配置覆盖所有主配置评测入口（含 SKVM / Qwen V-Droid）、标定、训练评测和采集；
+  原生 V-Droid 则在其独立 TOML 的 `[android_world]` 下配置同样的两个字段；
 - `android_world.max_steps = 50` 表示每个 episode 最多执行 50 步；collector
   会在 AndroidWorld 的 episode runner 外层再次强制这一硬上限，任务完成时仍会提前停止；
 - `android_world.infrastructure_recovery_attempts = 1` 会在 a11y/ADB 失效时恢复

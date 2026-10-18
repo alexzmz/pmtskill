@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import io
 import json
 import math
@@ -197,6 +198,9 @@ class BatchEvaluationTest(unittest.TestCase):
         from src1.pmtskill_v2.core.models import ModelProfile, SkillRecord, SkillStatus, SkillTopology
         legacy = legacy_kernel_module()
         config = load_config("src1/config.example.toml")
+        config.android_world = dataclasses.replace(
+            config.android_world, console_port=5558, grpc_port=8556,
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = cli_parser().parse_args(["evaluate-skvm", "--adapter-path", directory,
@@ -249,6 +253,9 @@ class BatchEvaluationTest(unittest.TestCase):
                     legacy.skvm_reporting, "write_skvm_evaluation"), mock.patch(
                     "src1.pmtskill_v2.evaluation.reporter.render_capability_plot", return_value={}):
                 artifacts = run_skvm(config, store, profile, args, ["ContactsAddContact"])
+            env.env_launcher.load_and_setup_env.assert_called_once_with(
+                console_port=5558, grpc_port=8556, emulator_setup=False, adb_path=config.android_world.adb_path,
+            )
             self.assertEqual(artifacts.summary["success_rate_micro"], 1)
             self.assertIs(client.predict_mm.call_args.args[1], images)
             self.assertIn("<skvm-adaptation>", client.predict_mm.call_args.args[0])

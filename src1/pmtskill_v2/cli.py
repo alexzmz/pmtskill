@@ -1271,6 +1271,10 @@ def _dry_evaluation_result(
         {
             "dry_run": True,
             "evaluation_mode": mode,
+            "android_world_connection": {
+                "console_port": deployment.config.android_world.console_port,
+                "grpc_port": deployment.config.android_world.grpc_port,
+            },
             "deployment_command": deployment.build_adapter_command(),
             "profiles": [profile.to_dict() for profile in deployment.profiles()],
             "adapters": [

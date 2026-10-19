@@ -186,7 +186,7 @@ class RoutedVLWrapper:
     """
 
     def __init__(self, model_pool: ModelPool, skills: Sequence[SkillRecord], *, router=None,
-                 include_candidates=False, supported_apps=()):
+                 include_candidates=False, supported_apps=(), skill_body_max_chars=3000):
         self.model_pool = model_pool
         self.skills = {skill.skill_id: skill for skill in skills}
         self.plan: ExecutionPlan | None = None
@@ -197,6 +197,7 @@ class RoutedVLWrapper:
         self.runtime = AdaptiveRoutingSession(router, model_pool, self.skills,
                                               include_candidates=include_candidates) if router and router.config.runtime_rerouting else None
         self.supported_apps = tuple(supported_apps)
+        self.skill_body_max_chars = skill_body_max_chars
         self._pending_action = None
 
     def set_plan(self, plan: ExecutionPlan) -> None:
@@ -316,7 +317,7 @@ class RoutedVLWrapper:
                     "\n\nPMT-Skill 路由约束：\n"
                     f"- 当前原语：{', '.join(route_step.primitive_ids)}\n"
                     f"- 当前技能：{skill.name if skill else 'primitive fallback'}\n"
-                    f"- 技能说明：{skill.body[:3000] if skill else '按原语完成一个可靠动作。'}\n"
+                    f"- 技能说明：{skill.body[:self.skill_body_max_chars] if skill else '按原语完成一个可靠动作。'}\n"
                     "以上约束不能改变 AndroidWorld 要求的 Reason/Action 输出格式。"
                 )
                 if self.runtime and not skill:

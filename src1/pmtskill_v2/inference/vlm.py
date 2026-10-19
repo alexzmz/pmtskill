@@ -87,6 +87,9 @@ class OpenAICompatibleVLClient:
         self.model_id = profile.model_id
         self.timeout_seconds = timeout_seconds
         self.maximum_retries = max(1, maximum_retries)
+        # Monotonic attempted HTTP requests, including retries. Experiments may
+        # take per-episode deltas without assuming two model calls per GUI step.
+        self.http_request_count = 0
 
     @property
     def endpoint(self) -> str:
@@ -145,6 +148,7 @@ class OpenAICompatibleVLClient:
                 method="POST",
             )
             try:
+                self.http_request_count += 1
                 with urllib.request.urlopen(
                     request, timeout=self.timeout_seconds
                 ) as response:

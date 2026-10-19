@@ -1711,6 +1711,55 @@ def command_evaluate_pmtskill(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_prepare_skill_effectiveness(args: argparse.Namespace) -> int:
+    from .evaluation.skill_effectiveness import prepare_inputs
+
+    config = load_config(args.config)
+    source = Path(args.skill_database).expanduser().resolve() if args.skill_database else config.paths.database
+    _print(prepare_inputs(source, Path(args.output_dir).expanduser().resolve()))
+    return 0
+
+
+def command_evaluate_skill_effectiveness(args: argparse.Namespace) -> int:
+    from .evaluation.skill_effectiveness import PROTOCOL, load_pairs, prepare_inputs, run_experiment
+
+    config = load_config(args.config)
+    if not args.output_dir:
+        raise ValueError("技能有效性实验必须指定 --output-dir，以保存三组共享的任务参数")
+    target = Path(args.output_dir).expanduser().resolve()
+    if not args.dry_run:
+        config.ensure_runtime_dirs()
+        source = Path(args.skill_database).expanduser().resolve() if args.skill_database else config.paths.database
+        prepared = prepare_inputs(source, target)
+        store = _open_evaluation_skill_store(config, prepared["skill_database"])
+    else:
+        source = Path(args.skill_database).expanduser().resolve() if args.skill_database else config.paths.database
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        store = SkillStore(source)
+    tasks = _evaluation_tasks(config, args)
+    pairs = load_pairs(store, Path(args.pairs_file).expanduser().resolve(), tasks=tasks)
+    deployment, bindings = _adapter_deployment(config, store, args, [args.adapter_path],
+                                               [args.model_id] if args.model_id else None)
+    if args.guidance_max_chars <= 0:
+        raise ValueError("--guidance-max-chars 必须为正数")
+    if args.dry_run:
+        _print({"dry_run": True, "protocol": PROTOCOL, "pairs": [pair.identity() for pair in pairs],
+                "conditions": ["raw", "primitives", "polished"], "fixed_single_model": True,
+                "deployment_command": deployment.build_adapter_command(),
+                "expected_episodes_per_condition": sum(len(p.tasks) * args.combinations for p in pairs),
+                "android_world": dataclasses.asdict(config.android_world), "output_dir": target})
+        return 0
+    with deployment.activate_adapters() as profiles:
+        result = run_experiment(config, store, profiles[0], pairs, target,
+                                combinations=args.combinations, seed=args.seed,
+                                max_steps=args.max_steps, family=args.family,
+                                resume=_evaluation_resume(config, args), store_trajectories=args.store_trajectories,
+                                guidance_max_chars=args.guidance_max_chars)
+    _print(result)
+    return 0
+
+
 def command_calibrate_skills(args: argparse.Namespace) -> int:
     """对每个 adapter×skill 运行 no-skill/forced-skill 配对标定。"""
 
@@ -2640,6 +2689,25 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--routing-minimum-capability", type=float)
     evaluate.add_argument("--routing-maximum-candidates", type=int)
     evaluate.set_defaults(handler=command_evaluate_pmtskill)
+
+    prepare_effectiveness = subparsers.add_parser(
+        "prepare-skill-effectiveness", help="冻结技能库并导出 PORTS 三组技能有效性实验配对模板")
+    prepare_effectiveness.add_argument("--skill-database", help="既有 SQLite；默认 TOML 技能库")
+    prepare_effectiveness.add_argument("--output-dir", required=True)
+    prepare_effectiveness.set_defaults(handler=command_prepare_skill_effectiveness)
+
+    effectiveness = subparsers.add_parser(
+        "evaluate-skill-effectiveness", help="PORTS 固定模型 raw / primitive sequence / polished 三元配对实验")
+    effectiveness.add_argument("--adapter-path", required=True)
+    effectiveness.add_argument("--model-id")
+    effectiveness.add_argument("--skill-database", help="既有 SQLite；运行时复制到实验 inputs，不写回来源库")
+    effectiveness.add_argument("--pairs-file", required=True, help="人工确认目标等价的 raw/polished 配对 JSON")
+    effectiveness.add_argument("--guidance-max-chars", type=int, default=12000,
+                               help="原文/原语序列预算；超长时拒绝截断，避免改变对照任务")
+    _add_common_evaluation_arguments(effectiveness, include_storage=False)
+    effectiveness.add_argument("--store-trajectories", action=argparse.BooleanOptionalAction, default=False,
+                               help="保存完整轨迹；本实验默认关闭，始终保留轻量计数和续跑 checkpoint")
+    effectiveness.set_defaults(handler=command_evaluate_skill_effectiveness)
 
     calibrate = subparsers.add_parser(
         "calibrate-skills",

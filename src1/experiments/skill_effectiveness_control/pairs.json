@@ -1,0 +1,82 @@
+{
+  "protocol": "ports-skill-effectiveness-v1",
+  "review_scope": "Manually matched task objectives using the current Android-adapted raw body. Not formal program equivalence or verified raw-to-polished compilation lineage.",
+  "source_catalog_sha256": "21d1730a5bddd67f50f1a04fd6285ccceeb2e283d79b5e2212ad56924557f791",
+  "source_counts": {"raw": 106, "polished": 334, "active_l3_candidates_reviewed": 43},
+  "raw_text_source": "SkillRecord.body, unchanged; NOT metadata.original_body",
+  "expected_episodes_with_combinations_1": 12,
+  "pairs": [
+    {
+      "pair_id": "files-delete",
+      "enabled": true,
+      "equivalence_confirmed": true,
+      "raw_skill_id": "skvm:file-manager",
+      "polished_skill_id": "polished:evidence:l3:07f06a6604fa58e2fc2c:v2",
+      "tasks": ["FilesDeleteFile"],
+      "match_type": "task-objective-compatible Android raw guidance",
+      "compilation_lineage_verified": false,
+      "raw_body_reviewed": "使用Android文件管理器完成文件整理与操作",
+      "selection_reason": "The Android-adapted raw covers file-manager operations; its preserved source explicitly includes deletion/cleanup. The polished workflow selects the requested file, deletes it, and confirms the dialog. All three conditions receive the same specific deletion goal from AndroidWorld.",
+      "limitation": "Generic raw capability versus task-specific polished workflow; not a verified before/after version of one skill. The raw body is only 23 characters."
+    },
+    {
+      "pair_id": "files-move",
+      "enabled": true,
+      "equivalence_confirmed": true,
+      "raw_skill_id": "skvm:file-manager",
+      "polished_skill_id": "polished:evidence:l3:9dd9509283e55d4ba1a1:v2",
+      "tasks": ["FilesMoveFile"],
+      "match_type": "task-objective-compatible Android raw guidance",
+      "compilation_lineage_verified": false,
+      "raw_body_reviewed": "使用Android文件管理器完成文件整理与操作",
+      "selection_reason": "File organization in the Android-adapted raw includes moving files; the preserved source documents move operations. The polished workflow covers selecting the source file and destination. All conditions use the same AndroidWorld source/destination parameters.",
+      "limitation": "The raw text does not provide a task-specific GUI path. Source capability coverage is not proof of raw-to-polished derivation."
+    },
+    {
+      "pair_id": "calendar-relative-day",
+      "enabled": true,
+      "equivalence_confirmed": true,
+      "raw_skill_id": "skvm:calendar",
+      "polished_skill_id": "polished:evidence:l3:ee8536f4b9ecfaa49f13:v2",
+      "tasks": ["SimpleCalendarAddOneEventRelativeDay"],
+      "match_type": "task-objective-compatible Android raw guidance",
+      "compilation_lineage_verified": false,
+      "raw_body_reviewed": "使用手机日历应用创建和管理日程事件",
+      "selection_reason": "The Android-adapted raw explicitly covers creating calendar events, and its preserved source covers relative-date parsing. The polished workflow creates an event using the current goal's fields. All conditions receive the same relative date, time, duration, title, and description.",
+      "limitation": "The original source generates ICS files, whereas the tested raw is its existing Android adaptation. Only the 17-character adapted body is injected."
+    },
+    {
+      "pair_id": "calendar-repeating",
+      "enabled": true,
+      "equivalence_confirmed": true,
+      "raw_skill_id": "skvm:calendar",
+      "polished_skill_id": "polished:evidence:l3:cafcda313e82d612ee0d:v2",
+      "tasks": ["SimpleCalendarAddRepeatingEvent"],
+      "match_type": "task-objective-compatible Android raw guidance",
+      "compilation_lineage_verified": false,
+      "raw_body_reviewed": "使用手机日历应用创建和管理日程事件",
+      "selection_reason": "The raw's Android body covers calendar-event creation and its preserved source includes recurrence rules. The polished workflow explicitly sets recurrence. The recurrence and event fields are supplied by the same frozen AndroidWorld goal in all conditions.",
+      "limitation": "Recurring-event GUI steps are absent from the short adapted raw body; this comparison measures the existing library representations, not formal equivalence or direct compilation improvement."
+    }
+  ],
+  "excluded_active_l3_candidates": {
+    "no_corresponding_raw_capability_identified": [
+      "AudioRecorderRecordAudio", "CameraTakeVideo", "ClockStopWatchPausedVerify", "ClockStopWatchRunning",
+      "ContactsAddContact", "ContactsNewContactDraft", "ExpenseDeleteDuplicates", "ExpenseDeleteDuplicates2",
+      "ExpenseDeleteMultiple", "ExpenseDeleteMultiple2", "ExpenseDeleteSingle", "OsmAndFavorite",
+      "RecipeAddSingleRecipe", "RecipeDeleteDuplicateRecipes", "RecipeDeleteSingleRecipe",
+      "RecipeDeleteSingleWithRecipeWithNoise", "SaveCopyOfReceiptTaskEval", "SportsTrackerActivitiesCountForWeek",
+      "SystemBluetoothTurnOff", "SystemBluetoothTurnOffVerify", "SystemBluetoothTurnOn", "SystemBluetoothTurnOnVerify",
+      "SystemBrightnessMaxVerify", "SystemWifiTurnOff", "SystemWifiTurnOffVerify", "SystemWifiTurnOn", "SystemWifiTurnOnVerify"
+    ],
+    "calendar_source_does_not_establish_the_specific_read_or_delete_objective": [
+      "SimpleCalendarDeleteEventsOnRelativeDay", "SimpleCalendarEventOnDateAtTime", "SimpleCalendarFirstEventAfterStartTime",
+      "SimpleCalendarLocationOfEvent", "SimpleCalendarNextEvent", "SimpleCalendarNextMeetingWithPerson"
+    ],
+    "notes_objective_or_application_mismatch": [
+      "MarkorDeleteNote", "MarkorMoveNote", "NotesIsTodo", "NotesMeetingAttendeeCount"
+    ],
+    "only_a_partial_operation_not_the_raw_skill_objective": ["OpenAppTaskEval"],
+    "specific_priority_and_due_date_query_not_confirmed_by_the_raw_procedure": ["TasksHighPriorityTasksDueOnDate"]
+  }
+}

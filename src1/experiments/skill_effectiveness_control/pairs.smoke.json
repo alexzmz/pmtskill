@@ -1,0 +1,18 @@
+{
+  "protocol": "ports-skill-effectiveness-v1",
+  "review_scope": "Task-objective-compatible existing Android-adapted raw guidance; no verified compilation lineage.",
+  "raw_text_source": "SkillRecord.body, unchanged; NOT metadata.original_body",
+  "pairs": [
+    {
+      "pair_id": "files-delete",
+      "enabled": true,
+      "equivalence_confirmed": true,
+      "raw_skill_id": "skvm:file-manager",
+      "polished_skill_id": "polished:evidence:l3:07f06a6604fa58e2fc2c:v2",
+      "tasks": ["FilesDeleteFile"],
+      "match_type": "task-objective-compatible Android raw guidance",
+      "compilation_lineage_verified": false,
+      "limitation": "The generic raw body is only 23 characters. This is a smoke test, not an independently validated efficacy result."
+    }
+  ]
+}

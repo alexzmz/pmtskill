@@ -1,5 +1,5 @@
 {
-  "protocol": "ports-skill-effectiveness-v1",
+  "protocol": "ports-skill-effectiveness-v2",
   "review_scope": "Manually matched task objectives using the current Android-adapted raw body. Not formal program equivalence or verified raw-to-polished compilation lineage.",
   "source_catalog_sha256": "21d1730a5bddd67f50f1a04fd6285ccceeb2e283d79b5e2212ad56924557f791",
   "source_counts": {"raw": 106, "polished": 334, "active_l3_candidates_reviewed": 43},

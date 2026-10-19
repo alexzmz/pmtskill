@@ -23,8 +23,18 @@ from ..skills.identity import skill_definition_hash
 from ..skills.store import SkillStore
 from .resume import fingerprint, model_resume_identity
 
-PROTOCOL = "ports-skill-effectiveness-v1"
+PROTOCOL = "ports-skill-effectiveness-v2"
 CONDITIONS = ("raw", "primitives", "polished")
+
+
+def validate_experiment_protocol(target: Path) -> None:
+    """Fail before GPU deployment; v1 prompts must not mix with v2 app hints."""
+    manifest = target / "experiment_manifest.json"
+    if manifest.is_file():
+        previous = json.loads(manifest.read_text(encoding="utf-8"))["specification"].get("protocol")
+        if previous != PROTOCOL:
+            raise ValueError(f"技能有效性实验协议已升级为 {PROTOCOL}（旧目录：{previous}）；"
+                             "三组新增相同应用名提示，不能混合旧结果。请保留旧目录并使用新的 --output-dir，例如 skill_effectiveness_control_v2")
 
 
 def slug(value: str) -> str:
@@ -227,6 +237,7 @@ def run_experiment(config, store: SkillStore, profile: ModelProfile, pairs: Sequ
     if not pairs:
         raise ValueError("至少需要一个明确等价的技能配对")
     target = target.resolve()
+    validate_experiment_protocol(target)
     specification = {"protocol": PROTOCOL, "model": model_resume_identity(profile),
                      "pairs": [p.identity() for p in pairs], "combinations": combinations,
                      "seed": seed, "max_steps": max_steps, "family": family,

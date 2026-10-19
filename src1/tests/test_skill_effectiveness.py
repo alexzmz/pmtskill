@@ -16,7 +16,7 @@ from src1.pmtskill_v2.cli import build_parser, command_evaluate_skill_effectiven
 from src1.pmtskill_v2.core.config import ProjectConfig, load_config
 from src1.pmtskill_v2.core.models import ModelProfile, SkillRecord, SkillStatus, SkillTopology, TopologyNode
 from src1.pmtskill_v2.evaluation.skill_effectiveness import (
-    CONDITIONS, SkillPair, load_pairs, prepare_inputs, run_experiment, write_report,
+    CONDITIONS, PROTOCOL, SkillPair, load_pairs, prepare_inputs, run_experiment, write_report,
 )
 from src1.pmtskill_v2.evaluation.skill_effectiveness_runner import (
     METRICS, EffectivenessWrapper, compact_result, frozen_suite, record_task_metrics,
@@ -202,6 +202,46 @@ class SkillEffectivenessTest(unittest.TestCase):
         self.assertIn("Approximate stage", client.prompts[0])
         self.assertIn("Fill current name", client.prompts[0])
 
+    def test_app_names_contract_is_identical_in_all_arms_and_does_not_rewrite_actions(self):
+        pair = make_pair()
+        pair.raw.name = "file-manager"
+        hints = []
+        for condition in CONDITIONS:
+            client = Client()
+            wrapper = EffectivenessWrapper(profile(), pair, condition, client=client,
+                                            supported_apps=("files", "simple calendar pro", "contacts"))
+            wrapper.set_goal("a goal")
+            wrapper.begin_step()
+            output, _, _ = wrapper.predict_mm("choose action", [])
+            wrapper.predict_mm("summary", [])
+            hint = wrapper.app_name_guidance()
+            hints.append(hint)
+            self.assertIn(hint, client.prompts[0])
+            self.assertNotIn(hint, client.prompts[1])
+            self.assertIn("named 'files'", hint)
+            self.assertIn("NOT Android app names", hint)
+            self.assertIn("'simple calendar pro'", hint)
+            self.assertEqual(output, "ok")
+            self.assertEqual(wrapper.metrics["model_invocations"], 2)
+        self.assertEqual(len(set(hints)), 1)
+
+    def test_v1_directory_is_rejected_before_deployment_or_input_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = {"specification": {"protocol": "ports-skill-effectiveness-v1"}}
+            manifest = root / "experiment_manifest.json"
+            manifest.write_text(json.dumps(old))
+            args = build_parser().parse_args(["evaluate-skill-effectiveness", "--adapter-path", "unused",
+                "--pairs-file", "unused", "--output-dir", str(root), "--resume"])
+            with mock.patch("src1.pmtskill_v2.cli.load_config", return_value=self.config()), \
+                 mock.patch("src1.pmtskill_v2.cli._adapter_deployment") as deployment, \
+                 mock.patch("src1.pmtskill_v2.evaluation.skill_effectiveness.prepare_inputs") as inputs:
+                with self.assertRaisesRegex(ValueError, "协议已升级"):
+                    command_evaluate_skill_effectiveness(args)
+            deployment.assert_not_called()
+            inputs.assert_not_called()
+            self.assertEqual(json.loads(manifest.read_text()), old)
+
     def test_no_silent_truncation_of_raw_or_primitive_sequence(self):
         pair = make_pair()
         pair.raw.body = "x" * 2000
@@ -290,6 +330,9 @@ class SkillEffectivenessTest(unittest.TestCase):
 
     def test_real_runner_all_three_arms_and_resume_with_mocked_device_and_http(self):
         """Run real wrapper, meter, frozen-suite, checkpoint and aggregation code."""
+        from src1.tests.test_task_parameters import calendar_schema
+        from src1.pmtskill_v2.evaluation.task_parameters import SCHEMA_MODULE
+        schema = calendar_schema()
         class M3A:
             def __init__(self, env, llm, **kwargs):
                 self.env, self.llm = env, llm
@@ -305,6 +348,8 @@ class SkillEffectivenessTest(unittest.TestCase):
                     "action_raw_response": raw, "summary": summary, "summary_raw_response": summary_raw})
 
         def original_task(task, agent):
+            self.assertIsInstance(task.params["events"][0], schema.CalendarEvent)
+            self.assertEqual(task.params["events"][0].duration_mins, 30)
             agent.reset()
             data = [agent.step(task.goal).data for _ in range(2)]
             return {"task_template": task.name, "goal": task.goal, "is_successful": float(agent.llm.condition != "raw"),
@@ -312,7 +357,9 @@ class SkillEffectivenessTest(unittest.TestCase):
                     "episode_data": {key: [item.get(key) for item in data] for key in data[0]}}
 
         harness = types.SimpleNamespace(Suite=Suite, _run_task=original_task)
-        create = mock.Mock(return_value=Suite(ContactsAddContact=[Task({"name": "saved-timestamp", "seed": 42})]))
+        create = mock.Mock(return_value=Suite(ContactsAddContact=[Task({"name": "saved-timestamp", "seed": 42,
+            "events": [schema.CalendarEvent(1800000000, 1800001800, "target")],
+            "noise_events": [schema.CalendarEvent(1700000000, 1700003600, "noise")]} )]))
         harness.create_suite = create
 
         def run(suite, agent, *, checkpointer, demo_mode, return_full_episode_data,
@@ -334,7 +381,8 @@ class SkillEffectivenessTest(unittest.TestCase):
         agents.m3a = types.SimpleNamespace(M3A=M3A)
         env = types.ModuleType("android_world.env")
         env.env_launcher = object()
-        modules = {"android_world": package, "android_world.agents": agents, "android_world.env": env}
+        env.adb_utils = types.SimpleNamespace(_PATTERN_TO_ACTIVITY={"files": "FilesActivity", "simple calendar pro": "CalendarActivity"})
+        modules = {"android_world": package, "android_world.agents": agents, "android_world.env": env, SCHEMA_MODULE: schema}
         calls = []
 
         def http(request, **kwargs):
@@ -359,6 +407,7 @@ class SkillEffectivenessTest(unittest.TestCase):
                 self.assertEqual(resumed["summary"]["table"], result["summary"]["table"])
                 self.assertEqual(create.call_count, 1)
                 self.assertEqual(len(list(target.glob("conditions/*/*/checkpoints/*.json"))), 3)
+                self.assertEqual(result["summary"]["protocol"], PROTOCOL)
 
 
 if __name__ == "__main__":

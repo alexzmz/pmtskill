@@ -5,6 +5,7 @@ import contextlib
 import copy
 import dataclasses
 import json
+import re
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from .compaction import compact_m3a_step_result
 from .reporter import compact_result_for_storage, successful_episode_value, write_evaluation_report
 from .resume import EvaluationProgress, fingerprint, model_resume_identity
 from .skill_effectiveness import PROTOCOL, slug
+from . import task_parameters
 
 METRICS = "_skill_effectiveness"
 
@@ -42,13 +44,16 @@ def frozen_suite(suite_utils, registry, tasks, *, combinations, seed, family, en
     else:
         suite = suite_utils.create_suite(registry, n_task_combinations=combinations,
                                          seed=seed, tasks=list(tasks), env=environment)
-        saved = {"specification": spec, "instances": [
-            {"task": name, "instance_id": i, "params": copy.deepcopy(task.params), "goal": task.goal}
+        saved = {"specification": spec, "params_encoding": task_parameters.PROTOCOL, "instances": [
+            {"task": name, "instance_id": i, "params": task_parameters.encode(task.params), "goal": task.goal}
             for name, instances in suite.items() for i, task in enumerate(instances)]}
-        write_json_atomic(path, saved)
+    encoding = saved.get("params_encoding")
+    if encoding not in {None, task_parameters.PROTOCOL}:
+        raise ValueError(f"Unsupported frozen task parameter encoding: {encoding}")
     result = {}
     for row in saved["instances"]:
-        task = registry[row["task"]](copy.deepcopy(row["params"]))
+        params = task_parameters.decode(row["params"]) if encoding else copy.deepcopy(row["params"])
+        task = registry[row["task"]](params)
         if task.goal != row["goal"]:
             raise ValueError(f"冻结任务的 goal 无法一致恢复: {row['task']}；请检查 harness 版本")
         instances = result.setdefault(row["task"], [])
@@ -57,6 +62,9 @@ def frozen_suite(suite_utils, registry, tasks, *, combinations, seed, family, en
         instances.append(task)
     if set(result) != set(tasks) or any(len(v) != combinations for v in result.values()):
         raise ValueError("冻结任务参数缺失或任务集合不匹配")
+    if not path.exists():
+        # Round-trip validation must pass BEFORE saving the shared parameters.
+        write_json_atomic(path, saved)
     suite = suite_utils.Suite(result)
     suite.suite_family = family
     return suite, fingerprint(saved)
@@ -68,9 +76,10 @@ class EffectivenessWrapper(RoutedVLWrapper):
     Primitive condition receives the entire flat sequence, not one artificial
     primitive per model call. Macro calls are NOT counted as a single GUI step.
     """
-    def __init__(self, profile, pair, condition, *, guidance_max_chars=12000, client=None):
+    def __init__(self, profile, pair, condition, *, guidance_max_chars=12000, client=None, supported_apps=()):
         self.profile, self.pair, self.condition = profile, pair, condition
         self.limit = guidance_max_chars
+        self.app_names = tuple(sorted(set(supported_apps)))
         self.client = client or OpenAICompatibleVLClient(profile)
         skill = pair.raw if condition == "raw" else pair.polished if condition == "polished" else None
         self.selected = copy.deepcopy(skill)
@@ -120,6 +129,7 @@ class EffectivenessWrapper(RoutedVLWrapper):
                 text_prompt += "\n\nFlat primitive-level implementation (no skill text):\n" + self.flat_guidance + "\n" + GUARD
             else:
                 text_prompt += "\n" + GUARD
+            text_prompt += self.app_name_guidance()
         self.metrics["action_calls" if is_action else "summary_calls"] += 1
         started = time.perf_counter()
         before = self.client.http_request_count
@@ -134,6 +144,19 @@ class EffectivenessWrapper(RoutedVLWrapper):
         finally:
             self.metrics["model_invocations"] += self.client.http_request_count - before
             self.metrics["model_latency_seconds"] += time.perf_counter() - started
+
+    def app_name_guidance(self):
+        """Identical public harness contract in every arm; no goal/answer hints."""
+        text = ("\n\nAndroidWorld application-name contract (shared by all representations):\n"
+                "Skill names/IDs are metadata, NOT Android app names or package IDs. "
+                "For open_app, use an exact supported app name, not a skill name.\n")
+        if self.app_names:
+            text += "Supported names (installation not guaranteed): " + ", ".join(self.app_names) + ".\n"
+            if "files" in self.app_names:
+                text += "The Android file manager is named 'files'; do NOT use 'file-manager' or 'Files by Google'.\n"
+            if "simple calendar pro" in self.app_names:
+                text += "For Simple Calendar Pro use 'simple calendar pro', not the skill name 'calendar'.\n"
+        return text
 
 
 @contextlib.contextmanager
@@ -168,8 +191,13 @@ class AndroidWorldEffectivenessRunner:
         from android_world.agents import m3a
         from android_world.env import env_launcher
 
+        from android_world.env import adb_utils
+        supported_apps = sorted({name for pattern in getattr(adb_utils, "_PATTERN_TO_ACTIVITY", {})
+                                 for name in pattern.split("|") if re.fullmatch(r"[a-zA-Z0-9 _-]+", name)})
+
         target = self.target / "conditions" / slug(pair.pair_id) / condition
-        wrapper = EffectivenessWrapper(self.profile, pair, condition, guidance_max_chars=self.limit)
+        wrapper = EffectivenessWrapper(self.profile, pair, condition, guidance_max_chars=self.limit,
+                                        supported_apps=supported_apps)
         # Force the same declared horizon in all three arms, independently of
         # the evaluator's legacy task-complexity budget.
         config = dataclasses.replace(self.config, evaluation=dataclasses.replace(self.config.evaluation, fixed_step_budget=True))
@@ -187,6 +215,7 @@ class AndroidWorldEffectivenessRunner:
                 "protocol": PROTOCOL, "pair": pair.identity(), "condition": condition,
                 "model": model_resume_identity(self.profile), "suite_hash": suite_hash,
                 "max_steps": max_steps, "guidance_max_chars": self.limit,
+                "supported_apps": supported_apps, "params_encoding": task_parameters.PROTOCOL,
                 "android_world": dataclasses.asdict(config.android_world),
             }, resume=resume, store_trajectories=store_trajectories, result_compactor=compact_result)
             outer = self
@@ -224,6 +253,7 @@ class AndroidWorldEffectivenessRunner:
                                     metadata={"evaluation_mode": PROTOCOL, "condition": condition,
                                               "model_id": self.profile.model_id, "pair_id": pair.pair_id,
                                               "tasks": list(pair.tasks), "seed": seed, "max_steps": max_steps,
+                                              "supported_apps": supported_apps, "params_encoding": task_parameters.PROTOCOL,
                                               "n_task_combinations": combinations,
                                               "suite_hash": suite_hash, "resume": progress.metadata()})
             rows = []

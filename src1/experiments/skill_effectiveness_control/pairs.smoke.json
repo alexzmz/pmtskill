@@ -1,5 +1,5 @@
 {
-  "protocol": "ports-skill-effectiveness-v1",
+  "protocol": "ports-skill-effectiveness-v2",
   "review_scope": "Task-objective-compatible existing Android-adapted raw guidance; no verified compilation lineage.",
   "raw_text_source": "SkillRecord.body, unchanged; NOT metadata.original_body",
   "pairs": [

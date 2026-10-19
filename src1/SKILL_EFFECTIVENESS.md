@@ -2,6 +2,9 @@
 
 本实验对应论文的 “Polished Skill Effectiveness”，不是五/八个方法的 end-to-end 对比。
 
+当前实验协议为 `ports-skill-effectiveness-v2`：修复 CalendarEvent 参数恢复，并为三组提供相同的应用名称约束。
+旧版 v1 目录不能续跑为 v2；保留旧结果，使用新的 `--output-dir`。协议不匹配会在部署 GPU 服务前拒绝。
+
 固定同一个 adapter、同一个 AndroidWorld 任务实例，仅改变技能的表示：
 
 | 条件 | 给模型的技能指导 |
@@ -40,7 +43,7 @@ grpc_port = 8554
 cd /home/zmz/Workspace/gui
 
 CFG=src1/config.local_test.toml
-OUT=/home/zmz/Workspace/gui/src1/runtime/evaluations/skill_effectiveness_control
+OUT=/home/zmz/Workspace/gui/src1/runtime/evaluations/skill_effectiveness_control_v2
 DB=/home/zmz/Workspace/gui/src1/runtime/evaluations/compare_five_control/ports/skill_library.sqlite3
 CONTROL=/home/zmz/Workspace/gui/src1/runtime/checkpoints/adapter_control01
 
@@ -137,13 +140,19 @@ python -m src1 --config "$CFG" \
 ## 5. 如何保证配对与续跑
 
 - 同一个 pair 的三组共享 `suites/<hash>.json` 中保存的**完整任务参数和 goal**，不仅是相同 seed。
+- 日历目标与噪声事件按带类型 JSON 保存，恢复时重建 `CalendarEvent`，保留字段和属性；不是将对象转为字符串或普通字典。
+  同时支持原生日期/时间、tuple、set 等参数；仅允许重建固定 AndroidWorld SQLite schema 模块中的数据类型，不使用 pickle/eval 或任意模块加载。
 - 因此像 `MarkorCreateFolder` 这种含当前时间戳的参数，后两组及续跑均恢复第一次保存的值，不会重新生成。
 - 每组分别调用 task 初始化/清理流程；这不是模拟器完整状态快照，也不声称所有随机背景状态完全一致。
 - 所有组执行相同的 `max-steps` 固定预算及相同的 stop-on-success 配置。
 - 三组顺序在不同 pair 间确定性轮换，不根据成功率挑选顺序；服务只部署一次，GPU 配置相同。
+- 三组收到完全相同的公开应用名称提示，名称从当前 harness 的映射读取。例如文件应用是 `files`，不是 raw 技能名 `file-manager`；
+  日历应用是 `simple calendar pro`。不会根据任务答案替模型选动作，也不改写模型输出、补装应用或伪造成功。模型继续选错时仍按真实执行结果判分。
 - `--resume` 跳过已正常完成的实例，包括真实失败；异常实例重跑。已有参数、模型权重、技能定义或实验设置变化时拒绝混合结果。
 - 默认不存截图/完整轨迹，也不写回来源 SQLite；轻量 checkpoint 始终保留计数器。
 - 基础设施故障会中止，保留已有结果并返回失败；全部无效不能当 SR=0。修复后用完全相同的命令续跑。
+
+注意最后一条指的是**相同 v2 协议下**的中断恢复。此次 v1→v2 同时改变了三组提示，不能继续复用旧六个文件任务结果。
 
 ## 6. 报告与论文表格
 

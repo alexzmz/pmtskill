@@ -1721,12 +1721,15 @@ def command_prepare_skill_effectiveness(args: argparse.Namespace) -> int:
 
 
 def command_evaluate_skill_effectiveness(args: argparse.Namespace) -> int:
-    from .evaluation.skill_effectiveness import PROTOCOL, load_pairs, prepare_inputs, run_experiment
+    from .evaluation.skill_effectiveness import (
+        PROTOCOL, load_pairs, prepare_inputs, run_experiment, validate_experiment_protocol,
+    )
 
     config = load_config(args.config)
     if not args.output_dir:
         raise ValueError("技能有效性实验必须指定 --output-dir，以保存三组共享的任务参数")
     target = Path(args.output_dir).expanduser().resolve()
+    validate_experiment_protocol(target)
     if not args.dry_run:
         config.ensure_runtime_dirs()
         source = Path(args.skill_database).expanduser().resolve() if args.skill_database else config.paths.database

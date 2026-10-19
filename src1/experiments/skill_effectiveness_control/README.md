@@ -36,17 +36,18 @@
 ## 如何使用
 
 将本文件夹同步到服务器 `src1/experiments/skill_effectiveness_control/`。
-你的原命令只需把 `--pairs-file` 改成：
+保留原来的技能库快照与配对内容，但本次修复升级为 v2 协议，必须使用新的输出/日志目录。
+`--pairs-file` 使用：
 
 ```bash
 --pairs-file /home/zmz/Workspace/gui/src1/experiments/skill_effectiveness_control/pairs.json
 ```
 
-完整命令（沿用你这次的 CUDA 2 / 模型服务 8003）：
+完整命令（沿用你这次的 CUDA 2 / 模型服务 8003，输出到全新 v2 目录）：
 
 ```bash
 python -m src1 --config /home/zmz/Workspace/gui/src1/config.local_test_effectiveness.toml \
-  --log-dir /home/zmz/Workspace/gui/src1/runtime/evaluations/skill_effectiveness_control/cli_logs \
+  --log-dir /home/zmz/Workspace/gui/src1/runtime/evaluations/skill_effectiveness_control_v2/cli_logs \
   evaluate-skill-effectiveness \
   --adapter-path /home/zmz/Workspace/gui/src1/runtime/checkpoints/adapter_control01 \
   --model-id adapter_control01 \
@@ -55,16 +56,20 @@ python -m src1 --config /home/zmz/Workspace/gui/src1/config.local_test_effective
   --combinations 1 --seed 42 --max-steps 30 \
   --cuda-visible-devices 2 --deploy-port 8003 --infer-backend vllm \
   --no-require-training-state --resume --no-store-trajectories \
-  --output-dir /home/zmz/Workspace/gui/src1/runtime/evaluations/skill_effectiveness_control
+  --output-dir /home/zmz/Workspace/gui/src1/runtime/evaluations/skill_effectiveness_control_v2
 ```
 
 第一次可先追加 `--dry-run`。这 4 对 × 3 条件 × 1 组合，一共 12 个 episode，不是测试全部 334 个 polished。
-如果之前只有“没有启用配对”的报错，还没产生 experiment_manifest/conditions，可继续使用上述目录。
-如果这个目录已经开始跑过另一组配对或配置，必须使用新 `--output-dir`，保留旧记录，不要删除 manifest 绕过校验。
+旧目录中的 SQLite 仍作为只读来源复制到新目录，不会删除旧报告或修改原技能。
+如果 v2 目录已经开始跑过相同配对与配置，可以原命令 `--resume`；改变配对/配置仍需新目录。
+不要删除旧 manifest 绕过校验。v1 六个文件任务的部分结果保留，但不能混入本次新增应用名称提示后的结果。
 设备 console/grpc 继续读取 `config.local_test_effectiveness.toml`，它们与 CUDA 2、推理端口 8003 无直接映射关系。
 
 如先做最小检查，用 `pairs.smoke.json` 替换上面的 `--pairs-file`，并同时把 `--output-dir` / `--log-dir` 改到单独的
-`.../skill_effectiveness_control_smoke` 目录。其余参数不变，共 3 个 episode。不要用同一个结果目录先测 1 对再续跑 4 对。
+`.../skill_effectiveness_control_smoke_v2` 目录。其余参数不变，共 3 个 episode。不要用同一个结果目录先测 1 对再续跑 4 对。
+
+v2 修复了：日历任务中的 `CalendarEvent`（包括背景事件）保存为带类型 JSON 并正确还原；三组动作阶段均增加相同的公开应用名称提示。
+例如应打开 `files`，不能把 raw 技能名 `file-manager` 当作应用；不会自动改写模型动作或将失败转成成功。
 
 ## 更准确的论文表述
 

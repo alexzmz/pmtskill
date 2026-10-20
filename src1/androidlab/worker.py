@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 
 from . import PROTOCOL
+from .avd import AvdDevice, verify_identity
 from .environment import (AndroidLabEnvironment, DockerDevice, InfrastructureError,
                           JudgeError, StepBudgetReached, bridge_adb_helpers)
 from .reporting import write_report
@@ -31,7 +32,7 @@ class EpisodeTimeout(BaseException):
 @contextlib.contextmanager
 def time_limit(seconds):
     if not hasattr(signal, "SIGALRM"):
-        raise RuntimeError("AndroidLab Docker evaluation requires Linux with SIGALRM (use Linux server, not Windows)")
+        raise RuntimeError("AndroidLab evaluation requires POSIX SIGALRM (Linux/macOS); Windows supports prepare/inspect/dry-run")
     previous = signal.getsignal(signal.SIGALRM)
     def expired(*args):
         raise EpisodeTimeout(f"Episode exceeded {seconds}s")
@@ -165,8 +166,10 @@ def bootstrap(request, options):
 def preflight(request):
     from .config import AndroidLabConfig
     if os.name != "posix" or not hasattr(signal, "SIGALRM"):
-        raise RuntimeError("Run AndroidLab Docker evaluation on the Linux server; Windows only supports prepare/dry-run")
+        raise RuntimeError("Run AndroidLab evaluation on Linux/macOS; Windows supports prepare/inspect/dry-run")
     options = AndroidLabConfig.load(request["config"])
+    if options.backend == "avd":
+        verify_identity(request["device_identity"])
     bootstrap(request, options)
     for task in request["tasks"]:
         module = importlib.import_module(task["metric_module"])
@@ -184,6 +187,15 @@ def preflight(request):
         if profile.api_key_env and not os.environ.get(profile.api_key_env):
             raise RuntimeError(f"AndroidLab judge API key environment variable is missing: {profile.api_key_env}")
     print("[AndroidLab] native task/agent dependencies checked; no model or device started", flush=True)
+
+
+def make_device(options, request, log_dir):
+    identity = request["device_identity"]
+    if options.backend != identity["backend"]:
+        raise ValueError("AndroidLab backend changed after preflight")
+    if options.backend == "avd":
+        return AvdDevice(options, identity, log_dir)
+    return DockerDevice(options, identity["image_id"])
 
 
 def run_request(request):
@@ -234,7 +246,7 @@ def run_request(request):
         np.random.seed(seed)
         key = episode_key(task, repeat)
         with time_limit(options.episode_timeout_seconds):
-            with DockerDevice(options, request["image_id"]) as device:
+            with make_device(options, request, target / "avd_logs" / key) as device:
                 device.initialize_task(task)
                 metric_type = importlib.import_module(task["metric_module"]).function_map[task["task_id"]]
                 metric = metric_type(argparse.Namespace(judge_model="configured", api_key=None))
@@ -317,7 +329,7 @@ def main():
         preflight(request)
         return 0
     def terminate(*unused):
-        raise KeyboardInterrupt("AndroidLab worker terminated; cleaning up its owned container")
+        raise KeyboardInterrupt("AndroidLab worker terminated; cleaning up its owned device resources")
     signal.signal(signal.SIGTERM, terminate)
     result = run_request(request)
     return 0 if result["evaluation_available"] else 1

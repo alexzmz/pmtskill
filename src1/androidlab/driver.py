@@ -17,6 +17,7 @@ from pathlib import Path
 from . import METHODS, MULTI_MODEL_METHODS, PROTOCOL, SKILL_METHODS
 from .catalog import file_digest, load_catalog, source_identity
 from .config import AndroidLabConfig
+from .avd import inspect_avd
 from .environment import docker_image_identity
 from ..pmtskill_v2.core.config import load_config
 from ..pmtskill_v2.core.io import write_json_atomic
@@ -44,7 +45,8 @@ def snapshot_database(source, target):
 
 
 def prepare(config, options, args):
-    """Freeze shared tasks/library without starting Docker, GPU or paid APIs."""
+    """Freeze selected tasks/library without starting a device, GPU or paid APIs."""
+    methods = list(dict.fromkeys(getattr(args, "methods", None) or [getattr(args, "method", "standalone")]))
     tasks = load_catalog(options, tasks=args.tasks, task_count=args.task_count, seed=args.seed)
     target = Path(args.output_dir).expanduser().resolve()
     document = {"protocol": PROTOCOL, "source_identity": source_identity(options.root),
@@ -59,11 +61,13 @@ def prepare(config, options, args):
     database = target / "inputs" / "skill_library.sqlite3"
     if not args.dry_run:
         write_json_atomic(catalog, document)
-        if source.is_file() and not database.exists():
+        if any(method in SKILL_METHODS for method in methods) and source.is_file() and not database.exists():
             snapshot_database(source, database)
-        for method in METHODS:
+        for method in methods:
             (target / method / "cli_logs").mkdir(parents=True, exist_ok=True)
-    return {"suite_file": str(catalog), "skill_database": str(database) if source.is_file() or database.exists() else None,
+    return {"suite_file": str(catalog), "skill_database": str(database) if database.exists() or
+            (any(method in SKILL_METHODS for method in methods) and source.is_file()) else None,
+            "methods": methods, "backend": options.backend,
             "task_count": len(tasks), "episodes_per_method": len(tasks) * args.combinations,
             "benchmark": "AndroidLab", "docker_started": False, "model_started": False,
             "note": "Existing input snapshot is retained, never refreshed from a changing source library"}
@@ -74,6 +78,26 @@ def command_prepare(args):
         raise ValueError("--output-dir is required")
     config = load_config(args.config)
     print(json.dumps(prepare(config, AndroidLabConfig.load(args.config), args), ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_inspect_avd(args):
+    options = AndroidLabConfig.load(args.config)
+    if options.backend != "avd":
+        raise ValueError("inspect-androidlab-avd requires [androidlab].backend = 'avd'")
+    identity = inspect_avd(options, hash_images=args.hash_images)
+    summary = {key: value for key, value in identity.items() if key not in {"files", "runtime_files"}}
+    summary.update(template_files=len(identity["files"]),
+                   template_size_gib=round(sum(r["size"] for r in identity["files"]) / 1024**3, 3),
+                   console_port=options.console_port, emulator_started=False,
+                   note="Static validation only; installed apps, initial data and guest services are checked when booted")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_list_tasks(args):
+    options = AndroidLabConfig.load(args.config)
+    print(json.dumps(load_catalog(options, tasks=args.tasks), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -230,11 +254,13 @@ def command_evaluate(args):
             print(json.dumps({"method": args.method, "tasks": [t["task_id"] for t in tasks],
                               "profiles": [p.model_id for p in profiles], "androidlab": options.to_dict(),
                               "deployment_command": deployment.build_adapter_command() if deployment else None,
-                              "note": "No Docker/GPU/API work performed; image/dependency checks occur at run time"},
+                              "note": "No AVD/Docker/GPU/API work performed; device/dependency checks occur at run time"},
                              ensure_ascii=False, indent=2))
             return 0
-        image_id = docker_image_identity(options.docker_image)
-        identity["image_id"] = image_id
+        device_identity = (inspect_avd(options, hash_images=True) if options.backend == "avd" else
+                           {"backend": "docker", "image_id": docker_image_identity(options.docker_image),
+                            "reset": "fresh-container-per-episode"})
+        identity["device"] = device_identity
         identity_hash = fingerprint(identity)
         manifest = target / "evaluation_manifest.json"
         if manifest.exists():
@@ -243,9 +269,13 @@ def command_evaluate(args):
                 raise ValueError("AndroidLab experiment identity changed; use a new output-dir (not --resume)")
         request = {"config": str(config.config_path), "profiles": [p.to_dict() for p in profiles],
                        "tasks": tasks, "all_tasks": all_tasks, "skill_database": str(database) if database else None,
-                       "agent_source": str(source), "image_id": image_id, "identity": identity_hash,
+                       "agent_source": str(source), "device_identity": device_identity, "identity": identity_hash,
                        "metadata": {"method": args.method, "benchmark": "AndroidLab", "protocol": PROTOCOL,
-                                    "image_id": image_id, "source_identity": identity["official_source"],
+                                    "backend": options.backend, "device_reset": device_identity["reset"],
+                                    "avd_snapshot": options.avd_snapshot,
+                                    "avd_content_identity": device_identity.get("content_identity"),
+                                    "image_id": device_identity.get("image_id"),
+                                    "source_identity": identity["official_source"],
                                     "model_ids": [p.model_id for p in profiles], "seed": args.seed,
                                     "combinations": args.combinations, "max_steps": args.max_steps}}
         request["args"] = {key: value for key, value in vars(args).items() if key != "handler"}
@@ -266,7 +296,7 @@ def command_evaluate(args):
 
 
 def run_worker(request_path, *, timeout, check=False):
-    """Forward worker logs and allow its finally blocks to clean owned Docker resources."""
+    """Forward worker logs and allow its finally blocks to clean owned device resources."""
     root = str(Path(__file__).resolve().parents[2])
     environment = os.environ.copy()
     environment["PYTHONPATH"] = root + os.pathsep + environment.get("PYTHONPATH", "")
@@ -302,13 +332,16 @@ def run_worker(request_path, *, timeout, check=False):
         process.stdout.close()
 
 
-def add_arguments(parser, *, evaluation=True):
+def add_arguments(parser, *, evaluation=True, method=None):
     from ..pmtskill_v2.cli import _add_common_evaluation_arguments, _add_skill_evaluation_arguments, _add_skvm_arguments
     _add_common_evaluation_arguments(parser)
     _add_skill_evaluation_arguments(parser)
     parser.set_defaults(family="android_lab")
     if evaluation:
-        parser.add_argument("--method", choices=METHODS, required=True)
+        if method is None:
+            parser.add_argument("--method", choices=METHODS, required=True)
+        else:
+            parser.set_defaults(method=method)
         sources = parser.add_mutually_exclusive_group()
         sources.add_argument("--adapter-paths", nargs="+")
         sources.add_argument("--adapter-path")
@@ -331,3 +364,6 @@ def add_arguments(parser, *, evaluation=True):
         parser.add_argument("--memory-alpha", type=float, default=0.5)
         parser.add_argument("--memory-top-k", type=int, default=2)
         parser.add_argument("--memory-max-chars", type=int, default=12000)
+    else:
+        parser.add_argument("--method", choices=METHODS, default="standalone",
+                            help="仅准备这一种方法的目录，默认 standalone")

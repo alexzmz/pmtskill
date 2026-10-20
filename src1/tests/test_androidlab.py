@@ -67,7 +67,7 @@ def fake_xml_module():
 class AndroidLabTest(unittest.TestCase):
     def test_all_eight_cli_commands_share_resources_and_correct_adapter_count(self):
         args = batch_parser().parse_args(["--config", "c.toml", "--output-dir", "out", "--dry-run",
-                                          "--cuda-visible-devices", "2", "--deploy-port", "8004"])
+                                          "--cuda-visible-devices", "2", "--deploy-port", "8004", "--methods", *METHODS])
         commands = build_commands(args, {"suite_file": "suite.json", "skill_database": "frozen.sqlite3"})
         self.assertEqual(set(commands), set(METHODS))
         for method, command in commands.items():
@@ -85,7 +85,7 @@ class AndroidLabTest(unittest.TestCase):
     def test_prepare_parses_without_model_argument(self):
         args = build_parser().parse_args(["prepare-androidlab", "--output-dir", "out"])
         self.assertEqual(args.family, "android_lab")
-        self.assertFalse(hasattr(args, "method"))
+        self.assertEqual(args.method, "standalone")
 
     def test_api_dry_run_does_not_create_output_or_touch_model_docker(self):
         from src1.androidlab.driver import command_evaluate
@@ -149,7 +149,8 @@ class AndroidLabTest(unittest.TestCase):
                 first = prepare(config, options(root / "source"), args)
                 self.assertEqual(first, prepare(config, options(root / "source"), args))
                 self.assertEqual(first["task_count"], 3)
-                self.assertTrue((root / "out/ports/cli_logs").is_dir())
+                self.assertTrue((root / "out/standalone/cli_logs").is_dir())
+                self.assertFalse((root / "out/ports").exists())
                 args.max_steps += 1
                 with self.assertRaisesRegex(ValueError, "differs"):
                     prepare(config, options(root / "source"), args)

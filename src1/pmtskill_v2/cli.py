@@ -2782,14 +2782,26 @@ def build_parser() -> argparse.ArgumentParser:
     from ..androidlab.driver import add_arguments as add_androidlab_arguments
     from ..androidlab.driver import command_evaluate as command_evaluate_androidlab
     from ..androidlab.driver import command_prepare as command_prepare_androidlab
+    from ..androidlab.driver import command_inspect_avd, command_list_tasks
+    from ..androidlab import METHODS as ANDROIDLAB_METHODS
+    lab_inspect = subparsers.add_parser("inspect-androidlab-avd", help="只读检查原生 AndroidLab AVD，不启动模拟器或模型")
+    lab_inspect.add_argument("--hash-images", action="store_true", help="同时计算大镜像文件摘要，可能耗时数分钟")
+    lab_inspect.set_defaults(handler=command_inspect_avd)
+    lab_list = subparsers.add_parser("list-androidlab-tasks", help="列出 AndroidLab 官方任务 ID 与指令")
+    lab_list.add_argument("--tasks", nargs="+")
+    lab_list.set_defaults(handler=command_list_tasks)
     lab_prepare = subparsers.add_parser(
         "prepare-androidlab", help="冻结 AndroidLab 官方任务和技能库；不启动模型或模拟器")
     add_androidlab_arguments(lab_prepare, evaluation=False)
     lab_prepare.set_defaults(handler=command_prepare_androidlab)
     lab_evaluate = subparsers.add_parser(
-        "evaluate-androidlab", help="AndroidLab 上运行 PORTS 或任一现有 baseline（独立 Docker 环境）")
+        "evaluate-androidlab", help="AndroidLab 上运行指定方法（原生 AVD 或可选 Docker）")
     add_androidlab_arguments(lab_evaluate)
     lab_evaluate.set_defaults(handler=command_evaluate_androidlab)
+    for method in ANDROIDLAB_METHODS:
+        lab_method = subparsers.add_parser(f"evaluate-androidlab-{method}", help=f"仅测试 AndroidLab {method}")
+        add_androidlab_arguments(lab_method, method=method)
+        lab_method.set_defaults(handler=command_evaluate_androidlab)
     return parser
 
 

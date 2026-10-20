@@ -1,6 +1,6 @@
 """AndroidLab benchmark adapter; no device or optional imports at import time."""
 
-PROTOCOL = "ports-androidlab-bridge-v1"
+PROTOCOL = "ports-androidlab-bridge-v2"
 METHODS = ("standalone", "simple-skill", "skvm", "vdroid", "androidworld",
            "echotrail-gui", "random-skvm", "ports")
 MULTI_MODEL_METHODS = {"ports", "random-skvm"}

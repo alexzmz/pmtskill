@@ -1,4 +1,4 @@
-"""Prepare and run the existing eight methods against one frozen AndroidLab suite."""
+"""Optional AndroidLab comparison helper; default to standalone, opt in to more methods."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def build_parser():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--adapter-paths", nargs="+", default=DEFAULT_ADAPTERS)
     parser.add_argument("--adapter-model-ids", nargs="+", default=["adapter_control01", "adapter_crossapp01", "adapter_all02"])
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=("standalone",))
     parser.add_argument("--skill-database")
     parser.add_argument("--tasks", nargs="+")
     parser.add_argument("--task-count", type=int)

@@ -53,7 +53,9 @@ def write_report(target, rows, expected, metadata):
              "", "| App | Valid / expected | SR |", "|---|---:|---:|"]
     for name, stats in summary["by_app"].items():
         lines.append(f"| {name} | {stats['valid_episodes']} / {stats['expected_episodes']} | {percent(stats['success_rate'])} |")
-    lines += ["", "## Protocol", "", "- Native AndroidLab snapshot, cold fresh container per episode; no AndroidWorld setup/reset.",
+    device_protocol = (f"Disposable native AVD copy per episode; baseline snapshot={metadata.get('avd_snapshot') or 'none (cold boot from pre-populated userdata)'}."
+                       if metadata.get("backend") == "avd" else "Fresh official Docker container per episode.")
+    lines += ["", "## Protocol", "", f"- {device_protocol} No AndroidWorld setup/reset.",
               "- M3A/T3A/V-Droid observations/actions are bridged from AndroidLab XML and screenshots.",
               "- Last eligible official judge result is retained; no success-oracle early stopping.",
               "- Final post-action state is included explicitly (bridge extension to upstream trace collection).",

@@ -294,7 +294,7 @@ python -m src1 --config "$CFG" evaluate-pmtskill \
   --skill-database "$OUT/ports/skill_library.sqlite3" --no-record-traces \
   "${COMMON[@]}" --output-dir "$OUT/ports"
 ```
-
+e
 ## 6. 报告、稳定性与复现实验注意事项
 
 每个方法输出 `summary.json`、`report.md`、轻量实例 checkpoint；三类能力仍仅 reasoning / coordination / manipulation。EchoTrail 附记忆来源 / Critic / embedding / 覆盖调用数，随机 SKVM 附每模型编译覆盖与适配统计。没有完整 trajectories 不代表没有恢复信息。

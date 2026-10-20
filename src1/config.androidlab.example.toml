@@ -1,0 +1,64 @@
+# Copy to config.local_androidlab.toml. Paths are relative to src1.
+[paths]
+repo_root = ".."
+android_world_root = "../libs/android_world" # Reuse agents only, NOT its emulator/task registry.
+ms_swift_root = "../libs/ms-swift"
+skvm_skills_root = "../libs/skvm/skvm-data/skills"
+state_dir = "./runtime"
+log_dir = "./runtime/logs"
+skill_library_db = "./runtime/skill_library.sqlite3"
+
+[offline]
+teacher_model_id = "teacher-qwen3.7-plus"
+student_model_path = "/home/zmz/Workspace/models/qwen3-vl-4b-instruct"
+lora_rank = 16
+
+[training_evaluation]
+model_id = "student-qwen3-vl"
+infer_backend = "vllm"
+cuda_visible_devices = "0"
+deploy_port = 8002
+max_model_len = 32768
+gpu_memory_utilization = 0.90
+max_new_tokens = 2048
+
+[routing]
+objective = "success_first"
+runtime_rerouting = true
+use_skill_estimates = true
+
+[evaluation]
+resume = true
+store_trajectories = false
+
+[androidlab]
+root = "../libs/Android-Lab"
+docker_image = "android_eval:latest"
+avd_name = "Pixel_7_Pro_API_33"
+docker_port = 6060 # Docker adb_client HTTP port, NOT model serving / ADB console / gRPC.
+startup_timeout_seconds = 240.0
+command_timeout_seconds = 45.0
+episode_timeout_seconds = 1800.0
+wait_after_action_seconds = 1.0
+app_start_wait_seconds = 15.0
+# Used only for official answer comparison; never supplies hints/actions to an agent.
+judge_model_id = "teacher-qwen3.7-plus"
+# Optional JSON: {"clock_1":"manipulation", ...}. No AndroidWorld task-name reuse.
+# capability_map = "./experiments/androidlab_capabilities.json"
+
+[[models]]
+model_id = "student-qwen3-vl"
+served_model = "student-qwen3-vl"
+base_url = "http://127.0.0.1:8002/v1"
+average_latency_ms = 1000.0
+switch_cost_ms = 0.0
+enabled = true
+
+[[models]]
+model_id = "teacher-qwen3.7-plus"
+served_model = "qwen3.7-plus"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+average_latency_ms = 2200.0
+switch_cost_ms = 0.0
+enabled = true

@@ -7,6 +7,10 @@
 见 [八入口 CLI 与环境准备](EIGHT_METHOD_EVALUATION.md)，入口为 `python -m src1.compare_eight`，
 支持 `--prepare-only` 冻结输入后再开始实验。默认官方 M3A 与已有 standalone 重合，报告中明确标注。
 
+AndroidLab 跨基准评测：见 [下载、环境与八方法指令](ANDROIDLAB_EVALUATION.md)，
+配置示例为 `config.androidlab.example.toml`，入口为 `evaluate-androidlab --method ...`
+与 `python -m src1.compare_androidlab`。使用 AndroidLab 官方预置 Docker/AVD，不能复用 AndroidWorld 模拟器数据。
+
 PORTS 的成功率优先路由、卡住恢复、固定步数预算与重测指令见
 [PORTS 成功率优先评测](PORTS_SUCCESS_FIRST.md)。新路由协议不能混用旧目录中的已完成结果。
 

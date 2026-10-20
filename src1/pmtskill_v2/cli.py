@@ -2779,6 +2779,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_evaluation_arguments(calibrate, include_resume=False, include_storage=False)
     calibrate.set_defaults(handler=command_calibrate_skills)
+    from ..androidlab.driver import add_arguments as add_androidlab_arguments
+    from ..androidlab.driver import command_evaluate as command_evaluate_androidlab
+    from ..androidlab.driver import command_prepare as command_prepare_androidlab
+    lab_prepare = subparsers.add_parser(
+        "prepare-androidlab", help="冻结 AndroidLab 官方任务和技能库；不启动模型或模拟器")
+    add_androidlab_arguments(lab_prepare, evaluation=False)
+    lab_prepare.set_defaults(handler=command_prepare_androidlab)
+    lab_evaluate = subparsers.add_parser(
+        "evaluate-androidlab", help="AndroidLab 上运行 PORTS 或任一现有 baseline（独立 Docker 环境）")
+    add_androidlab_arguments(lab_evaluate)
+    lab_evaluate.set_defaults(handler=command_evaluate_androidlab)
     return parser
 
 

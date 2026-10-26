@@ -10,3 +10,6 @@
 [submodule "libs/V-Droid"]
 	path = libs/V-Droid
 	url = https://github.com/V-Droid-Agent/V-Droid.git
+[submodule "libs/Android-Lab"]
+	path = libs/Android-Lab
+	url = https://github.com/THUDM/Android-Lab.git

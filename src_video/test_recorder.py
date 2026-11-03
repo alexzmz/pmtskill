@@ -18,7 +18,9 @@ class RecorderTest(unittest.TestCase):
         example = Path(__file__).with_name("config.example.toml")
         for mode in ("standalone", "ports"):
             settings = load_settings(example, mode)
-            args = build_parser().parse_args(settings["argv"])
+            with patch.dict("sys.modules", {"src1.androidlab.catalog": None,
+                                            "src1.androidlab.driver": None}):
+                args = build_parser().parse_args(settings["argv"])
             self.assertEqual(settings["serial"], "emulator-5554")
             self.assertEqual(args.tasks, ["OsmAndTrack"])
             self.assertEqual(args.combinations, 1)

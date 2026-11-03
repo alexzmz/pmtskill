@@ -2079,6 +2079,52 @@ def _add_skvm_arguments(parser):
                         help="无合格缓存时每变体的额外编译重试次数，默认 1")
 
 
+def _add_androidlab_arguments(parser, *, evaluation=True, method=None):
+    from ..androidlab import METHODS
+    _add_common_evaluation_arguments(parser)
+    _add_skill_evaluation_arguments(parser)
+    parser.set_defaults(family="android_lab")
+    if evaluation:
+        if method is None:
+            parser.add_argument("--method", choices=METHODS, required=True)
+        else:
+            parser.set_defaults(method=method)
+        sources = parser.add_mutually_exclusive_group()
+        sources.add_argument("--adapter-paths", nargs="+")
+        sources.add_argument("--adapter-path")
+        sources.add_argument("--model-ids", nargs="+")
+        sources.add_argument("--model-id")
+        parser.add_argument("--adapter-model-ids", nargs="+")
+        parser.add_argument("--suite-file")
+        parser.add_argument("--planner-model")
+        parser.add_argument("--continue-on-error", action="store_true",
+                            help="保留 unavailable 并继续后续任务，最终仍以非零退出")
+        parser.add_argument("--preparation-timeout-seconds", type=float, default=10800)
+        _add_skvm_arguments(parser)
+        parser.add_argument("--routing-seed", type=int, default=42)
+        parser.add_argument("--androidworld-agent", choices=["m3a", "t3a"], default="m3a")
+        parser.add_argument("--vdroid-root")
+        parser.add_argument("--vdroid-score-workers", type=int, default=4)
+        parser.add_argument("--vdroid-search-iterations", type=int, default=1)
+        parser.add_argument("--memory-file")
+        parser.add_argument("--embedding-model-path")
+        parser.add_argument("--memory-alpha", type=float, default=0.5)
+        parser.add_argument("--memory-top-k", type=int, default=2)
+        parser.add_argument("--memory-max-chars", type=int, default=12000)
+    else:
+        parser.add_argument("--method", choices=METHODS, default="standalone",
+                            help="仅准备这一种方法的目录，默认 standalone")
+
+
+def _androidlab_handler(name):
+    def run(args):
+        from ..androidlab import driver
+
+        return getattr(driver, name)(args)
+
+    return run
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src1",
@@ -2779,29 +2825,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_evaluation_arguments(calibrate, include_resume=False, include_storage=False)
     calibrate.set_defaults(handler=command_calibrate_skills)
-    from ..androidlab.driver import add_arguments as add_androidlab_arguments
-    from ..androidlab.driver import command_evaluate as command_evaluate_androidlab
-    from ..androidlab.driver import command_prepare as command_prepare_androidlab
-    from ..androidlab.driver import command_inspect_avd, command_list_tasks
     from ..androidlab import METHODS as ANDROIDLAB_METHODS
     lab_inspect = subparsers.add_parser("inspect-androidlab-avd", help="只读检查原生 AndroidLab AVD，不启动模拟器或模型")
     lab_inspect.add_argument("--hash-images", action="store_true", help="同时计算大镜像文件摘要，可能耗时数分钟")
-    lab_inspect.set_defaults(handler=command_inspect_avd)
+    lab_inspect.set_defaults(handler=_androidlab_handler("command_inspect_avd"))
     lab_list = subparsers.add_parser("list-androidlab-tasks", help="列出 AndroidLab 官方任务 ID 与指令")
     lab_list.add_argument("--tasks", nargs="+")
-    lab_list.set_defaults(handler=command_list_tasks)
+    lab_list.set_defaults(handler=_androidlab_handler("command_list_tasks"))
     lab_prepare = subparsers.add_parser(
         "prepare-androidlab", help="冻结 AndroidLab 官方任务和技能库；不启动模型或模拟器")
-    add_androidlab_arguments(lab_prepare, evaluation=False)
-    lab_prepare.set_defaults(handler=command_prepare_androidlab)
+    _add_androidlab_arguments(lab_prepare, evaluation=False)
+    lab_prepare.set_defaults(handler=_androidlab_handler("command_prepare"))
     lab_evaluate = subparsers.add_parser(
         "evaluate-androidlab", help="AndroidLab 上运行指定方法（原生 AVD 或可选 Docker）")
-    add_androidlab_arguments(lab_evaluate)
-    lab_evaluate.set_defaults(handler=command_evaluate_androidlab)
+    _add_androidlab_arguments(lab_evaluate)
+    lab_evaluate.set_defaults(handler=_androidlab_handler("command_evaluate"))
     for method in ANDROIDLAB_METHODS:
         lab_method = subparsers.add_parser(f"evaluate-androidlab-{method}", help=f"仅测试 AndroidLab {method}")
-        add_androidlab_arguments(lab_method, method=method)
-        lab_method.set_defaults(handler=command_evaluate_androidlab)
+        _add_androidlab_arguments(lab_method, method=method)
+        lab_method.set_defaults(handler=_androidlab_handler("command_evaluate"))
     return parser
 
 

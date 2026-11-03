@@ -10,11 +10,13 @@ figures/outputs/*
 results/*
 .codex*
 deliverables/*
+figures/*
 
 # runtime folders
 __pycache__/
 build/
 /results/
+
 src1/pmtskill_v2/runtime/*
 config.local*
 # log

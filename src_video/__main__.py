@@ -51,14 +51,26 @@ def load_settings(path: Path, method_override=None):
     task = evaluation["task"]
     if not isinstance(task, str) or not task.isidentifier():
         raise ValueError("evaluation.task must be a single AndroidWorld task ID")
-    adapters = evaluation["adapter_paths"]
+    api_model_id = evaluation.get("api_model_id")
+    if api_model_id is not None:
+        if not isinstance(api_model_id, str) or not api_model_id.strip():
+            raise ValueError("evaluation.api_model_id must be a nonempty model ID")
+        if method != "standalone":
+            raise ValueError("API models currently require evaluation.method = 'standalone'")
+        if not config.model(api_model_id).enabled:
+            raise ValueError(f"API model is disabled: {api_model_id}")
+        if any(key in evaluation for key in ("adapter_paths", "adapter_model_ids",
+                                             "cuda_visible_devices", "deploy_port")):
+            raise ValueError("API mode: remove adapter_paths, adapter_model_ids, cuda_visible_devices and deploy_port")
+    adapters = evaluation.get("adapter_paths", []) if api_model_id is None else []
     ids = evaluation.get("adapter_model_ids", [])
-    if not isinstance(adapters, list) or not adapters or not all(isinstance(x, str) and x for x in adapters):
+    if api_model_id is None and (not isinstance(adapters, list) or not adapters or not all(
+            isinstance(x, str) and x for x in adapters)):
         raise ValueError("evaluation.adapter_paths must be a nonempty array of paths")
     if not isinstance(ids, list) or (ids and len(ids) != len(adapters)) or not all(
             isinstance(x, str) and x for x in ids):
         raise ValueError("evaluation.adapter_model_ids must be empty or match adapter_paths")
-    if method == "standalone" and len(adapters) != 1:
+    if method == "standalone" and api_model_id is None and len(adapters) != 1:
         raise ValueError("standalone requires exactly one adapter path")
     if len(set(ids)) != len(ids):
         raise ValueError("evaluation.adapter_model_ids must be distinct")
@@ -67,7 +79,9 @@ def load_settings(path: Path, method_override=None):
     run = output / f"{task}_{method}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}"
     argv = ["--config", str(config_path), "--log-dir", str(run / "cli_logs")]
     adapter_args = [str(local(x)) for x in adapters]
-    if method == "standalone":
+    if api_model_id is not None:
+        argv += ["evaluate-standalone", "--api-model-id", api_model_id]
+    elif method == "standalone":
         argv += ["evaluate-standalone", "--adapter-path", adapter_args[0]]
         if ids:
             argv += ["--model-id", ids[0]]
@@ -79,16 +93,18 @@ def load_settings(path: Path, method_override=None):
             argv += ["--skill-database", str(local(evaluation["skill_database"]))]
         if evaluation.get("planner_model"):
             argv += ["--planner-model", evaluation["planner_model"]]
-    port = _integer(evaluation.get("deploy_port", 8002), "deploy_port")
-    if port > 65535:
-        raise ValueError("deploy_port must be at most 65535")
+    if api_model_id is None:
+        port = _integer(evaluation.get("deploy_port", 8002), "deploy_port")
+        if port > 65535:
+            raise ValueError("deploy_port must be at most 65535")
+        argv += ["--cuda-visible-devices", str(evaluation.get("cuda_visible_devices", "0")),
+                 "--deploy-port", str(port), "--infer-backend", "vllm",
+                 "--no-require-training-state"]
     argv += [
         "--tasks", task, "--family", "android_world", "--combinations", "1",
         "--seed", str(evaluation.get("seed", 42)),
         "--max-steps", str(_integer(evaluation.get("max_steps", 30), "max_steps")),
-        "--cuda-visible-devices", str(evaluation.get("cuda_visible_devices", "0")),
-        "--deploy-port", str(port), "--infer-backend", "vllm",
-        "--no-require-training-state", "--no-resume", "--store-trajectories",
+        "--no-resume", "--store-trajectories",
         "--output-dir", str(run / "evaluation"),
     ]
     return {

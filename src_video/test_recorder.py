@@ -28,6 +28,16 @@ class RecorderTest(unittest.TestCase):
             self.assertTrue(args.store_trajectories)
             self.assertFalse(args.resume)
 
+    def test_api_example_does_not_request_local_deployment(self):
+        from src1.pmtskill_v2.cli import build_parser
+
+        settings = load_settings(Path(__file__).with_name("config.api.example.toml"))
+        args = build_parser().parse_args(settings["argv"])
+        self.assertEqual(args.api_model_id, "teacher-qwen3.7-plus")
+        self.assertEqual(args.tasks, ["OsmAndTrack"])
+        for field in ("adapter_path", "cuda_visible_devices", "deploy_port", "infer_backend"):
+            self.assertIsNone(getattr(args, field))
+
     def test_sample_and_exact_step_share_timeline(self):
         import numpy as np
         from PIL import Image

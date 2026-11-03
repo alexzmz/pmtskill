@@ -1,0 +1,15 @@
+[evaluation]
+# Point to the src1 TOML containing the [[models]] profile and emulator settings.
+config = "../src1/config.example.toml"
+method = "standalone"
+api_model_id = "teacher-qwen3.7-plus"
+task = "OsmAndTrack"
+max_steps = 30
+seed = 42
+
+[recording]
+emulator_serial = "emulator-5554"
+output_dir = "../src1/runtime/videos"
+capture_fps = 4
+video_fps = 12
+ffmpeg = "ffmpeg"

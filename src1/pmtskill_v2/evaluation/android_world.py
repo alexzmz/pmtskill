@@ -52,6 +52,7 @@ from ..online.router import DynamicProgrammingRouter
 from ..skills.importer import relevant_raw_skills
 from ..skills.store import SkillStore
 from .compaction import compact_m3a_step_result
+from .observation import ObservedM3A, watch_observed_episodes
 from .resume import (
     EvaluationProgress,
     fingerprint,
@@ -175,6 +176,7 @@ def _run_evaluation_suite(
                                                            fixed_budget=config.evaluation.fixed_step_budget))
         if not native_stop and config.android_world.stop_on_task_success:
             stack.enter_context(_legacy_task_success_termination(suite_utils))
+        stack.enter_context(watch_observed_episodes(suite_utils))
         stack.enter_context(recover_infrastructure_failures(
             suite_utils, environment, config.android_world,
             continue_on_infrastructure_failure=continue_on_infrastructure_failure,
@@ -504,7 +506,7 @@ class AndroidWorldStandaloneEvaluator:
         )
         model = OpenAICompatibleVLClient(profile)
 
-        class MemoryBoundedM3A(m3a.M3A):
+        class MemoryBoundedM3A(ObservedM3A, m3a.M3A):
             """评测不跨 step 保留截图，避免长 suite 被宿主 OOM killer 杀死。"""
 
             def step(self, goal: str):
@@ -644,7 +646,7 @@ class AndroidWorldSimpleSkillEvaluator:
         )
         self_outer = self
 
-        class SimpleSkillM3A(m3a.M3A):
+        class SimpleSkillM3A(ObservedM3A, m3a.M3A):
             def __init__(self, environment):
                 super().__init__(
                     environment,
@@ -776,7 +778,7 @@ class AndroidWorldForcedSkillEvaluator:
         )
         self_outer = self
 
-        class ForcedSkillM3A(m3a.M3A):
+        class ForcedSkillM3A(ObservedM3A, m3a.M3A):
             def __init__(self, environment):
                 super().__init__(
                     environment,
@@ -917,7 +919,7 @@ class AndroidWorldOnlineEvaluator:
         routed_wrapper = RoutedVLWrapper(model_pool, polished, router=router,
                                          include_candidates=include_candidate_skills, supported_apps=supported_apps)
 
-        class DynamicRoutingM3A(m3a.M3A):
+        class DynamicRoutingM3A(ObservedM3A, m3a.M3A):
             """Initial DP + observation-driven model/skill re-selection per action."""
 
             def __init__(self, environment):

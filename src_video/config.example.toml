@@ -1,0 +1,22 @@
+# Relative paths are resolved from this TOML. The evaluation TOML owns ADB and gRPC.
+[evaluation]
+config = "../src1/config.example.toml"
+method = "standalone"
+task = "OsmAndTrack"
+adapter_paths = ["../src1/runtime/checkpoints/adapter_control01"]
+adapter_model_ids = ["adapter_control01"]
+cuda_visible_devices = "0"
+deploy_port = 8002
+max_steps = 30
+seed = 42
+# PORTS only; otherwise inherit the evaluation TOML.
+# skill_database = "../src1/runtime/skill_library.sqlite3"
+# planner_model = "adapter_control01"
+
+[recording]
+emulator_serial = "emulator-5554"
+output_dir = "../src1/runtime/videos"
+capture_fps = 4
+video_fps = 12
+adb_timeout_seconds = 5
+ffmpeg = "ffmpeg"

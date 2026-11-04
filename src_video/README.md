@@ -47,3 +47,16 @@ python -m src_video --render-existing /path/to/run/episode_001
 默认 ADB 每秒约采 4 帧，输出 12 fps；补帧仅保持最近的真实图像，不生成中间画面。
 较短的动画可能落在采样间隙。录制本身有 ADB 和磁盘开销，建议不要用开着录像的运行报告论文的正式 latency。
 截图可能包含任务中的敏感内容，分享前请检查。
+
+## PORTS 路由原理动画（不需要模拟器）
+
+```bash
+python -m src_video.ports_workflow --output deliverables/ports-recipe-workflow.mp4
+```
+
+脚本用 `RecipeAddSingleRecipe` 作为教学示例，展示任务输入、小模型草案、原语分解、
+L1/L2/L3 技能匹配、DAG 边代价、带模型状态的动态规划以及最优路径回溯。
+配方内容、技能和代价为演示数据；路径由脚本计算，不是实测路由结果。
+需要 Pillow；MP4 还需要支持 libx264 的 FFmpeg（可用 `--ffmpeg /path/to/ffmpeg` 指定）。
+没有 FFmpeg 时，将输出扩展名改为 `.avi` 即可生成同内容的 Motion JPEG 视频。
+可用 `--preview deliverables/ports-recipe-preview.png` 仅生成六幕预览。

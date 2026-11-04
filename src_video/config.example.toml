@@ -2,12 +2,12 @@
 [evaluation]
 config = "../src1/config.example.toml"
 method = "standalone"
-task = "OsmAndTrack"
+task = "RecipeAddSingleRecipe"
 adapter_paths = ["../src1/runtime/checkpoints/adapter_control01"]
 adapter_model_ids = ["adapter_control01"]
 cuda_visible_devices = "0"
 deploy_port = 8002
-max_steps = 30
+max_steps = 50
 seed = 42
 # PORTS only; otherwise inherit the evaluation TOML.
 # skill_database = "../src1/runtime/skill_library.sqlite3"
@@ -15,7 +15,7 @@ seed = 42
 
 [recording]
 emulator_serial = "emulator-5554"
-output_dir = "../src1/runtime/videos"
+output_dir = "/home/zmz/Workspace/gui/src_video/videos"
 capture_fps = 4
 video_fps = 12
 adb_timeout_seconds = 5

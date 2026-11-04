@@ -16,6 +16,7 @@ figures/*
 __pycache__/
 build/
 /results/
+src_video/videos
 
 src1/pmtskill_v2/runtime/*
 config.local*

@@ -60,3 +60,4 @@ L1/L2/L3 技能匹配、DAG 边代价、带模型状态的动态规划以及最�
 需要 Pillow；MP4 还需要支持 libx264 的 FFmpeg（可用 `--ffmpeg /path/to/ffmpeg` 指定）。
 没有 FFmpeg 时，将输出扩展名改为 `.avi` 即可生成同内容的 Motion JPEG 视频。
 可用 `--preview deliverables/ports-recipe-preview.png` 仅生成六幕预览。
+生成全中文画面时加 `--lang zh`；如未找到系统中文字体，用 `--font /path/to/CJK-font.ttc` 指定。

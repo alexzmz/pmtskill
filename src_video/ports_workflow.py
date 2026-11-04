@@ -13,6 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
+from .ports_workflow_zh import COPY
 
 W, H = 1280, 720
 BG, PANEL, LINE = "#0c1425", "#141f35", "#2c3d59"
@@ -65,7 +66,19 @@ TABLE, COUNT, COST, PATH = solve()
 
 
 @lru_cache(maxsize=None)
-def font(size, bold=False):
+def font(size, bold=False, lang="en", custom=None):
+    if custom:
+        return ImageFont.truetype(custom, size)
+    if lang == "zh":
+        candidates = (
+            Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / ("msyhbd.ttc" if bold else "msyh.ttc"),
+            Path("/usr/share/fonts/opentype/noto") / ("NotoSansCJK-Bold.ttc" if bold else "NotoSansCJK-Regular.ttc"),
+            Path("/System/Library/Fonts/PingFang.ttc"),
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return ImageFont.truetype(str(candidate), size)
+        raise OSError("Chinese font not found; pass --font with a CJK .ttf/.otf/.ttc file")
     names = ("DejaVuSans-Bold.ttf", "arialbd.ttf") if bold else ("DejaVuSans.ttf", "arial.ttf")
     for name in names:
         for candidate in (name, str(Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / name)):
@@ -81,8 +94,13 @@ def ease(value):
     return x * x * (3 - 2 * x)
 
 
+def tr(draw, label):
+    return COPY.get(label, label) if draw.ports_lang == "zh" else label
+
+
 def text(draw, xy, label, size=20, color=WHITE, bold=False, anchor="lt"):
-    draw.text(xy, label, font=font(size, bold), fill=color, anchor=anchor)
+    draw.text(xy, tr(draw, label), font=font(size, bold, draw.ports_lang, draw.ports_font),
+              fill=color, anchor=anchor)
 
 
 def card(draw, box, outline=LINE, fill=PANEL, radius=16):
@@ -105,13 +123,13 @@ def arrow(draw, points, color, width=3, progress=1):
 
 def shell(draw, phase, heading, caption, elapsed):
     text(draw, (60, 37), "PORTS", 26, GREEN, True)
-    text(draw, (160, 41), "ROUTING WALKTHROUGH", 16, MUTED, True)
+    text(draw, (182 if draw.ports_lang == "zh" else 160, 41), "ROUTING WALKTHROUGH", 16, MUTED, True)
     text(draw, (1220, 41), "ILLUSTRATIVE EXAMPLE", 15, MUTED, True, "rt")
     for i, label in enumerate(PHASES):
         x = 60 + 195 * i
         active = i == phase
         draw.line((x, 95, x + 178, 95), GREEN if active else LINE, width=4)
-        text(draw, (x, 108), f"{i + 1:02d}  {label}", 16, GREEN if active else MUTED, active)
+        text(draw, (x, 108), f"{i + 1:02d}  {tr(draw, label)}", 16, GREEN if active else MUTED, active)
     text(draw, (60, 155), heading, 41, WHITE, True)
     draw.line((60, 631, 1220, 631), LINE, width=1)
     text(draw, (60, 653), caption, 21, MUTED)
@@ -126,7 +144,7 @@ def primitive_strip(draw, progress, y=290):
             continue
         yy = y + round(15 * (1 - reveal))
         card(draw, (x, yy, x + 178, yy + 112), BLUE)
-        text(draw, (x + 14, yy + 19), f"P{i + 1}", 18, BLUE, True)
+        text(draw, (x + 14, yy + 19), tr(draw, "P{index}").format(index=i + 1), 18, BLUE, True)
         text(draw, (x + 89, yy + 69), name, 18, WHITE, True, "mm")
         if i:
             arrow(draw, [(x - 15, yy + 55), (x - 4, yy + 55)], BLUE, 2, reveal)
@@ -153,7 +171,7 @@ def graph(draw, t, selected=False):
         if progress > .92 and (not selected or edge in active):
             mx = (x0 + x1) / 2
             if edge.level:
-                label = f"L{edge.level}  {edge.name}"
+                label = f"{tr(draw, f'L{edge.level}')}  {tr(draw, edge.name)}"
                 text(draw, (mx, y - height - (29 if height > 0 else -9)), label, 17, color, True, "mt")
             elif selected:
                 text(draw, (mx, y - 34), edge.name, 17, color, True, "mt")
@@ -175,13 +193,14 @@ def graph(draw, t, selected=False):
         text(draw, (60, 553), "BEST CUMULATIVE COST PER BOUNDARY  /  LAST MODEL A OR B", 14, MUTED, True)
 
 
-def frame(elapsed):
+def frame(elapsed, lang="en", custom_font=None):
     phase, t = 0, elapsed
     while phase < len(DURATIONS) - 1 and t >= DURATIONS[phase]:
         t -= DURATIONS[phase]
         phase += 1
     image = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(image)
+    d.ports_lang, d.ports_font = lang, custom_font
     if phase == 0:
         shell(d, phase, "A task arrives", "AndroidWorld  /  One Broccoli recipe  /  Example values", elapsed)
         card(d, (60, 236, 778, 571), BLUE)
@@ -233,7 +252,8 @@ def frame(elapsed):
                     arrow(d, [(105, y - 22), (105, y - 5)], VIOLET, 2)
     elif phase == 4:
         shell(d, phase, "Score candidate routes on a DAG",
-              f"{COUNT} structural routes  /  Dynamic programming retains the best cost for each (boundary, last model).", elapsed)
+              tr(d, "{count} structural routes  /  Dynamic programming retains the best cost for each (boundary, last model).")
+              .format(count=COUNT), elapsed)
         graph(d, t)
     else:
         shell(d, phase, "Backtrack the minimum-cost route",
@@ -244,14 +264,17 @@ def frame(elapsed):
                 continue
             x = 60 + 273 * i
             card(d, (x, 463, x + 251, 588), GREEN)
-            text(d, (x + 15, 484), f"{i+1:02d}   MODEL {model}", 16, GREEN, True)
+            text(d, (x + 15, 484), tr(d, "{index:02d}   MODEL {model}").format(index=i+1, model=tr(d, model)),
+                 16, GREEN, True)
             text(d, (x + 15, 519), edge.name, 22, WHITE, True)
-            text(d, (x + 15, 554), f"Edge cost  {edge.costs[MODELS.index(model)]/100:.2f}", 17, MUTED)
+            text(d, (x + 15, 554), tr(d, "Edge cost  {cost:.2f}").format(cost=edge.costs[MODELS.index(model)]/100),
+                 17, MUTED)
         if t > 2:
             text(d, (1220, 478), f"{COST/100:.2f}", 50, GREEN, True, "rt")
             text(d, (1220, 537), "TOTAL COST", 15, MUTED, True, "rt")
             switch_count = sum(a[1] != b[1] for a, b in zip(PATH, PATH[1:]))
-            text(d, (1220, 564), f"Includes {switch_count} switches (+{switch_count * SWITCH / 100:.2f})",
+            text(d, (1220, 564), tr(d, "Includes {count} switches (+{cost:.2f})")
+                 .format(count=switch_count, cost=switch_count * SWITCH / 100),
                  16, MUTED, anchor="rt")
     return image
 
@@ -295,24 +318,28 @@ def main(argv=None):
     parser.add_argument("--output", type=Path)
     parser.add_argument("--fps", type=int, default=24, choices=range(12, 61))
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--lang", choices=("en", "zh"), default="en")
+    parser.add_argument("--font", help="Path to a font file, e.g. a CJK font for --lang zh")
     parser.add_argument("--preview", type=Path, help="Write a montage of the six scenes instead of encoding")
     args = parser.parse_args(argv)
     if args.preview:
         preview = Image.new("RGB", (W * 3 // 2, H))
         for i, elapsed in enumerate((3, 9, 15, 23, 36, 43)):
-            preview.paste(frame(elapsed).resize((W // 2, H // 2)), ((i % 3) * W // 2, (i // 3) * H // 2))
+            preview.paste(frame(elapsed, args.lang, args.font).resize((W // 2, H // 2)),
+                          ((i % 3) * W // 2, (i // 3) * H // 2))
         args.preview.parent.mkdir(parents=True, exist_ok=True)
         preview.save(args.preview)
         return
     executable = shutil.which(args.ffmpeg)
-    target = args.output or Path("deliverables") / ("ports-recipe-workflow.mp4" if executable else "ports-recipe-workflow.avi")
+    stem = "ports-recipe-workflow-zh" if args.lang == "zh" else "ports-recipe-workflow"
+    target = args.output or Path("deliverables") / (stem + (".mp4" if executable else ".avi"))
     if target.suffix.lower() not in {".mp4", ".avi"}:
         parser.error("--output must end in .mp4 or .avi")
     if target.suffix.lower() == ".mp4" and not executable:
         parser.error("MP4 requires FFmpeg with libx264; choose .avi for the Pillow-only fallback")
     target.parent.mkdir(parents=True, exist_ok=True)
     count = sum(DURATIONS) * args.fps
-    images = (frame(i / args.fps) for i in range(count))
+    images = (frame(i / args.fps, args.lang, args.font) for i in range(count))
     temporary = target.with_name(f".{target.stem}.encoding{target.suffix}")
     try:
         if target.suffix.lower() == ".mp4":

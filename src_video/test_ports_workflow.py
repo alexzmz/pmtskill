@@ -2,11 +2,21 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from .ports_workflow import COST, COUNT, EDGES, MODELS, PATH, PRIMITIVES, SWITCH, frame, write_avi
 
 
 class WorkflowTest(unittest.TestCase):
+    def test_chinese_labels_have_no_english_text(self):
+        with patch("src_video.ports_workflow.font"), patch("PIL.ImageDraw.ImageDraw.text") as draw:
+            for elapsed in (3, 9, 15, 23, 36, 43):
+                frame(elapsed, "zh")
+        labels = [call.args[1] for call in draw.call_args_list]
+        self.assertIn("有向无环图与代价", " ".join(labels))
+        for label in labels:
+            self.assertNotRegex(label, "[a-zA-Z]")
+
     def test_dynamic_programming_matches_exhaustive_search(self):
         def paths(position):
             if position == len(PRIMITIVES):
